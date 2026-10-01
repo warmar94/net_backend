@@ -95,6 +95,8 @@ pub struct Config {
     pub metrics: MetricsConfig,
     /// `[openapi]`: the API description and its optional browser UI.
     pub openapi: OpenApiConfig,
+    /// `[ws]`: the WebSocket hub at `/v1/ws` (on by default).
+    pub ws: WsConfig,
     /// `[modules.<name>]`: each module's own settings, read with [`Config::module_config`]. `Debug`
     /// prints only the key names (a module section may hold secrets). A section without a
     /// registered module is refused when the server is built.
@@ -116,6 +118,7 @@ impl fmt::Debug for Config {
             .field("log", &self.log)
             .field("metrics", &self.metrics)
             .field("openapi", &self.openapi)
+            .field("ws", &self.ws)
             .field("modules (keys only)", &modules)
             .finish()
     }
@@ -333,6 +336,147 @@ impl Default for OpenApiConfig {
     }
 }
 
+/// `[ws]`: the WebSocket hub at `/v1/ws` (see [`crate::ws`]).
+///
+/// The socket buffers are tuned for many idle connections: an 8 KiB read buffer, no write
+/// buffering (each frame is written at once) and the protocol's 1 MiB message limit. Defaults
+/// follow the protocol (`AUTH_TIMEOUT_SECS`, `MAX_MESSAGE_BYTES`, the chat room caps).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
+pub struct WsConfig {
+    /// Serve the hub at `/v1/ws`. Default true; when false the path answers 403 (never 400).
+    pub enabled: bool,
+    /// The most open sockets (authenticated or not); a handshake over it gets 503 + `Retry-After`.
+    /// Default 10 000. Keep it below the process's open-file limit.
+    pub max_connections: usize,
+    /// The most sockets per user; a newer one closes the oldest with 4009 (replaced), the oldest of
+    /// its own session first. Default 5.
+    pub max_connections_per_user: usize,
+    /// The most open sockets per client address (IPv6 by /64), authenticated or not; 429 above.
+    /// Default 100 (players behind one NAT or at a LAN party share an address).
+    pub max_connections_per_ip: usize,
+    /// The most sockets still waiting for their first-message `auth` (anonymous for up to
+    /// `auth_timeout_secs`); 503 above, so they never crowd out authenticated players. Default 1000.
+    pub max_pending_connections: usize,
+    /// How often the hub re-reads the roles of every connected user, in seconds (role changes made by
+    /// another process, e.g. the command line, reach open sockets within this). Changes made in this
+    /// process apply at once. Default 60, 0 = off.
+    pub roles_refresh_secs: u64,
+    /// WebSocket handshakes per client address (IPv6 by /64) per minute; 429 above. Default 60, 0 = off.
+    pub handshakes_per_ip_per_minute: u32,
+    /// Seconds an unauthenticated socket has to send `auth` (then close 1008). Default 5 (the
+    /// protocol's `AUTH_TIMEOUT_SECS`).
+    pub auth_timeout_secs: u64,
+    /// Seconds between the server's pings. Default 20 (the client pings every 15 s itself).
+    pub ping_interval_secs: u64,
+    /// Seconds without any frame from the client (data, ping or pong) before the socket counts
+    /// as dead and is dropped. Default 60 (must exceed `ping_interval_secs`).
+    pub idle_timeout_secs: u64,
+    /// The time limit of one request handler, in seconds (then 503 `unavailable`). Default 10.
+    pub request_timeout_secs: u64,
+    /// How long one frame may take to write before the peer counts as stuck (the socket is
+    /// dropped), in seconds. Default 10.
+    pub write_timeout_secs: u64,
+    /// Frames waiting to be sent per socket (pushes): the largest burst the game may push to one
+    /// socket at once. While a request handler runs, as many again are held back (they follow its
+    /// answer). When both are full the socket is closed with 1013 (the client reconnects and
+    /// resyncs). Raise it for broadcast-heavy games. Default 256.
+    pub outbox_frames: usize,
+    /// Incoming frames per second per socket (sustained); over it a request is answered
+    /// `rate_limited`, and a socket that keeps flooding is closed with 1008. Default 20.
+    pub frames_per_second: u32,
+    /// Incoming frames a socket may send at once (the bucket size). Default 40.
+    pub frame_burst: u32,
+    /// The largest message in either direction, in bytes (a bigger incoming one closes the socket
+    /// with 1009). Default 1 MiB (the protocol's `MAX_MESSAGE_BYTES` and the client's default).
+    pub max_message_bytes: usize,
+    /// The socket's read buffer, in bytes. Default 8 KiB (tungstenite's own default, 128 KiB per
+    /// socket, costs ~120 KiB more per idle connection).
+    pub read_buffer_bytes: usize,
+    /// The most rooms one socket may be in at once (`Hub::join`). Default 16 (the protocol's
+    /// `DEFAULT_MAX_JOINED_ROOMS`).
+    pub max_rooms_per_connection: usize,
+    /// The most sockets in one room unless the room is joined with its own cap. Default 200 (the
+    /// protocol's `DEFAULT_MAX_ROOM_MEMBERS`).
+    pub max_room_members: usize,
+    /// Accept the access token as `?token=` on the handshake. Default false: reverse proxies (Caddy,
+    /// nginx) log URLs with their query, so a token there ends up in access logs. Clients that cannot
+    /// set headers (browsers) use first-message `auth` instead.
+    pub query_token: bool,
+}
+
+impl Default for WsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_connections: 10_000,
+            max_connections_per_user: 5,
+            max_connections_per_ip: 100,
+            max_pending_connections: 1000,
+            roles_refresh_secs: 60,
+            handshakes_per_ip_per_minute: 60,
+            auth_timeout_secs: net_backend_protocol::envelope::AUTH_TIMEOUT_SECS,
+            ping_interval_secs: 20,
+            idle_timeout_secs: 60,
+            request_timeout_secs: 10,
+            write_timeout_secs: 10,
+            outbox_frames: 256,
+            frames_per_second: 20,
+            frame_burst: 40,
+            max_message_bytes: net_backend_protocol::envelope::MAX_MESSAGE_BYTES,
+            read_buffer_bytes: 8 * 1024,
+            max_rooms_per_connection: net_backend_protocol::chat::DEFAULT_MAX_JOINED_ROOMS as usize,
+            max_room_members: net_backend_protocol::chat::DEFAULT_MAX_ROOM_MEMBERS as usize,
+            query_token: false,
+        }
+    }
+}
+
+impl WsConfig {
+    fn problems(&self, problems: &mut Vec<String>) {
+        let ranges: [(&str, u64, u64, u64); 7] = [
+            ("ws.auth_timeout_secs", self.auth_timeout_secs, 1, 300),
+            ("ws.ping_interval_secs", self.ping_interval_secs, 1, 3600),
+            ("ws.idle_timeout_secs", self.idle_timeout_secs, 2, 7200),
+            ("ws.request_timeout_secs", self.request_timeout_secs, 1, 3600),
+            ("ws.write_timeout_secs", self.write_timeout_secs, 1, 3600),
+            ("ws.frames_per_second", u64::from(self.frames_per_second), 1, 100_000),
+            ("ws.frame_burst", u64::from(self.frame_burst), 1, 100_000),
+        ];
+        for (name, value, min, max) in ranges {
+            if !(min..=max).contains(&value) {
+                problems.push(format!("{name} must be between {min} and {max}"));
+            }
+        }
+        if self.idle_timeout_secs <= self.ping_interval_secs {
+            problems.push("ws.idle_timeout_secs must be greater than ws.ping_interval_secs".into());
+        } else if self.request_timeout_secs >= self.idle_timeout_secs - self.ping_interval_secs {
+            // A socket reads nothing while its handler runs; it must not look dead afterwards.
+            problems.push("ws.request_timeout_secs must be less than ws.idle_timeout_secs - ws.ping_interval_secs".into());
+        }
+        if self.roles_refresh_secs > 86_400 {
+            problems.push("ws.roles_refresh_secs must be at most 86400".into());
+        }
+        let sizes: [(&str, usize, usize, usize); 9] = [
+            ("ws.max_connections", self.max_connections, 1, 10_000_000),
+            ("ws.max_connections_per_user", self.max_connections_per_user, 1, 10_000),
+            ("ws.max_connections_per_ip", self.max_connections_per_ip, 1, 10_000_000),
+            ("ws.max_pending_connections", self.max_pending_connections, 1, 10_000_000),
+            ("ws.outbox_frames", self.outbox_frames, 4, 1 << 20),
+            ("ws.max_message_bytes", self.max_message_bytes, 1024, 64 * 1024 * 1024),
+            ("ws.read_buffer_bytes", self.read_buffer_bytes, 1024, 1024 * 1024),
+            ("ws.max_rooms_per_connection", self.max_rooms_per_connection, 1, 100_000),
+            ("ws.max_room_members", self.max_room_members, 1, 10_000_000),
+        ];
+        for (name, value, min, max) in sizes {
+            if !(min..=max).contains(&value) {
+                problems.push(format!("{name} must be between {min} and {max}"));
+            }
+        }
+    }
+}
+
 impl Config {
     /// Load from the file named by `NBS_CONFIG` (or `./config.toml` if it exists) plus the
     /// `NBS__*` environment overrides, then [`validate`](Config::validate).
@@ -444,6 +588,26 @@ impl Config {
             ["openapi", "ui_script_integrity"] => self.openapi.ui_script_integrity = Some(value.to_string()),
             ["openapi", "title"] => self.openapi.title = value.to_string(),
             ["openapi", "version"] => self.openapi.version = value.to_string(),
+            ["ws", "enabled"] => self.ws.enabled = parse(value)?,
+            ["ws", "max_connections"] => self.ws.max_connections = parse(value)?,
+            ["ws", "max_connections_per_user"] => self.ws.max_connections_per_user = parse(value)?,
+            ["ws", "max_connections_per_ip"] => self.ws.max_connections_per_ip = parse(value)?,
+            ["ws", "max_pending_connections"] => self.ws.max_pending_connections = parse(value)?,
+            ["ws", "roles_refresh_secs"] => self.ws.roles_refresh_secs = parse(value)?,
+            ["ws", "handshakes_per_ip_per_minute"] => self.ws.handshakes_per_ip_per_minute = parse(value)?,
+            ["ws", "auth_timeout_secs"] => self.ws.auth_timeout_secs = parse(value)?,
+            ["ws", "ping_interval_secs"] => self.ws.ping_interval_secs = parse(value)?,
+            ["ws", "idle_timeout_secs"] => self.ws.idle_timeout_secs = parse(value)?,
+            ["ws", "request_timeout_secs"] => self.ws.request_timeout_secs = parse(value)?,
+            ["ws", "write_timeout_secs"] => self.ws.write_timeout_secs = parse(value)?,
+            ["ws", "outbox_frames"] => self.ws.outbox_frames = parse(value)?,
+            ["ws", "frames_per_second"] => self.ws.frames_per_second = parse(value)?,
+            ["ws", "frame_burst"] => self.ws.frame_burst = parse(value)?,
+            ["ws", "max_message_bytes"] => self.ws.max_message_bytes = parse(value)?,
+            ["ws", "read_buffer_bytes"] => self.ws.read_buffer_bytes = parse(value)?,
+            ["ws", "max_rooms_per_connection"] => self.ws.max_rooms_per_connection = parse(value)?,
+            ["ws", "max_room_members"] => self.ws.max_room_members = parse(value)?,
+            ["ws", "query_token"] => self.ws.query_token = parse(value)?,
             ["modules", module, rest @ ..] if !module.is_empty() && !rest.is_empty() && rest.iter().all(|s| !s.is_empty()) => {
                 let mut table = match self.modules.remove(*module) {
                     Some(toml::Value::Table(table)) => table,
@@ -549,6 +713,7 @@ impl Config {
         if self.openapi.title.trim().is_empty() || self.openapi.version.trim().is_empty() {
             problems.push("openapi.title and openapi.version must not be empty".into());
         }
+        self.ws.problems(&mut problems);
         if problems.is_empty() {
             Ok(())
         } else {

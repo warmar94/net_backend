@@ -6,8 +6,8 @@
   <img alt="Rust 1.95+" src="https://img.shields.io/badge/rust-1.95%2B-orange">
 </p>
 
-> **Status: in development.** Nothing is published yet. The core and the accounts module described
-> below work and are tested; the WebSocket hub and the storage and chat modules are being built
+> **Status: in development.** Nothing is published yet. The core, the accounts module and the
+> WebSocket hub described below work and are tested; the storage and chat modules are being built
 > next (see [Roadmap](#roadmap)). APIs may still change before 0.1.0.
 
 A Rust framework for building **game backend servers**: async (tokio + axum) and modular. It speaks
@@ -42,7 +42,7 @@ The server does not care which client connects; the JSON on the wire is the cont
 |---|---|
 | a **Bevy** game | [`bevy_net_backend`](https://crates.io/crates/bevy_net_backend) for the connection (HTTP, WebSocket) + [`net_backend_protocol`](https://github.com/warmar94/net_backend/tree/main/crates/net_backend_protocol) for the message types. The recommended path. |
 | **another Rust** app (other engine, tool, bot, CLI) | `net_backend_protocol` + the HTTP / WebSocket library you already use (for example reqwest, ureq, tokio-tungstenite). A small ready-made client, [`net_backend_client`](https://github.com/warmar94/net_backend/tree/main/crates/net_backend_client), is coming. |
-| **not Rust** (C#, GDScript, JavaScript, …) | The API directly: the OpenAPI document at `/v1/openapi.json` describes every HTTP route and can generate typed clients; a WebSocket message reference comes with the WebSocket hub. |
+| **not Rust** (C#, GDScript, JavaScript, …) | The API directly: the OpenAPI document at `/v1/openapi.json` describes every HTTP route and can generate typed clients; the AsyncAPI document at `/v1/asyncapi.json` and the [WebSocket](#websocket) section describe every WebSocket frame. |
 
 ## Contents
 
@@ -54,6 +54,7 @@ The server does not care which client connects; the JSON on the wire is the cont
 - [Configuration](#configuration)
 - [Modules and hooks](#modules-and-hooks)
 - [Accounts and authentication](#accounts-and-authentication)
+- [WebSocket](#websocket)
 - [Databases](#databases)
 - [Migrations](#migrations)
 - [The command line](#the-command-line)
@@ -81,10 +82,11 @@ The server does not care which client connects; the JSON on the wire is the cont
 | Migrations | Plain SQL per dialect, ordered, tracked and checksummed, namespaced per module, safe against concurrent runs on every backend, precise recovery messages; modules' migrations can be **published** into the app, which then owns them. |
 | HTTP | Routes under `/v1`, `GET /v1/info`, `/healthz`, `/readyz`, body limits (64 KiB default, 32 MiB hard cap), a header-read timeout, request ids, request tracing, request timeouts, panic safety, optional CORS, the protocol version header. |
 | Errors | Every 4xx / 5xx is the protocol's error body; internal errors are logged with the request id and never reach a client. |
-| OpenAPI | The document at `/v1/openapi.json` (utoipa), an optional browser UI. |
-| Operations | Optional Prometheus metrics on their own loopback listener, a command line (`serve`, `migrate`, `migrations publish`, `config check`, `openapi export`), graceful shutdown with an enforced deadline. |
+| OpenAPI / AsyncAPI | The HTTP document at `/v1/openapi.json` (utoipa), an optional browser UI; the WebSocket document at `/v1/asyncapi.json` (AsyncAPI 3.0, generated from the registered kinds). |
+| Operations | Optional Prometheus metrics on their own loopback listener, a command line (`serve`, `migrate`, `migrations publish`, `config check`, `openapi export`, `asyncapi export`), graceful shutdown with an enforced deadline. |
 | Accounts | The `Auth` module: email + password (argon2id) and Steam logins, opaque access and rotating refresh tokens stored as hashes, sessions and revocation, email verification and password reset (log or SMTP mailer), roles, an audit log, `/v1/admin` routes, rate limits and a failed-login lockout, hooks, `user:*` commands. |
-| Seams | Authenticators (`Authenticator`, the `AuthContext` / `RequireRole` extractors), rate limiters (with an in-memory `MemoryRateLimiter`), trusted-proxy client addresses, app commands, the reserved `/v1/ws` path. |
+| WebSocket hub | `/v1/ws` with the protocol's envelope: auth at the handshake (Bearer / `?token=`) or by first message, request handlers by kind (typed or JSON) for the game and modules, pushes to a socket / user / room / everyone, rooms with caps, close on revocation (4001) and ban (4003), connection caps, per-socket rate limits and bounded outboxes, heartbeats, hooks, 1001 on shutdown, a pub/sub seam for several instances. |
+| Seams | Authenticators (`Authenticator`, the `AuthContext` / `RequireRole` extractors), rate limiters (with an in-memory `MemoryRateLimiter`), trusted-proxy client addresses, app commands, the WebSocket `Broadcaster`. |
 
 ## Features
 
@@ -209,6 +211,28 @@ ui = false                     # /v1/docs; needs the two pinned script settings 
 # ui_script_integrity = "sha384-…"
 title = "Game backend API"
 version = "1"
+
+[ws]                           # the WebSocket hub at /v1/ws (see WebSocket)
+enabled = true                 # false: /v1/ws answers 403
+max_connections = 10000        # 503 above
+max_connections_per_user = 5   # a newer socket closes the oldest with 4009 (its own session's first)
+max_connections_per_ip = 100   # open sockets per client address (IPv6 by /64); 429 above
+max_pending_connections = 1000 # sockets still waiting for `auth`; 503 above
+roles_refresh_secs = 60        # role changes made by another process reach open sockets within this
+handshakes_per_ip_per_minute = 60
+auth_timeout_secs = 5          # unauthenticated sockets: send `auth` within this, else close 1008
+ping_interval_secs = 20
+idle_timeout_secs = 60         # nothing from the client for this long: dropped
+request_timeout_secs = 10      # one handler call
+write_timeout_secs = 10        # a frame not taken within this: the socket is dropped
+outbox_frames = 256            # pushes waiting per socket; full: close 1013
+frames_per_second = 20         # per socket, burst below; over it: `rate_limited`, flooding: close 1008
+frame_burst = 40
+max_message_bytes = 1048576    # both directions; bigger incoming: close 1009
+read_buffer_bytes = 8192
+max_rooms_per_connection = 16
+max_room_members = 200         # unless a room is joined with its own cap
+query_token = false            # accept ?token= on the handshake (proxies log URLs: off by default)
 
 [modules.auth]                 # each module reads its own section (here: the accounts module)
 app_name = "My Game"           # in mail subjects
@@ -500,6 +524,242 @@ code 4003 for a ban, else 4001).
   converted to punycode, so `bücher.de` and `xn--bcher-kva.de` count as different addresses).
 - Every setting is in `[modules.auth]` (see `AuthConfig`); secrets also come as `*_file`.
 
+## WebSocket
+
+The hub at `/v1/ws` (on by default, `[ws]`) carries requests, answers and server pushes as JSON
+objects in text frames, exactly the envelope of
+[`net_backend_protocol`](https://github.com/warmar94/net_backend/tree/main/crates/net_backend_protocol)
+(which is what `bevy_net_backend`'s `JsonEnvelope` speaks). Clients in other languages can follow
+this section or the AsyncAPI 3.0 document the server generates at **`GET /v1/asyncapi.json`**
+(every frame type, the kinds your server registered, close codes; `asyncapi export` writes it
+without a database).
+
+### Frames
+
+```json
+{"id":7,"type":"game.shout","data":{"text":"hello"}}
+{"id":7,"ok":true,"data":{"listeners":12}}
+{"id":7,"ok":false,"error":{"code":"room_full","message":"the room is full"}}
+{"type":"game.heard","data":{"from":42,"text":"hello"}}
+```
+
+| Direction | Frame | Rules |
+|---|---|---|
+| client → server | request `{"id","type","data"}` | `id` is an unsigned 64-bit integer, echoed in the answer; `data` may be left out (`null`) |
+| server → client | answer `{"id","ok":true,"data"}` / `{"id","ok":false,"error"}` | exactly one per request; `error` is the protocol's `{"code","message","details"?}` |
+| server → client | push `{"type","data"}` | never an `id` or `ok` field |
+| client → server | `{"type":"auth","data":{"token":"…","protocol":1}}` | first-message authentication (no `id`) |
+| server → client | `{"type":"auth.ok","data":{"user_id":42,"protocol":1}}` / `{"type":"auth.failed","error":{…}}` | exactly one per `auth`; `auth.failed` is followed by a close |
+
+A malformed frame that has an unsigned-integer `id` is answered `bad_request`; one without an id
+cannot be answered and is dropped (counted in the metrics). Binary frames are not part of the
+protocol and are dropped. Error codes on requests: `bad_request` (malformed frame or `data`),
+`unauthorized` (not authenticated yet), `unknown_type`, `rate_limited` (`details.retry_after_ms`),
+`payload_too_large` (an answer over the message limit), `unavailable` (the handler took longer
+than `ws.request_timeout_secs`), `internal` (never with details), plus whatever a handler answers.
+
+### Authentication
+
+| How | What happens |
+|---|---|
+| `Authorization: Bearer <access token>` on the handshake | checked by the app's authenticators (the `Auth` module's, or your own) before the upgrade |
+| `?token=<access token>` (only with `ws.query_token = true`; default off) | the same; the server never logs query strings, but reverse proxies (Caddy, nginx) log URLs with them, so a token there lands in access logs. Prefer the header, or first-message `auth` for clients that cannot set headers (browsers) |
+| first message `{"type":"auth",…}` within `ws.auth_timeout_secs` (5 s) | `auth.ok`, or `auth.failed` + close; no `auth` in time: close 1008 |
+
+- A refused handshake never answers 400 (clients retry those forever): an invalid token is 401
+  `unauthorized`, an expired one 401 `token_expired` (refresh, then reconnect), a banned account
+  403 `banned`, a `before` hook's refusal its own status, an unsupported protocol version 403 when
+  the request is not an upgrade (else: upgrade, then close 4010), a full hub or too many sockets
+  waiting for `auth` 503 + `Retry-After`, too many handshakes or open sockets from one address 429
+  + `Retry-After`, a temporary failure (database down) 503, a plain GET 426.
+- Every `auth` frame gets exactly one `auth.ok` / `auth.failed`, also on a socket the handshake
+  already authenticated (a client may do both). A later `auth` with a fresh token of the same user
+  re-authenticates; another user's token is refused (`auth.failed`, close 4001). `auth.failed` is
+  always definitive; a TEMPORARY failure (the database is down, a hook timed out, 5xx / 429) closes
+  with 1013 without an answer, so clients reconnect and try again.
+- An open socket survives the expiry of its access token. Revoking its session closes it: logout,
+  password change or reset, admin revocation, refresh-token reuse → 4001; a ban → 4003. Revocations
+  made by another process (the command line, another instance) arrive through the `Auth` module's
+  database poll (`revocation_poll_secs`, 5 s). A revocation that lands while a socket is still
+  authenticating (after its token was checked) is applied too.
+- `WsCtx.auth.roles` follow role changes: at once for changes made in this process (admin routes,
+  server code), within `ws.roles_refresh_secs` (60 s) for changes made elsewhere (the command line,
+  another instance).
+- Requests sent before authenticating are answered `unauthorized`; pushes reach authenticated
+  sockets only.
+
+### Close codes
+
+| Code | Meaning | Client reconnects |
+|---|---|---|
+| 1000 | normal closure | yes |
+| 1001 | the server is shutting down or redeploying | yes |
+| 1008 | no `auth` in time, or still flooding after the rate limit refused `ws.frame_burst` frames in a row | yes |
+| 1009 | a message over `ws.max_message_bytes` | yes |
+| 1011 | an unexpected server error | yes |
+| 1013 | this socket could not keep up with its pushes (outbox full); reconnect and resync | yes |
+| 4001 | authentication refused or revoked: log in again | no |
+| 4003 | the account is banned | no |
+| 4009 | replaced: the user opened more than `ws.max_connections_per_user` sockets (the oldest of the same session goes first, then the oldest overall) | no |
+| 4010 | the client's protocol version is not supported | no |
+
+The client crate never reconnects after 4000–4099; the server uses that range only for "do not
+come back".
+
+### Handlers
+
+Register a handler per request kind: typed through the protocol's `WsCall` (the request type and
+its answer type), or untyped on `serde_json::Value`. A handler gets a `WsCtx` (the app state, its
+`connection`, the caller's `AuthContext`, the request `id` and `kind`) and answers
+`Result<Response, AppError>`. Requests of one socket are handled one after another, in order; the
+answer is written before any push the handler queued (a chat echo arrives after its
+acknowledgement).
+
+```rust,no_run
+use net_backend_server::protocol::{ServerPush, WsCall};
+use net_backend_server::ws::{WsCtx, WsHandlers};
+use net_backend_server::{AppError, Config, Module, NetBackendServer};
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize)]
+struct Shout {
+    text: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Shouted {
+    listeners: usize,
+}
+
+impl WsCall for Shout {
+    type Response = Shouted;
+    const KIND: &'static str = "game.shout";
+}
+
+#[derive(Serialize, Deserialize)]
+struct Heard {
+    from: i64,
+    text: String,
+}
+
+impl ServerPush for Heard {
+    const KIND: &'static str = "game.heard";
+}
+
+async fn shout(ctx: WsCtx, shout: Shout) -> Result<Shouted, AppError> {
+    let hub = ctx.hub();
+    hub.join(ctx.connection, "lobby")?; // room_full / quota_exceeded become error answers
+    hub.push_room("lobby", &Heard { from: ctx.auth.user_id.get(), text: shout.text })?;
+    Ok(Shouted { listeners: hub.room_size("lobby") })
+}
+
+/// A module registers its kinds the same way.
+struct Lobby;
+
+impl Module for Lobby {
+    fn name(&self) -> &'static str {
+        "lobby"
+    }
+    fn ws_handlers(&self, ws: &mut WsHandlers) {
+        ws.raw("lobby.ping", |_ctx, data| async move { Ok(data) }).summary("Echo the data back");
+        ws.push::<Heard>().summary("Someone in the room shouted");
+    }
+}
+
+async fn start(config: Config) -> Result<(), net_backend_server::Error> {
+    NetBackendServer::new(config)
+        .module(Lobby)
+        .ws(|ws| {
+            ws.call::<Shout, _, _>(shout).summary("Shout into the lobby");
+        })
+        .run()
+        .await
+}
+```
+
+- `NetBackendServer::ws(|ws| …)` (or the shortcuts `.ws_call::<C, _, _>(handler)` and
+  `.ws_handler(kind, handler)`) for the game; `Module::ws_handlers` for modules. A kind is 1–64
+  bytes of `[a-z0-9_.:-]` starting with a letter, registered once (a duplicate stops the build);
+  `auth`, `auth.ok` and `auth.failed` are reserved.
+- The typed form decodes `data` as the request type (`bad_request` if it does not fit) and encodes
+  the answer. `KindDoc` (returned by every registration) documents a kind for the AsyncAPI
+  document: `.summary(..)`, `.description(..)`, `.data_schema(json)`, `.answer_schema(json)`, or
+  `.schemas::<Req, Res>()` from types deriving `utoipa::ToSchema`. `ws.push::<P>()` /
+  `ws.push_kind(kind)` documents a push (sending one needs no registration).
+- A handler that panics answers `internal` (the socket stays open); one that runs longer than
+  `ws.request_timeout_secs` (10 s) answers `unavailable`.
+
+### Pushes and rooms
+
+The hub is `state.ws()` (`AppState::ws`), `State<Hub>` in HTTP handlers and `ctx.hub()` in
+WebSocket handlers, so an HTTP route can push too.
+
+| Call | What |
+|---|---|
+| `push_user(user, &push)`, `push_room(room, &push)`, `push_all(&push)`, `push_connection(id, &push)` | a typed `ServerPush`, encoded once for every receiver |
+| `push(target, &push)`, `push_raw(target, kind, &data)`, `publish(Delivery)` | any `Target` (`Connection`, `User`, `Room`, `All`); untyped kinds; a pre-encoded frame. A frame over `ws.max_message_bytes` is refused with `PushError::TooLarge` (logged, counted): clients would close for it |
+| `join(id, room)`, `join_with_cap(id, room, cap)`, `leave(id, room)` | membership ends with the socket; caps `ws.max_room_members` (200) and `ws.max_rooms_per_connection` (16) |
+| `room_members(room)`, `room_size(room)`, `rooms_of(id)`, `connections_of(user)`, `is_online(user)`, `connection(id)`, `stats()` | lookups (this instance) |
+| `close(id, code, reason)`, `close_user(user, code, reason)` | close sockets yourself (e.g. 4001 after your own revocation) |
+
+Each socket has a bounded outbox (`ws.outbox_frames`, 256): **the largest burst you may push to one
+socket at once**. A push to a socket whose outbox is full closes it with 1013 (the client reconnects
+and resyncs) instead of buffering without limit or silently dropping messages, and a socket that
+does not take a frame within `ws.write_timeout_secs` (10 s) is dropped: one slow client never holds
+the others back. Raise `outbox_frames` for broadcast-heavy games (a 3000-message burst to a room
+needs it above 3000). Pushes keep flowing while a request handler of the socket runs; only the
+pushes that handler makes to its own socket wait for its answer (up to `outbox_frames` of them).
+
+### Limits, heartbeats, hooks
+
+- **Caps:** `ws.max_connections` (10 000; 503 above), `ws.max_pending_connections` (1000 sockets
+  waiting for `auth`; 503 above), `ws.max_connections_per_ip` (100 open sockets per address; 429),
+  `ws.max_connections_per_user` (5; the oldest is closed with 4009, the same session's first),
+  `ws.handshakes_per_ip_per_minute` (60; IPv6 by /64; 429 above). Behind a reverse proxy, list it in
+  `http.trusted_proxies`: otherwise every client has the proxy's address and the per-address limits
+  apply to everyone together (a restart would then 429 most reconnects).
+- **Rate limit per socket:** `ws.frames_per_second` (20) with a burst of `ws.frame_burst` (40),
+  counting text, binary and ping frames; a request over it is answered `rate_limited`, and a socket
+  that keeps flooding is closed with 1008.
+- **Sizes:** `ws.max_message_bytes` (1 MiB, the protocol's `MAX_MESSAGE_BYTES`) in both directions.
+- **Heartbeats:** the server answers pings and pings every `ws.ping_interval_secs` (20 s); a socket
+  that sent nothing (not even a pong) for `ws.idle_timeout_secs` (60 s) is dropped. This fits
+  `bevy_net_backend`'s heartbeat (a ping every 15 s, dead after 45 s of silence).
+- **Memory:** an 8 KiB read buffer per socket (`ws.read_buffer_bytes`), no write buffering;
+  measured about 15 KiB of server heap per idle authenticated socket (tungstenite's defaults would
+  add ~120 KiB). Behind Caddy, the proxy needs far more per socket (~100 KiB measured): it, not the
+  hub, bounds the socket count on a small box.
+- **Hooks** (`ws::events`): `BeforeWsConnect` (refuse a player: 403 at the handshake, else
+  `auth.failed` + 4001; a 5xx / 429 refusal is temporary; it carries the handshake's `Origin`: an app
+  that authenticates with cookies must check it), `AfterWsConnect` (in its own task),
+  `AfterWsDisconnect` (with the rooms it left; not for sockets dropped when the shutdown grace ran
+  out), `BeforeWsFrame` (change a request's `data` or refuse it; its `kind` is read-only).
+- **Presence** (who is in a room) is not the hub's job: the chat module builds it on these hooks.
+- **Several instances:** pushes to users, rooms and everyone go through a `Broadcaster`
+  (`.broadcaster(..)`); the default `LocalBroadcaster` delivers in this process. A pub/sub
+  implementation publishes each `Delivery` (serde-serializable) to every instance, which hands it to
+  its own sockets with the `LocalDelivery` it got in `start`. `push_connection` never leaves the
+  process (connection ids are per instance), and rooms, `is_online`, `close_user` and the caps are
+  per instance.
+- **Shutdown:** every socket gets close 1001 when the shutdown starts; the hub waits for them
+  within `server.shutdown_grace_secs`, then drops the rest.
+
+### With bevy_net_backend
+
+```text
+// The access token on every handshake (Bearer), the default JsonEnvelope, ws:// only on loopback.
+credentials.set(BearerToken::new(session.tokens.access_token.expose()));
+ws.connect("main", WsSettings::new("wss://game.example.com/v1/ws"));
+// First-message auth instead (or as well): return `WsAuth::new(token).to_message()` from your
+// `Credentials::ws_auth_message`, and `.with_auth_ack(Duration::from_secs(5))` to hold requests
+// until `auth.ok`.
+```
+
+`bevy_net_backend` 0.1.0 treats a 401 handshake as final. After a server restart (1001) a client
+whose access token expired meanwhile gets 401 `token_expired` and goes `Disconnected`: watch
+`WsStateChanged` for that error, refresh the token (`POST /v1/auth/refresh`), set the new
+credentials and `connect` again. Refreshing shortly before expiry avoids it.
+
 ## Databases
 
 One `Db` handle over the pool of the configured backend. Statements are built with
@@ -602,6 +862,7 @@ Every server binary built with `.run()` has these commands:
 | `migrations publish <module> [--dialect mysql\|postgres\|sqlite] [--force]` | copy a module's SQL into the app |
 | `config check [--connect]` | validate the configuration and print a summary without secrets (and try the database) |
 | `openapi export [--output <file>]` | write or print the OpenAPI document (needs no database) |
+| `asyncapi export [--output <file>]` | write or print the AsyncAPI document of the WebSocket endpoint (needs no database) |
 | `user:create <email> [--name <n>] [--password-file <f>] [--admin] [--verified]` | create an account (auth module); without a file a password is generated and printed once |
 | `user:role <email or id> <role> [--revoke]` | grant or revoke a role |
 | `user:ban <email or id> [--reason <text>] [--hours <n>]`, `user:unban <email or id>` | ban (revokes the sessions) or lift a ban |
@@ -622,8 +883,8 @@ machine).
 - Routes live under `/v1`. `GET /v1/info` answers the protocol's `ServerInfo`
   (`{"protocol":1,"min_protocol":1,"modules":[…]}`, module names sorted). `GET /healthz` (liveness)
   and `GET /readyz` (readiness: the database answers and the server is not shutting down) are
-  unversioned. `/v1/ws` is reserved for the WebSocket hub and answers 403 until it exists (never
-  400, which clients would retry forever).
+  unversioned. `/v1/ws` is the WebSocket hub (see [WebSocket](#websocket)); it never answers 400,
+  which clients would retry forever.
 - Every answer (except CORS preflights) carries `x-net-backend-protocol: 1`. A request naming an unsupported version in
   that header gets 400 `unsupported_protocol` with `{"supported_min":1,"supported_max":1}`.
 - **Body limits:** 64 KiB by default (the protocol's `DEFAULT_BODY_LIMIT_BYTES`; axum's own
@@ -688,19 +949,27 @@ reaches a client.
   pinned to an exact version (`openapi.ui_script_url`) plus its Subresource Integrity hash
   (`openapi.ui_script_integrity`); the page sends a Content-Security-Policy that allows no other
   script.
+- `GET /v1/asyncapi.json` (with `openapi.enabled` and `ws.enabled`): the AsyncAPI 3.0 document of
+  the WebSocket endpoint, generated when the server is built: the envelope, `auth` / `auth.ok` /
+  `auth.failed`, the error answer, every registered request kind (with its schemas when
+  documented) and documented push, the close codes (also as `x-close-codes`).
 - `GET /readyz` checks the database with a 1 s limit and fails at once when the database refuses
   connections.
 - Metrics (`metrics.enabled`, default off): Prometheus text at `GET /metrics` on **its own
   listener**, `metrics.bind` (default `127.0.0.1:9100`), never on the API port:
   `nbs_http_requests_total` and `nbs_http_request_duration_seconds` by method, route pattern and
-  status. Record your own metrics with the [`metrics`](https://crates.io/crates/metrics) facade.
+  status; for the WebSocket hub `nbs_ws_connections` (gauge), `nbs_ws_frames_in_total`,
+  `nbs_ws_frames_out_total`, `nbs_ws_closes_total` by `code` (the code sent, or `peer` / `dead` /
+  `stuck`), `nbs_ws_dropped_frames_total` and `nbs_ws_handshakes_refused_total` by `reason`,
+  `nbs_ws_slow_consumers_total`. Record your own metrics with the [`metrics`](https://crates.io/crates/metrics) facade.
   If your app installs its own recorder first, the framework records into it and does not serve
   `/metrics`.
 
 ## Graceful shutdown
 
 On SIGTERM or Ctrl-C (or the future given to `serve_with_shutdown`): the server stops accepting
-connections, `/readyz` answers 503, in-flight requests get `server.shutdown_grace_secs` to finish,
+connections, `/readyz` answers 503, every WebSocket gets close 1001 (clients reconnect to the next
+instance), in-flight requests and closing sockets get `server.shutdown_grace_secs` to finish,
 then modules shut down in reverse order, the shutdown hooks run and the database pool closes.
 At the deadline the remaining connections are closed and their handlers are dropped (cancelled),
 so no handler runs on after the modules and the pool are gone. Set systemd's `TimeoutStopSec`
@@ -711,9 +980,9 @@ above the grace period plus the module shutdown time.
 | Step | What |
 |---|---|
 | core | the builder, modules, databases, migrations, HTTP, OpenAPI, command line |
-| accounts (this) | the `Auth` module, rate limits, trusted proxies, app commands |
-| next | the WebSocket hub (the client's envelope, rooms, bounded outboxes, close codes; tokens checked at the handshake, sockets closed on revocation) |
-| then | the storage (saves) and chat modules |
+| accounts | the `Auth` module, rate limits, trusted proxies, app commands |
+| WebSocket (this) | the hub: the client's envelope, handlers, pushes, rooms, bounded outboxes, close codes, revocation closes, AsyncAPI |
+| next | the storage (saves) and chat modules |
 | then | deployment (Docker Compose or systemd, Caddy, backups) and a measured load test |
 
 Later versions: OAuth providers, notifications, friends, leaderboards, groups, lobbies, an
@@ -721,7 +990,11 @@ optional SeaORM layer, multi-instance pub/sub, payment connectors.
 
 ## Limits
 
-- No WebSocket hub yet (see the roadmap). No OAuth providers yet (Steam and email only).
+- No OAuth providers yet (Steam and email only).
+- WebSocket rooms, users and connections are per instance; only pushes can travel between
+  instances (through a `Broadcaster`; the built-in one is in process). No permessage-deflate.
+  Sockets waiting for their first-message `auth` count against `ws.max_connections` for up to
+  `ws.auth_timeout_secs`.
 - Rate limits and the failed-login counters are in memory, per process.
 - Revocations from other processes reach this process's subscribers by a database poll
   (`revocation_poll_secs`, 5 s), not instantly.
@@ -758,8 +1031,17 @@ Steam (a fake verifier), roles, admin routes, the audit log, rate limits and loc
 same answer for known and unknown addresses, redaction (no secret in logs, `Debug` or errors) and
 hashing on the blocking pool; it runs on SQLite here and on MySQL / MariaDB / PostgreSQL in CI. The
 real Steam and SMTP clients are tested against fakes on 127.0.0.1, never a real service.
+The WebSocket suite runs a loopback server with a WebSocket client: both ways to authenticate, the
+auth deadline, every refusal, version mismatches, token expiry, logout / ban / another process's
+ban closing sockets, malformed frames, handler panics and timeouts, rooms and their caps,
+connection caps, slow consumers, heartbeats and dead peers, the rate and size limits, hooks and
+shutdown. A separate unpublished crate in the repository drives the server with the published
+`bevy_net_backend` client in a headless app (Bearer and first-message auth with the
+acknowledgement, requests, pushes, reconnecting after 1001, staying away after 4003 / 4010 / 401,
+heartbeats both ways). `tests/ws_memory.rs` measures the heap per idle socket (ignored; run it in
+release with `--ignored --nocapture`).
 CI runs fmt, clippy, docs, the tests for each backend alone and all together,
-the external-database job, the dependency rules and the package contents.
+the external-database job, the end-to-end client job, the dependency rules and the package contents.
 
 ## FAQ
 

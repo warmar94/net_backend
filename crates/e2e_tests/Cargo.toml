@@ -1,0 +1,24 @@
+[package]
+name = "e2e_tests"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "End-to-end tests: net_backend_server driven by the published Bevy client over loopback. Never published."
+license.workspace = true
+repository.workspace = true
+# Tests only: never packaged or published. Bevy lives here (dev-dependencies), so the server's own
+# `cargo test -p net_backend_server` never builds an engine.
+publish = false
+
+[dev-dependencies]
+net_backend_server = { path = "../net_backend_server", default-features = false, features = ["sqlite"] }
+# The published client, by version (never a path): what games really use.
+bevy_net_backend = { version = "0.1.0", features = ["ws"] }
+# A headless app: MinimalPlugins, no window. Exactly 0.19.0 (one Bevy in the lockfile).
+bevy = { version = "=0.19.0", default-features = false, features = ["std"] }
+tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "net", "time"] }
+# One-shot HTTP calls into the server's router (both already in the server's tree).
+tower = { version = "0.5.2", default-features = false, features = ["util"] }
+http = "1.3"
+serde = { workspace = true }
+serde_json = { workspace = true }

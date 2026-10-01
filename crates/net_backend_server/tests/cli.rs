@@ -133,6 +133,12 @@ async fn openapi_export_needs_no_database() {
     let (result, out) = run(&config, &["openapi", "export", "--output", &file.display().to_string()]).await;
     assert!(result.is_ok() && out.contains("Wrote"), "{result:?} {out}");
     assert!(std::fs::read_to_string(&file).expect("file").contains("\"/v1/info\""));
+    // The WebSocket endpoint's AsyncAPI document, likewise without a database.
+    let (result, out) = run(&config, &["asyncapi", "export"]).await;
+    assert!(result.is_ok(), "{result:?}");
+    let doc: serde_json::Value = serde_json::from_str(out.trim()).expect("JSON");
+    assert_eq!(doc["asyncapi"], "3.0.0");
+    assert_eq!(doc["channels"]["ws"]["address"], "/v1/ws");
 }
 
 #[cfg(feature = "sqlite")]

@@ -8,8 +8,8 @@
 
 **Build your own game backend in Rust: server, protocol and client.**
 
-> **Status: in development.** Nothing is published yet. The server's core and its accounts
-> module work and are tested; the WebSocket hub, storage, chat and deployment come next. APIs may
+> **Status: in development.** Nothing is published yet. The server's core, its accounts module
+> and its WebSocket hub work and are tested; storage, chat and deployment come next. APIs may
 > still change before 0.1.0.
 
 `net_backend` is a family of Rust crates for game backends: a framework you build your own server
@@ -38,7 +38,7 @@ Not Rust? Use the HTTP / WebSocket API directly (OpenAPI + WebSocket reference).
 
 | Crate | What | Status |
 |---|---|---|
-| [`net_backend_server`](crates/net_backend_server/README.md) | The game-backend framework: tokio + axum, modules with hooks, accounts and sessions, MySQL / PostgreSQL / SQLite, migrations, OpenAPI. A library you build your own server binary with. | in development |
+| [`net_backend_server`](crates/net_backend_server/README.md) | The game-backend framework: tokio + axum, modules with hooks, accounts and sessions, a WebSocket hub, MySQL / PostgreSQL / SQLite, migrations, OpenAPI + AsyncAPI. A library you build your own server binary with. | in development |
 | [`net_backend_protocol`](crates/net_backend_protocol/README.md) | The shared message types: plain Rust + serde, no networking, no async runtime, no engine. Used by the server and by Rust clients. | in development |
 | [`net_backend_client`](crates/net_backend_client/README.md) | A small Rust client for apps that do not use Bevy, built on the protocol. | planned |
 
@@ -52,7 +52,7 @@ The server does not care which client connects; the JSON on the wire is the cont
 |---|---|
 | a **Bevy** game | [`bevy_net_backend`](https://crates.io/crates/bevy_net_backend) for the connection (HTTP, WebSocket), the recommended path, + `net_backend_protocol` for the message types. |
 | **another Rust** app (other engine, tool, bot, CLI) | `net_backend_protocol` + the HTTP / WebSocket library you already use (for example reqwest, ureq, tokio-tungstenite). `net_backend_client` is coming. |
-| **not Rust** (C#, GDScript, JavaScript, …) | The API directly: the server's OpenAPI document describes every HTTP route and can generate typed clients; a WebSocket message reference comes with the WebSocket hub. |
+| **not Rust** (C#, GDScript, JavaScript, …) | The API directly: the server's OpenAPI document describes every HTTP route and can generate typed clients; its AsyncAPI document (`/v1/asyncapi.json`) and README describe every WebSocket frame. |
 
 ## Repository layout
 
@@ -60,7 +60,8 @@ The server does not care which client connects; the JSON on the wire is the cont
 crates/
 ├── net_backend_server/     the server framework
 ├── net_backend_protocol/   the shared message types
-└── net_backend_client/     the client (planned)
+├── net_backend_client/     the client (planned)
+└── e2e_tests/              end-to-end tests with the Bevy client (never published)
 ```
 
 One Cargo workspace with one lockfile and one CI workflow. Releases are per crate: each crate has
@@ -69,6 +70,7 @@ its own version and tags named `<crate>-X.Y.Z`.
 ```sh
 cargo test -p net_backend_protocol
 cargo test -p net_backend_server --no-default-features --features sqlite
+cargo test -p e2e_tests          # the server driven by bevy_net_backend in a headless app
 ```
 
 ## License

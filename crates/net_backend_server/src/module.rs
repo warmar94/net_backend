@@ -10,9 +10,8 @@
 //! are assembled. Command-line commands ([`commands`](Module::commands)) are collected before the
 //! command line is parsed.
 //!
-//! **Compatibility promise:** methods added to [`Module`] later (the WebSocket kinds in the next
-//! sub-phase, permissions) always come with a default implementation, so a module written today
-//! keeps compiling.
+//! **Compatibility promise:** methods added to [`Module`] later (e.g. permissions) always come
+//! with a default implementation, so a module written today keeps compiling.
 
 use std::sync::Arc;
 
@@ -28,6 +27,7 @@ use crate::hooks::Hooks;
 use crate::migrate::Migration;
 use crate::rate_limit::RateLimiter;
 use crate::state::{AppState, Extensions};
+use crate::ws::WsHandlers;
 
 /// Names a module may not use: `app` is the app's own migrations namespace; `core` and `nbs` are
 /// reserved for the framework.
@@ -93,6 +93,13 @@ pub trait Module: Send + Sync + 'static {
     fn setup(&self, setup: &mut Setup<'_>) -> Result<(), Error> {
         let _ = setup;
         Ok(())
+    }
+
+    /// The module's WebSocket request handlers and documented pushes (see [`crate::ws`]), e.g.
+    /// `handlers.call::<JoinRoom, _, _>(join)`. A kind may be registered once across the app and
+    /// all modules (a duplicate stops the build).
+    fn ws_handlers(&self, handlers: &mut WsHandlers) {
+        let _ = handlers;
     }
 
     /// The module's command-line commands (see [`crate::command`]), e.g. `user:create`.

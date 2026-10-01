@@ -94,9 +94,21 @@ async fn unsupported_protocol_version() {
     }
     let request = Request::get(routes::INFO).header(PROTOCOL_HEADER, "1").body(Body::empty()).expect("request");
     assert_eq!(call(&router, request).await.0, StatusCode::OK);
-    // /v1/ws is never a 400 (the client would retry forever): reserved, 403 until the hub exists.
+    // /v1/ws is never a 400 (the client would retry forever): a version refusal before an
+    // upgrade is 403, a plain GET 426, and with the hub off the path answers 403.
     let request = Request::get(routes::WS).header(PROTOCOL_HEADER, "99").body(Body::empty()).expect("request");
     let (status, _, body) = call(&router, request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], codes::UNSUPPORTED_PROTOCOL);
+    let (status, headers, body) = call(&router, get_req(routes::WS)).await;
+    assert_eq!(status, StatusCode::UPGRADE_REQUIRED);
+    assert_eq!(headers.get("upgrade").and_then(|v| v.to_str().ok()), Some("websocket"));
+    assert_eq!(body["error"]["code"], codes::BAD_REQUEST);
+    let mut config = http_config();
+    config.ws.enabled = false;
+    let off = router_of(NetBackendServer::new(config)).await;
+    let request = Request::get(routes::WS).header(PROTOCOL_HEADER, "99").body(Body::empty()).expect("request");
+    let (status, _, body) = call(&off, request).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(body["error"]["code"], codes::FORBIDDEN);
 }

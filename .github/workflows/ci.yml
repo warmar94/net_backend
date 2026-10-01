@@ -96,6 +96,21 @@ jobs:
       - run: cargo test -p net_backend_client --locked
       - run: cargo doc -p net_backend_client --locked --no-deps
 
+  # End to end: the server's WebSocket hub driven by the published Bevy client (`bevy_net_backend` 0.1.0) in a headless
+  # app over loopback. Bevy is only in this unpublished crate (`crates/e2e_tests`), never in the server's own builds.
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p e2e_tests --locked --all-targets
+      - run: cargo clippy -p e2e_tests --locked --all-targets -- -D warnings
+      - run: cargo test -p e2e_tests --locked
+
   # The server's database and auth suites against real MySQL 8.4, MariaDB 11.4 and PostgreSQL 16 (each test creates
   # and drops its own database).
   databases:

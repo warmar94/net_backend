@@ -147,6 +147,7 @@ struct Inner {
     mail: MailQueue,
     steam: Option<Arc<dyn SteamVerifier>>,
     revocations: broadcast::Sender<Revocation>,
+    role_changes: broadcast::Sender<UserId>,
     key: OnceCell<Vec<u8>>,
     /// Failed logins per (email address, client network).
     login_failures: KeyedBuckets<(String, Option<IpAddr>)>,
@@ -199,12 +200,14 @@ impl AuthService {
         let mails = KeyedBuckets::new(config.mails_per_account_per_hour, Duration::from_secs(3600), 100_000);
         let v6_prefix = config.rate_limit_ipv6_prefix;
         let (revocations, _) = broadcast::channel(1024);
+        let (role_changes, _) = broadcast::channel(256);
         Self(Arc::new(Inner {
             config,
             hasher,
             mail,
             steam,
             revocations,
+            role_changes,
             key: OnceCell::new(),
             login_failures,
             account_failures,
@@ -230,6 +233,24 @@ impl AuthService {
     /// [`authenticate_token`](Self::authenticate_token).
     pub fn subscribe_revocations(&self) -> broadcast::Receiver<Revocation> {
         self.0.revocations.subscribe()
+    }
+
+    /// Receive the user of every role grant / revocation made in THIS process (admin routes, server
+    /// code); the WebSocket hub refreshes the roles of that user's open sockets. Changes made by
+    /// other processes (the command line, another instance) reach open sockets through the hub's
+    /// periodic refresh (`ws.roles_refresh_secs`).
+    pub fn subscribe_role_changes(&self) -> broadcast::Receiver<UserId> {
+        self.0.role_changes.subscribe()
+    }
+
+    /// The roles of several users (users without roles are absent).
+    pub async fn roles_of_users(&self, state: &AppState, users: &[UserId]) -> Result<HashMap<UserId, Vec<String>>, AppError> {
+        let ids: Vec<i64> = users.iter().map(|u| u.get()).collect();
+        let mut roles: HashMap<UserId, Vec<String>> = HashMap::new();
+        for row in state.db().fetch_all::<store::RoleRow, _>(&store::roles_of(&ids)).await? {
+            roles.entry(UserId(row.user_id)).or_default().push(row.role);
+        }
+        Ok(roles)
     }
 
     /// Every session revoked at or after `since` (by any process), oldest first, at most 1000:
@@ -1226,7 +1247,8 @@ impl AuthService {
         self.revoke_with(state, &actor.info, Revocation::new(user, RevokedSessions::All, RevocationReason::Admin), Some(record)).await
     }
 
-    /// Grant (or revoke) a role. Takes effect with the account's next request.
+    /// Grant (or revoke) a role. Takes effect with the account's next request; open WebSockets of
+    /// this process get the new roles at once (`subscribe_role_changes`).
     pub(crate) async fn set_role(&self, state: &AppState, actor: &Actor, user: UserId, role: &str, grant: bool) -> Result<(), AppError> {
         if !net_backend_protocol::admin::is_valid_role(role) {
             return Err(AppError::bad_request("a role is 1-64 bytes of [a-z0-9_.-], starting with a letter"));
@@ -1255,6 +1277,7 @@ impl AuthService {
         let record = actor.record(if grant { "role_grant" } else { "role_revoke" }, user).data(json!({ "role": role }));
         audit::record_tx(&mut tx, UnixMillis(now), &record).await?;
         tx.commit().await?;
+        let _ = self.0.role_changes.send(user);
         Ok(())
     }
 

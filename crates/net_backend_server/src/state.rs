@@ -20,6 +20,7 @@ use crate::db::Db;
 use crate::hooks::Hooks;
 use crate::http::client_ip::IpNet;
 use crate::shutdown::Shutdown;
+use crate::ws::Hub;
 
 /// The source of "now". The server reads time only through this, so tests can control it.
 ///
@@ -95,6 +96,7 @@ struct Inner {
     modules: Vec<&'static str>,
     shutdown: Shutdown,
     trusted_proxies: Vec<IpNet>,
+    ws: Hub,
 }
 
 /// The shared state. Cheap to clone.
@@ -108,6 +110,7 @@ impl fmt::Debug for AppState {
 }
 
 impl AppState {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         config: Arc<Config>,
         db: Db,
@@ -116,9 +119,10 @@ impl AppState {
         extensions: Extensions,
         modules: Vec<&'static str>,
         shutdown: Shutdown,
+        ws: Hub,
     ) -> Self {
         let trusted_proxies = config.http.trusted_proxies.iter().filter_map(|p| IpNet::parse(p)).collect();
-        Self(Arc::new(Inner { config, db, clock, hooks, extensions, modules, shutdown, trusted_proxies }))
+        Self(Arc::new(Inner { config, db, clock, hooks, extensions, modules, shutdown, trusted_proxies, ws }))
     }
 
     /// The configuration.
@@ -159,6 +163,11 @@ impl AppState {
     /// The parsed `http.trusted_proxies`.
     pub(crate) fn trusted_proxies(&self) -> &[IpNet] {
         &self.0.trusted_proxies
+    }
+
+    /// The WebSocket hub: pushes to connections, users, rooms (see [`crate::ws`]).
+    pub fn ws(&self) -> &Hub {
+        &self.0.ws
     }
 
     /// The shutdown signal (background tasks wait on it; `/readyz` reports 503 once it fired).

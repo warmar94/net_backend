@@ -30,7 +30,9 @@
 //! CORS), OpenAPI, metrics, the command line ([`cli`], [`command`]) and graceful shutdown; and the
 //! accounts module [`Auth`] ([`auth`]: email + password and Steam logins, rotating tokens,
 //! sessions, verification and reset mails ([`mail`]), roles, the audit log, `/v1/admin`, rate
-//! limits ([`rate_limit`])). The WebSocket hub and the storage and chat modules come next.
+//! limits ([`rate_limit`])); and the WebSocket hub ([`ws`]: `/v1/ws` with the protocol's envelope,
+//! handlers by kind, pushes, rooms, caps, close codes, an AsyncAPI document at
+//! [`ASYNCAPI_PATH`]). The storage and chat modules come next.
 //!
 //! Cargo features: `mysql` (default), `postgres`, `sqlite` (additive, any combination compiles,
 //! at least one is needed to run a server); `steam` (the built-in Steam ticket check) and `smtp`
@@ -53,13 +55,14 @@ pub mod module;
 pub mod rate_limit;
 pub mod shutdown;
 pub mod state;
+pub mod ws;
 
 mod app;
 mod metrics;
 mod openapi;
 mod serve;
 
-pub use app::{NetBackendServer, PreparedServer};
+pub use app::{NetBackendServer, PreparedServer, ASYNCAPI_PATH};
 pub use auth::{Auth, AuthContext, AuthService, Authenticator};
 pub use config::{Config, SecretString};
 pub use db::{Db, DbError, DbTx, Dialect};

@@ -37,6 +37,7 @@ use crate::rate_limit::RateLimiter;
 use crate::serve::serve_connections;
 use crate::shutdown::{os_signal, Shutdown};
 use crate::state::{AppState, Clock, Extensions, SystemClock};
+use crate::ws::{Broadcaster, Hub, LocalBroadcaster, WsCtx, WsHandlers};
 use crate::AppError;
 
 /// A route registration, applied when the router is assembled (so a conflict becomes an
@@ -73,6 +74,8 @@ pub struct NetBackendServer {
     authenticators: Vec<Arc<dyn Authenticator>>,
     rate_limiters: Vec<Arc<dyn RateLimiter>>,
     commands: Vec<Arc<dyn AppCommand>>,
+    ws_handlers: WsHandlers,
+    broadcaster: Option<Arc<dyn Broadcaster>>,
 }
 
 impl NetBackendServer {
@@ -89,6 +92,8 @@ impl NetBackendServer {
             authenticators: Vec::new(),
             rate_limiters: Vec::new(),
             commands: Vec::new(),
+            ws_handlers: WsHandlers::new(),
+            broadcaster: None,
         }
     }
 
@@ -213,6 +218,40 @@ impl NetBackendServer {
         self
     }
 
+    /// Register the game's WebSocket handlers (see [`crate::ws`]): `.ws(|ws| { ws.call::<Shout, _, _>(shout).summary("…"); })`.
+    pub fn ws(mut self, register: impl FnOnce(&mut WsHandlers)) -> Self {
+        register(&mut self.ws_handlers);
+        self
+    }
+
+    /// A typed WebSocket handler for `C::KIND` (the request's `data` decodes as `C`; the `Ok`
+    /// value is the answer's `data`). A kind may be registered once.
+    pub fn ws_call<C, F, Fut>(mut self, handler: F) -> Self
+    where
+        C: net_backend_protocol::WsCall + Send + 'static,
+        F: Fn(WsCtx, C) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<C::Response, AppError>> + Send + 'static,
+    {
+        self.ws_handlers.call::<C, F, Fut>(handler);
+        self
+    }
+
+    /// An untyped WebSocket handler for `kind` (JSON in, JSON out).
+    pub fn ws_handler<F, Fut>(mut self, kind: &str, handler: F) -> Self
+    where
+        F: Fn(WsCtx, serde_json::Value) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<serde_json::Value, AppError>> + Send + 'static,
+    {
+        self.ws_handlers.raw(kind, handler);
+        self
+    }
+
+    /// Deliver WebSocket pushes through this [`Broadcaster`] (default: in this process only).
+    pub fn broadcaster(mut self, broadcaster: impl Broadcaster) -> Self {
+        self.broadcaster = Some(Arc::new(broadcaster));
+        self
+    }
+
     /// Add a command-line command (see [`crate::command`]).
     pub fn command(mut self, command: impl AppCommand) -> Self {
         self.commands.push(Arc::new(command));
@@ -244,7 +283,20 @@ impl NetBackendServer {
         if !unknown.is_empty() {
             return Err(Error::Config(unknown.iter().map(|name| format!("[modules.{name}]: no module named `{name}` is registered (a typo?)")).collect()));
         }
-        let NetBackendServer { config, modules, route_ops, mut hooks, mut extensions, clock, db, mut authenticators, mut rate_limiters, commands: _ } = self;
+        let NetBackendServer {
+            config,
+            modules,
+            route_ops,
+            mut hooks,
+            mut extensions,
+            clock,
+            db,
+            mut authenticators,
+            mut rate_limiters,
+            commands: _,
+            mut ws_handlers,
+            broadcaster,
+        } = self;
         let db = match db {
             Some(db) => db,
             None => Db::connect(&config.database).await?,
@@ -264,11 +316,33 @@ impl NetBackendServer {
         for module in modules.iter() {
             module.register_hooks(&mut hooks);
         }
-        let state =
-            AppState::new(Arc::new(config), db, clock.unwrap_or_else(|| Arc::new(SystemClock)), Arc::new(hooks), extensions, modules.names(), Shutdown::new());
-        let mw = Mw { state: state.clone(), authenticators: Arc::from(authenticators), rate_limiters: Arc::from(rate_limiters) };
-        let (router, metrics_router, openapi) = assemble(&state, &modules, route_ops, mw)?;
-        Ok(PreparedServer { state, router, metrics_router, openapi, modules: Arc::new(modules) })
+        for module in modules.iter() {
+            ws_handlers.set_owner(module.name());
+            module.ws_handlers(&mut ws_handlers);
+        }
+        let handlers = match ws_handlers.finish() {
+            Ok(handlers) => handlers,
+            Err(problems) => {
+                db.close().await;
+                return Err(Error::Module(problems.join("; ")));
+            }
+        };
+        let authenticators: Arc<[Arc<dyn Authenticator>]> = Arc::from(authenticators);
+        let hub =
+            Hub::new(config.ws.clone(), handlers, authenticators.clone(), broadcaster.unwrap_or_else(|| Arc::new(LocalBroadcaster)), config.metrics.enabled);
+        let state = AppState::new(
+            Arc::new(config),
+            db,
+            clock.unwrap_or_else(|| Arc::new(SystemClock)),
+            Arc::new(hooks),
+            extensions,
+            modules.names(),
+            Shutdown::new(),
+            hub,
+        );
+        let mw = Mw { state: state.clone(), authenticators, rate_limiters: Arc::from(rate_limiters) };
+        let (router, metrics_router, openapi, asyncapi) = assemble(&state, &modules, route_ops, mw)?;
+        Ok(PreparedServer { state, router, metrics_router, openapi, asyncapi, modules: Arc::new(modules) })
     }
 
     /// Build and serve on this listener until SIGTERM / Ctrl-C.
@@ -338,11 +412,16 @@ fn panic_text(panic: &(dyn std::any::Any + Send)) -> String {
 
 /// Assemble every route and layer. axum panics on conflicting routes; that panic is turned into
 /// an [`Error::Module`].
-/// The assembled parts: the API router, the metrics router, the OpenAPI document (JSON).
-type Assembled = (Router, Option<Router>, Arc<str>);
+/// The assembled parts: the API router, the metrics router, the OpenAPI and AsyncAPI documents (JSON).
+type Assembled = (Router, Option<Router>, Arc<str>, Arc<str>);
+
+/// Where the AsyncAPI document of the WebSocket endpoint is served (with `openapi.enabled` and
+/// `ws.enabled`).
+pub const ASYNCAPI_PATH: &str = "/v1/asyncapi.json";
 
 fn assemble(state: &AppState, modules: &ModuleSet, route_ops: Vec<RouteOp>, mw: Mw) -> Result<Assembled, Error> {
     let config = state.config().clone();
+    let asyncapi: Arc<str> = Arc::from(crate::ws::asyncapi::document(&config, &state.ws().0.handlers));
     let metrics = if config.metrics.enabled { crate::metrics::handle() } else { None };
     let (routed, spec) = std::panic::catch_unwind(AssertUnwindSafe(|| {
         let mut api: OpenApiRouter<AppState> =
@@ -357,8 +436,22 @@ fn assemble(state: &AppState, modules: &ModuleSet, route_ops: Vec<RouteOp>, mw: 
             api = op(api);
         }
         let (mut router, spec) = api.split_for_parts();
-        router = router.route(proto_routes::WS, get(core::ws_reserved));
+        router = if config.ws.enabled {
+            router.route(proto_routes::WS, get(crate::ws::connection::endpoint))
+        } else {
+            router.route(proto_routes::WS, get(core::ws_reserved))
+        };
         let spec: Arc<str> = Arc::from(spec.to_json().unwrap_or_else(|_| "{}".into()));
+        if config.openapi.enabled && config.ws.enabled {
+            let asyncapi = asyncapi.clone();
+            router = router.route(
+                ASYNCAPI_PATH,
+                get(move || {
+                    let asyncapi = asyncapi.clone();
+                    async move { ([(CONTENT_TYPE, HeaderValue::from_static("application/json"))], asyncapi.to_string()).into_response() }
+                }),
+            );
+        }
         if config.openapi.enabled {
             let spec = spec.clone();
             router = router.route(
@@ -422,7 +515,7 @@ fn assemble(state: &AppState, modules: &ModuleSet, route_ops: Vec<RouteOp>, mw: 
             }),
         )
     });
-    Ok((router.with_state(state.clone()), metrics_router, spec))
+    Ok((router.with_state(state.clone()), metrics_router, spec, asyncapi))
 }
 
 /// A built server: database connected, router assembled. Serve it, or run migrations with it.
@@ -431,6 +524,7 @@ pub struct PreparedServer {
     router: Router,
     metrics_router: Option<Router>,
     openapi: Arc<str>,
+    asyncapi: Arc<str>,
     modules: Arc<ModuleSet>,
 }
 
@@ -461,6 +555,12 @@ impl PreparedServer {
     /// The OpenAPI document as JSON (also when `openapi.enabled` is off).
     pub fn openapi_json(&self) -> &str {
         &self.openapi
+    }
+
+    /// The AsyncAPI 3.0 document of the WebSocket endpoint as JSON (served at
+    /// [`ASYNCAPI_PATH`] with `openapi.enabled` and `ws.enabled`; available here either way).
+    pub fn asyncapi_json(&self) -> &str {
+        &self.asyncapi
     }
 
     /// The migrations directory from the configuration.
@@ -543,6 +643,7 @@ impl PreparedServer {
             state.db().close().await;
             return Err(error);
         }
+        let hub_tasks = state.ws().start(&state);
 
         let shutdown = state.shutdown().clone();
         let trigger = shutdown.clone();
@@ -588,8 +689,10 @@ impl PreparedServer {
         };
         serve_connections(listener, router, shutdown.clone(), header_timeout, grace, "api").await;
         shutdown.trigger();
+        // WebSockets got 1001 when the signal came; wait for them within the same grace period.
+        state.ws().finish(grace).await;
         let _ = drain_notice.await;
-        for task in background {
+        for task in background.into_iter().chain(hub_tasks) {
             let _ = task.await;
         }
         shutdown_modules(modules.iter().rev(), &state, stop_limit).await;

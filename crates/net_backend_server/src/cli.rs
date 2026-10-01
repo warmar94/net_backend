@@ -8,6 +8,7 @@
 //! | `migrations publish <module> [--dialect <d>] [--force]` | copy a module's SQL into the app (it then owns it) |
 //! | `config check [--connect]` | validate the configuration (and try the database) |
 //! | `openapi export [--output <file>]` | write or print the OpenAPI document (no database needed) |
+//! | `asyncapi export [--output <file>]` | write or print the AsyncAPI document of the WebSocket endpoint (no database needed) |
 //!
 //! The configuration comes from `NBS_CONFIG` / `config.toml` + `NBS__*` variables
 //! ([`Config::load`](crate::Config::load)), loaded by the app before the builder is created.
@@ -57,6 +58,11 @@ enum Command {
         #[command(subcommand)]
         action: OpenapiAction,
     },
+    /// The AsyncAPI document of the WebSocket endpoint.
+    Asyncapi {
+        #[command(subcommand)]
+        action: OpenapiAction,
+    },
     /// An app command (from a module or the app; listed below).
     #[command(external_subcommand)]
     External(Vec<OsString>),
@@ -64,7 +70,7 @@ enum Command {
 
 #[derive(Subcommand, Debug)]
 enum OpenapiAction {
-    /// Write the OpenAPI document (JSON) to a file, or print it. Needs no database.
+    /// Write the document (JSON) to a file, or print it. Needs no database.
     Export {
         /// The file to write; default: print it.
         #[arg(long)]
@@ -218,16 +224,8 @@ where
             }
             out(w, format!("The app now owns the `{module}` migrations; edit them before the first `migrate`."))
         }
-        Command::Openapi { action: OpenapiAction::Export { output } } => {
-            let json = openapi_document(server).await?;
-            match output {
-                Some(path) => {
-                    std::fs::write(&path, json.as_bytes()).map_err(|e| Error::io(format!("writing {}", path.display()), e))?;
-                    out(w, format!("Wrote {}", path.display()))
-                }
-                None => out(w, json),
-            }
-        }
+        Command::Openapi { action: OpenapiAction::Export { output } } => export(document(server, false).await?, output, w),
+        Command::Asyncapi { action: OpenapiAction::Export { output } } => export(document(server, true).await?, output, w),
         Command::Config { action: ConfigAction::Check { connect } } => {
             let config = server.config();
             config.validate()?;
@@ -262,11 +260,23 @@ where
     }
 }
 
-/// The OpenAPI document without touching the database (the pool is created lazily and never used).
-async fn openapi_document(mut server: NetBackendServer) -> Result<String, Error> {
+/// Write a document to `output`, or print it.
+fn export(json: String, output: Option<std::path::PathBuf>, w: &mut (dyn Write + Send)) -> Result<(), Error> {
+    match output {
+        Some(path) => {
+            std::fs::write(&path, json.as_bytes()).map_err(|e| Error::io(format!("writing {}", path.display()), e))?;
+            out(w, format!("Wrote {}", path.display()))
+        }
+        None => out(w, json),
+    }
+}
+
+/// The OpenAPI (or AsyncAPI) document without touching the database (the pool is created lazily
+/// and never used).
+async fn document(mut server: NetBackendServer, asyncapi: bool) -> Result<String, Error> {
     server.config.database.connect_lazy = true;
     let prepared = server.build().await?;
-    let json = prepared.openapi_json().to_string();
+    let json = if asyncapi { prepared.asyncapi_json().to_string() } else { prepared.openapi_json().to_string() };
     prepared.state().db().close().await;
     Ok(json)
 }

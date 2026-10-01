@@ -11,6 +11,38 @@ In development. This entry grows until the first release.
 
 ### Added
 
+- The WebSocket hub at `/v1/ws` (module `ws`, settings `[ws]` / `WsConfig`, on by default): the
+  protocol's envelope (requests, answers, pushes; malformed frames with an id answered
+  `bad_request`, `unknown_type` for unregistered kinds); authentication at the handshake through
+  the app's authenticators (`Authorization: Bearer`, or `?token=`) or by first-message `auth` with
+  exactly one `auth.ok` / `auth.failed` per `auth` and a deadline (close 1008); refused handshakes
+  never answer 400 (401 / 401 `token_expired` / 403 `banned`, upgrade + close 4010 for an
+  unsupported protocol version, 503 / 429 with `Retry-After`); open sockets survive token expiry and
+  close on revocation (4001) or ban (4003), also when another process revoked; request handlers by
+  kind for the game (`NetBackendServer::ws`, `ws_call`, `ws_handler`) and modules
+  (`Module::ws_handlers`), typed through the protocol's `WsCall` or on JSON, with `WsCtx`
+  (`AuthContext`, connection) and `KindDoc` documentation; pushes to a connection / user / room /
+  everyone (`Hub`, `AppState::ws`, encoded once), rooms with member and per-connection caps; global
+  and per-user connection caps (4009 replaced), per-address handshake and per-socket frame rate
+  limits (`rate_limited`, close 1008), bounded outboxes (close 1013) and a write deadline,
+  heartbeats with dead-peer detection, a message size limit (close 1009), tuned socket buffers
+  (8 KiB read buffer, no write buffering; ~15 KiB heap per idle socket measured), hooks
+  (`ws::events`: `BeforeWsConnect`, `AfterWsConnect`, `AfterWsDisconnect`, `BeforeWsFrame`), close
+  1001 for every socket on shutdown within the grace period, metrics (`nbs_ws_*`), the `Broadcaster`
+  seam (`LocalBroadcaster`) for several instances later.
+- WebSocket hub hardening (review and live-test round): request handlers run while the socket keeps writing
+  pushes (only a handler's pushes to its own socket wait for its answer); pushes over `ws.max_message_bytes` are
+  refused (`PushError::TooLarge`); a revocation or ban landing while a socket authenticates is applied; a temporary
+  failure during first-message `auth` (5xx / 429) closes with 1013 without `auth.failed` (clients retry); open
+  sockets get role changes (`AuthService::subscribe_role_changes`, `roles_of_users`, `ws.roles_refresh_secs`);
+  `Target::Connection` pushes never leave the process and `Target` / `Delivery` / `ConnectionId` are serde types;
+  `ws.max_connections_per_ip` (100, 429) and `ws.max_pending_connections` (1000, 503); the per-user cap closes the
+  oldest socket of the same session first; an `auth` over the rate limit is still answered; unique AsyncAPI keys and
+  the handshake statuses in the AsyncAPI description; `BeforeWsConnect::origin`; unsendable close codes become
+  1011; `WsCtx::for_tests`; `HubStats::pending`; `ConnectionInfo::roles`; the registry is a `RwLock`;
+  `request_timeout_secs < idle_timeout_secs - ping_interval_secs` is validated.
+- The AsyncAPI 3.0 document of the WebSocket endpoint at `/v1/asyncapi.json` (`ASYNCAPI_PATH`,
+  `PreparedServer::asyncapi_json`, command `asyncapi export`), generated from the registered kinds.
 - The accounts module `Auth` (name `auth`, settings `[modules.auth]` / `AuthConfig`): the protocol's
   `/v1/auth/*` and `/v1/account*` routes (register, login, Steam login, refresh, logout, email
   verification and resend, password forgot / reset, account read / update, password change) and
@@ -60,6 +92,10 @@ In development. This entry grows until the first release.
 
 ### Changed
 
+- `ws.query_token` defaults to `false` (reverse proxies log URLs with their query). `Hub::publish` returns
+  `Result<(), PushError>`.
+- `/v1/ws` is the WebSocket hub (it answered 403 while reserved; with `ws.enabled = false` it
+  still does). `AppState` holds the hub.
 - Several authenticators and rate limiters may be installed (asked in order). An authenticator's
   error no longer answers the request at once: the request continues anonymously, and handlers
   that need a user (`AuthContext`) answer that error; `Option<AuthContext>` sees `None`.

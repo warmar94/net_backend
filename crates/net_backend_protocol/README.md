@@ -27,7 +27,7 @@ This crate defines **what** is said; a client library decides **how** it is sent
 |---|---|
 | a **Bevy** game | this crate + [`bevy_net_backend`](https://crates.io/crates/bevy_net_backend) for the connection (with the optional `bevy_net_backend` feature, the types plug straight into its WebSocket requests). |
 | **another Rust** app | this crate + the HTTP / WebSocket library you already use (for example reqwest, ureq, tokio-tungstenite). A small ready-made client, [`net_backend_client`](https://github.com/warmar94/net_backend/tree/main/crates/net_backend_client), is coming. |
-| **not Rust** | not this crate: use the server's API documentation (OpenAPI for HTTP, a WebSocket message reference) and send the same JSON. |
+| **not Rust** | not this crate: use the server's API documentation (OpenAPI for HTTP, AsyncAPI for the WebSocket) and send the same JSON. |
 
 ## Contents
 
@@ -185,7 +185,9 @@ crate `bevy_net_backend` 0.1:
   first-message `auth` within 5 seconds (`AUTH_TIMEOUT_SECS`; otherwise close 1008).
 - **Every `auth` message gets exactly one `auth.ok` or `auth.failed`**, also on a socket already
   authenticated by its header. A later `auth` re-authenticates an open socket with a fresh token;
-  a token of another user is refused (`auth.failed`, close 4001).
+  a token of another user is refused (`auth.failed`, close 4001). `auth.failed` is a definitive
+  refusal; a temporary server failure instead closes with 1013 without an answer (the client
+  reconnects and tries again).
 - An open socket survives the expiry of its access token; only a revocation closes it (4001, or
   4003 for a ban). Client recipe: refresh shortly before expiry (`ACCESS_TOKEN_REFRESH_MARGIN_SECS`);
   after a `Disconnected` with a handshake 401 or close 4001, refresh once and connect again (if the
@@ -204,7 +206,7 @@ crate `bevy_net_backend` 0.1:
 | 1013 | `TRY_AGAIN_LATER` | overloaded, or the connection could not keep up: reconnect later |
 | 4001 | `UNAUTHORIZED` | authentication refused or revoked (logout, password change): log in again |
 | 4003 | `BANNED` | the account is banned |
-| 4009 | `REPLACED` | replaced by a newer connection of the same session |
+| 4009 | `REPLACED` | replaced by a newer connection of the same user or session (e.g. over the server's per-user connection cap) |
 | 4010 | `UNSUPPORTED_PROTOCOL` | the client's protocol version is not supported |
 
 **WebSocket kinds** (`kinds`): `auth`, `auth.ok`, `auth.failed`, `chat.join`, `chat.leave`,

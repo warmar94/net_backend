@@ -37,7 +37,7 @@ net_backend_protocol = { path = "../net_backend_protocol", version = "0.1.0" }
 # HTTP. Caret minimums (PLUGINS §8): apps depend on axum / tower-http themselves, and an `=` pin
 # would break their resolution at the next patch. These crates are re-exported and part of our
 # public API, so a minor bump of any of them is a minor bump of this crate.
-axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "matched-path", "original-uri", "query", "tokio", "tracing"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "matched-path", "original-uri", "query", "tokio", "tracing", "ws"] }
 tower-http = { version = "0.7.1", default-features = false, features = ["catch-panic", "cors", "limit", "trace"] }
 # The connection loop (header-read timeout, tracked connections for the shutdown deadline); already
 # in the tree through axum.
@@ -47,8 +47,11 @@ tower = { version = "0.5.2", default-features = false, features = ["util"] }
 # Ubiquitous crates: caret minimums (an exact pin would force every app's version).
 tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 http = "1.3"
-serde = { workspace = true }
+serde = { workspace = true, features = ["rc"] }
 serde_json = { workspace = true }
+# tungstenite's error type, to recognise a message over the limit (axum does not re-export it). The
+# same version axum's `ws` feature brings (nothing new in the tree); re-check when axum moves.
+tungstenite = { version = "0.29.0", default-features = false }
 futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
 thiserror = "2.0.12"
 tracing = "0.1.41"
@@ -89,8 +92,11 @@ metrics = "0.24.2"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 
 [dev-dependencies]
-tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "process"] }
 http-body-util = "0.1.3"
+# A WebSocket client for the hub tests: the same tokio-tungstenite axum's `ws` feature already brings.
+tokio-tungstenite = { version = "0.29.0", default-features = false, features = ["connect", "handshake"] }
+futures-util = { version = "0.3.31", default-features = false, features = ["std", "sink"] }
 
 [[example]]
 name = "minimal"

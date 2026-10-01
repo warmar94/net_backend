@@ -116,6 +116,10 @@ pub(crate) fn panic_response(panic: Box<dyn Any + Send + 'static>) -> Response {
     AppError::internal_plain().into_response()
 }
 
+/// When the authenticators ran for a request.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AuthCheckedAt(pub(crate) Instant);
+
 /// Ask the authenticators in order: the first `Ok(Some(..))` attaches its context; an `Err` is
 /// remembered as an [`AuthFailure`] (answered by handlers that need a user) and stops the chain.
 pub(crate) async fn authenticate(State(mw): State<Mw>, req: Request, next: Next) -> Response {
@@ -123,6 +127,9 @@ pub(crate) async fn authenticate(State(mw): State<Mw>, req: Request, next: Next)
         return next.run(req).await;
     }
     let (mut parts, body) = req.into_parts();
+    // When the credentials were checked (the WebSocket hub refuses a socket whose session was
+    // revoked after this moment).
+    parts.extensions.insert(AuthCheckedAt(Instant::now()));
     for authenticator in mw.authenticators.iter() {
         match authenticator.authenticate(&parts, &mw.state).await {
             Ok(Some(context)) => {

@@ -132,7 +132,7 @@ impl AuthFailure {
         Self { status: error.status(), error: error.api_error().clone() }
     }
 
-    fn to_error(&self) -> AppError {
+    pub(crate) fn to_error(&self) -> AppError {
         AppError::from_parts(self.status, self.error.clone())
     }
 }

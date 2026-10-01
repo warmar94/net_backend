@@ -24,7 +24,9 @@
 //! or the first-message `auth` within [`AUTH_TIMEOUT_SECS`] (otherwise close 1008). Rules:
 //! - **Every `auth` message gets exactly one answer**, `auth.ok` or `auth.failed`, also on a
 //!   socket already authenticated by its handshake header (a client using both, with the
-//!   client's `with_auth_ack`, must not wait forever).
+//!   client's `with_auth_ack`, must not wait forever). The one exception: a TEMPORARY server
+//!   failure (its database is down, overloaded) closes the socket with 1013 without an answer,
+//!   so the client reconnects and tries again; `auth.failed` is always a definitive refusal.
 //! - A later `auth` on an open socket **re-authenticates** it with a fresh token (`auth.ok`); a
 //!   token of a DIFFERENT user is refused (`auth.failed`, then close 4001).
 //! - An open socket survives the expiry of its access token; only a revocation closes it (4001,
@@ -122,7 +124,8 @@ impl CloseCode {
     pub const UNAUTHORIZED: CloseCode = CloseCode(4001);
     /// 4003: the account is banned.
     pub const BANNED: CloseCode = CloseCode(4003);
-    /// 4009: replaced by a newer connection of the same session.
+    /// 4009: replaced by a newer connection of the same user or session (e.g. the user opened more
+    /// connections than the server allows; the oldest goes).
     pub const REPLACED: CloseCode = CloseCode(4009);
     /// 4010: the client's protocol version is not supported (see [`crate::version`]).
     pub const UNSUPPORTED_PROTOCOL: CloseCode = CloseCode(4010);
