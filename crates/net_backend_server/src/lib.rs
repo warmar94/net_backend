@@ -23,7 +23,7 @@
 //! }
 //! ```
 //!
-//! **Status:** in development. This version provides the core: the app builder and module
+//! **What is inside:** the core: the app builder and module
 //! system ([`NetBackendServer`], [`Module`], [`hooks`]), configuration ([`Config`]), the error
 //! model ([`AppError`]), the database layer ([`db`]) and migrations ([`migrate`]), the HTTP basics
 //! ([`http`]: health, info, body limits, request ids, client addresses, timeouts, panic safety,

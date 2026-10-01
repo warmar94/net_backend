@@ -7,8 +7,6 @@ change or a key dependency bump).
 
 ## [0.1.0] - Unreleased
 
-In development. This entry grows until the first release.
-
 ### Added
 
 - Typed routes (`http::call`): the extractor `Call<C>` (path parameters + JSON body or query of a

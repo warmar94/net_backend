@@ -18,6 +18,8 @@ env:
 jobs:
   fmt:
     runs-on: ubuntu-latest
+    # A hang fails the job instead of eating CI time (the ws tests also abort themselves).
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -37,6 +39,8 @@ jobs:
           - "--features bevy_net_backend"
           - "--all-features"
     runs-on: ubuntu-latest
+    # A hang fails the job instead of eating CI time (the ws tests also abort themselves).
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -66,6 +70,8 @@ jobs:
           - "--no-default-features --features mysql,storage,chat"
           - "--all-features"
     runs-on: ubuntu-latest
+    # A hang fails the job instead of eating CI time (the ws tests also abort themselves).
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -89,6 +95,8 @@ jobs:
   # net_backend_client: the skeleton builds cleanly.
   client:
     runs-on: ubuntu-latest
+    # A hang fails the job instead of eating CI time (the ws tests also abort themselves).
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -106,6 +114,8 @@ jobs:
   # unpublished crate (`crates/e2e_tests`), never in the server's own builds (`-p net_backend_server`).
   e2e:
     runs-on: ubuntu-latest
+    # A hang fails the job instead of eating CI time (the ws tests also abort themselves).
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -121,6 +131,8 @@ jobs:
   # test creates and drops its own database).
   databases:
     runs-on: ubuntu-latest
+    # A hang fails the job instead of eating CI time (the ws tests also abort themselves).
+    timeout-minutes: 45
     services:
       mysql:
         image: mysql:8.4
@@ -169,6 +181,8 @@ jobs:
   # The minimum supported Rust version (`rust-version` in the workspace Cargo.toml).
   msrv:
     runs-on: ubuntu-latest
+    # A hang fails the job instead of eating CI time (the ws tests also abort themselves).
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -184,6 +198,8 @@ jobs:
   # The dependency rules.
   deps:
     runs-on: ubuntu-latest
+    # A hang fails the job instead of eating CI time (the ws tests also abort themselves).
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -226,6 +242,8 @@ jobs:
   # Nothing private in any package. `--list` only: packaging the server for real needs the protocol on crates.io.
   package:
     runs-on: ubuntu-latest
+    # A hang fails the job instead of eating CI time (the ws tests also abort themselves).
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master

@@ -170,6 +170,8 @@ async fn start(tweak: impl FnOnce(&mut Config)) -> Server {
 }
 
 async fn start_with(tweak: impl FnOnce(&mut Config), url: &str, auth: AuthConfig) -> Server {
+    // The whole suite runs in ~30 s; a hang aborts the binary after 10 minutes (CI hang, 2026-10-02).
+    common::watchdog(Duration::from_secs(600));
     let mut config = Config::default();
     config.database.url = SecretString::new(url);
     config.database.migrations_dir = common::temp_dir("ws-migrations");
@@ -386,6 +388,12 @@ async fn handshake_auth_requests_and_pushes() {
     assert_eq!(recv(&mut ws).await, json!({"type": "test.broadcast", "data": [1]}));
     assert!(matches!(server.state.ws().push_raw(Target::All, "auth.ok", &json!({})), Err(PushError::ReservedKind)));
     assert!(server.state.ws().is_online(user));
+    // The connect hook runs in its own task: wait for it (an immediate check raced on a busy machine).
+    let deadline = Instant::now() + WAIT;
+    while server.probe.connects.load(Ordering::SeqCst) < 1 {
+        assert!(Instant::now() < deadline, "the connect hook never ran");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     assert_eq!(server.probe.connects.load(Ordering::SeqCst), 1);
     // `?token=` works too (query never logged).
     let mut by_query = connect_with(server.addr, None, &[], &format!("?token={token}")).await.expect("query token");

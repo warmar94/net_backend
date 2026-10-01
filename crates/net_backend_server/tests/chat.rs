@@ -100,6 +100,8 @@ async fn start_with(
     extra: impl FnOnce(NetBackendServer) -> NetBackendServer,
     tweak: impl FnOnce(&mut Config, &mut ChatConfig),
 ) -> Server {
+    // A hang aborts the binary instead of eating CI time (the MySQL / PostgreSQL suites are slower).
+    common::watchdog(Duration::from_secs(1200));
     let mut config = Config::default();
     config.database.url = SecretString::new(url);
     config.database.migrations_dir = common::temp_dir("chat-migrations");

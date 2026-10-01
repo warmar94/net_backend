@@ -6,10 +6,6 @@
   <img alt="Rust 1.95+" src="https://img.shields.io/badge/rust-1.95%2B-orange">
 </p>
 
-> **Status: in development.** Nothing is published yet; the types follow
-> [`net_backend_server`](https://github.com/warmar94/net_backend/tree/main/crates/net_backend_server) as it is built and are
-> released together with its first version.
-
 Shared message types for [`net_backend_server`](https://github.com/warmar94/net_backend/tree/main/crates/net_backend_server):
 plain Rust + serde, usable from any Rust client.
 
@@ -25,8 +21,9 @@ This crate defines **what** is said; a client library decides **how** it is sent
 
 | Your client is… | Use |
 |---|---|
+| a **Rust** app | this crate + [`net_backend_client`](https://github.com/warmar94/net_backend/tree/main/crates/net_backend_client) for the connection. |
 | a **Bevy** game | this crate + [`bevy_net_backend`](https://crates.io/crates/bevy_net_backend) for the connection (with the optional `bevy_net_backend` feature, the types plug straight into its WebSocket requests). |
-| **another Rust** app | this crate + the HTTP / WebSocket library you already use (for example reqwest, ureq, tokio-tungstenite). A small ready-made client, [`net_backend_client`](https://github.com/warmar94/net_backend/tree/main/crates/net_backend_client), is coming. |
+| **other** Rust code | this crate + any HTTP / WebSocket library (for example reqwest, ureq, tokio-tungstenite). |
 | **not Rust** | not this crate: use the server's API documentation (OpenAPI for HTTP, AsyncAPI for the WebSocket) and send the same JSON. |
 
 ## Contents

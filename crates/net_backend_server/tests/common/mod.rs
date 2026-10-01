@@ -105,3 +105,24 @@ pub async fn drop_database(base_url: &str, name: &str) {
         admin.close().await;
     }
 }
+
+/// A process-wide watchdog for loopback suites: if this test binary is still running after `limit`
+/// it prints which tests started and aborts the process, so a hang (even one that blocks a worker
+/// thread or the test thread itself, where no tokio timeout can fire) fails fast instead of eating
+/// CI time. Started once per process (the first call wins); costs one sleeping thread.
+pub fn watchdog(limit: std::time::Duration) {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let spawned = std::thread::Builder::new().name("test-watchdog".into()).spawn(move || {
+            std::thread::sleep(limit);
+            eprintln!(
+                "\n*** test watchdog: this test binary ran longer than {} s; a test hangs (see the tests still running above). Aborting. ***\n",
+                limit.as_secs()
+            );
+            std::process::abort();
+        });
+        if let Err(error) = spawned {
+            eprintln!("test watchdog not started: {error}");
+        }
+    });
+}

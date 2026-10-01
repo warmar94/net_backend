@@ -9,4 +9,4 @@ change or a key dependency bump).
 
 ### Added
 
-- The empty crate skeleton (no API yet).
+- The crate.

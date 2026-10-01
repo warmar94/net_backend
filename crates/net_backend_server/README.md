@@ -6,31 +6,27 @@
   <img alt="Rust 1.95+" src="https://img.shields.io/badge/rust-1.95%2B-orange">
 </p>
 
-> **Status: in development.** Nothing is published yet. The core, the accounts module, the
-> WebSocket hub and the storage and chat modules described below work and are tested; deployment
-> (Compose / systemd, Caddy, backups) comes next (see [Roadmap](#roadmap)). APIs may still change
-> before 0.1.0.
-
 A Rust framework for building **game backend servers**: async (tokio + axum) and modular. It speaks
 plain HTTP + WebSocket + JSON, so any client can use it. Rust clients share the message types through
-[`net_backend_protocol`](https://github.com/warmar94/net_backend/tree/main/crates/net_backend_protocol); for Bevy games, the
-recommended client is [`bevy_net_backend`](https://crates.io/crates/bevy_net_backend).
+[`net_backend_protocol`](https://github.com/warmar94/net_backend/tree/main/crates/net_backend_protocol); the ready-made clients are
+[`net_backend_client`](https://github.com/warmar94/net_backend/tree/main/crates/net_backend_client) for Rust and
+[`bevy_net_backend`](https://crates.io/crates/bevy_net_backend) for Bevy games.
 
 It is a **library you build your own server with**, not a finished server application. It gives you
 solid building blocks with sensible defaults and leaves the game rules to you.
 
 ```text
-Your client (Rust)                        Your server (Rust binary)
-┌───────────────────────────┐             ┌───────────────────────────────┐
-│ your game / app / tool    │             │ your rules / hooks / logic    │
-│        │                  │             │        │                      │
-│ HTTP + WebSocket client ──┼─ HTTP / WS ▶│ net_backend_server            │
-│  · Bevy: bevy_net_backend │             │  core: auth, sessions, WS hub │
-│    (recommended)          │             │  modules: chat, leaderboards… │
-│  · other: any HTTP/WS lib │             └───────────────────────────────┘
-└───────────────────────────┘                          ▲
-           ▲                                           │
-           └──── net_backend_protocol (shared message types) ────┘
+Your client (Rust)                          Your server (Rust binary)
+┌─────────────────────────────┐             ┌───────────────────────────────┐
+│ your game / app / tool      │             │ your rules / hooks / logic    │
+│        │                    │             │        │                      │
+│ HTTP + WebSocket client ────┼─ HTTP / WS ▶│ net_backend_server            │
+│  · Rust: net_backend_client │             │  core: auth, sessions, WS hub │
+│  · Bevy: bevy_net_backend   │             │  modules: chat, leaderboards… │
+│  · Other: any HTTP/WS lib   │             └───────────────────────────────┘
+└─────────────────────────────┘                                ▲
+           ▲                                                   │
+           └──── net_backend_protocol (shared message types) ──┘
 
 Not Rust? Use the HTTP / WebSocket API directly (OpenAPI + WebSocket reference).
 ```
@@ -41,8 +37,9 @@ The server does not care which client connects; the JSON on the wire is the cont
 
 | Your client is… | Use |
 |---|---|
-| a **Bevy** game | [`bevy_net_backend`](https://crates.io/crates/bevy_net_backend) for the connection (HTTP, WebSocket) + [`net_backend_protocol`](https://github.com/warmar94/net_backend/tree/main/crates/net_backend_protocol) for the message types. The recommended path. |
-| **another Rust** app (other engine, tool, bot, CLI) | `net_backend_protocol` + the HTTP / WebSocket library you already use (for example reqwest, ureq, tokio-tungstenite). A small ready-made client, [`net_backend_client`](https://github.com/warmar94/net_backend/tree/main/crates/net_backend_client), is coming. |
+| a **Rust** app (tool, bot, CLI, other engine) | [`net_backend_client`](https://github.com/warmar94/net_backend/tree/main/crates/net_backend_client) for the connection (HTTP, WebSocket, SSH / SFTP) + [`net_backend_protocol`](https://github.com/warmar94/net_backend/tree/main/crates/net_backend_protocol) for the message types. |
+| a **Bevy** game | [`bevy_net_backend`](https://crates.io/crates/bevy_net_backend) for the connection (HTTP, WebSocket, SSH / SFTP) + `net_backend_protocol` for the message types. |
+| **other** | `net_backend_protocol` + any HTTP / WebSocket library (for example reqwest, ureq, tokio-tungstenite). |
 | **not Rust** (C#, GDScript, JavaScript, …) | The API directly: the OpenAPI document at `/v1/openapi.json` describes every HTTP route and can generate typed clients; the AsyncAPI document at `/v1/asyncapi.json` and the [WebSocket](#websocket) section describe every WebSocket frame. |
 
 ## Contents
@@ -524,7 +521,7 @@ code 4003 for a ban, else 4001).
 
 - Registration answers 409 `email_taken` for a known address: a deliberate trade-off of the
   protocol (a game needs a clear sign-up answer), bounded by the registration rate limit; an
-  enumeration-safe registration mode is planned for 0.2. The password is hashed either way, but a
+  enumeration-safe registration mode arrives in 0.2. The password is hashed either way, but a
   successful registration does more database work than a refused one, so the timing differs too.
   Login, password reset and the failed-login limits do not reveal whether an address has an
   account.
@@ -1198,15 +1195,17 @@ above the grace period plus the module shutdown time.
 
 ## Roadmap
 
-| Step | What |
+0.1.0 contains:
+
+| Part | What |
 |---|---|
 | core | the builder, modules, databases, migrations, HTTP, OpenAPI, command line |
 | accounts | the `Auth` module, rate limits, trusted proxies, app commands |
 | WebSocket | the hub: the client's envelope, handlers, pushes, rooms, bounded outboxes, close codes, revocation closes, AsyncAPI |
-| modules (this) | storage (saves) and chat (with presence); typed routes from the protocol's `HttpCall` |
-| next | deployment (Docker Compose or systemd, Caddy, backups) and a measured load test |
+| modules | storage (saves) and chat (with presence); typed routes from the protocol's `HttpCall` |
+| deployment | Docker Compose or systemd, Caddy, backups, a measured load test |
 
-Later versions: OAuth providers, notifications, friends, leaderboards, groups, lobbies, an
+Next versions: OAuth providers, notifications, friends, leaderboards, groups, lobbies, an
 optional SeaORM layer, multi-instance pub/sub, payment connectors.
 
 ## Limits
@@ -1235,7 +1234,7 @@ optional SeaORM layer, multi-instance pub/sub, payment connectors.
 
 | net_backend_server | net_backend_protocol | axum | sqlx | sea-query | utoipa | Rust |
 |---|---|---|---|---|---|---|
-| 0.1.0 (in development) | 0.1 | 0.8 (≥ 0.8.9) | 0.9 | 1.0 (≥ 1.0.2) | 6 | 1.95+ |
+| 0.1.0 | 0.1.0 | 0.8 (≥ 0.8.9) | 0.9 | 1.0 (≥ 1.0.2) | 6 | 1.95+ |
 
 ## Testing
 
@@ -1292,7 +1291,7 @@ the external-database job, the end-to-end client job, the dependency rules and t
 One enum over the three real pools plus sea-query keeps every type and every dialect correct.
 
 **Can I use SeaORM / Diesel?** Your own code can use anything on top of the same database. An
-optional SeaORM layer reusing the framework's pool is planned; Diesel is not supported.
+optional SeaORM layer reusing the framework's pool arrives in a later version; Diesel is not supported.
 
 **Why plain SQL migrations?** So you can read, review and change them, per database, and own a
 module's tables once you publish them.

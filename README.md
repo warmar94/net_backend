@@ -8,28 +8,22 @@
 
 **Build your own game backend in Rust: server, protocol and client.**
 
-> **Status: in development.** Nothing is published yet. The server's core, its accounts module,
-> its WebSocket hub and the storage and chat modules work and are tested; deployment comes next.
-> APIs may still change before 0.1.0.
-
 `net_backend` is a family of Rust crates for game backends: a framework you build your own server
-with, the shared message types both sides speak, and (coming) a small client. The server speaks
+with, the shared message types both sides speak, and a small Rust client. The server speaks
 plain HTTP + WebSocket + JSON, so any client in any language can use it.
 
 ```text
-Your client (Rust)                        Your server (Rust binary)
-┌───────────────────────────┐             ┌───────────────────────────────┐
-│ your game / app / tool    │             │ your rules / hooks / logic    │
-│        │                  │             │        │                      │
-│ HTTP + WebSocket client ──┼─ HTTP / WS ▶│ net_backend_server            │
-│  · Bevy: bevy_net_backend │             │  core: auth, sessions, WS hub │
-│    (recommended)          │             │  modules: chat, leaderboards… │
-│  · other: any HTTP/WS lib │             └───────────────────────────────┘
-│    (net_backend_client:   │                          ▲
-│     coming)               │                          │
-└───────────────────────────┘                          │
-           ▲                                           │
-           └──── net_backend_protocol (shared message types) ────┘
+Your client (Rust)                          Your server (Rust binary)
+┌─────────────────────────────┐             ┌───────────────────────────────┐
+│ your game / app / tool      │             │ your rules / hooks / logic    │
+│        │                    │             │        │                      │
+│ HTTP + WebSocket client ────┼─ HTTP / WS ▶│ net_backend_server            │
+│  · Rust: net_backend_client │             │  core: auth, sessions, WS hub │
+│  · Bevy: bevy_net_backend   │             │  modules: chat, leaderboards… │
+│  · Other: any HTTP/WS lib   │             └───────────────────────────────┘
+└─────────────────────────────┘                                ▲
+           ▲                                                   │
+           └──── net_backend_protocol (shared message types) ──┘
 
 Not Rust? Use the HTTP / WebSocket API directly (OpenAPI + WebSocket reference).
 ```
@@ -38,9 +32,9 @@ Not Rust? Use the HTTP / WebSocket API directly (OpenAPI + WebSocket reference).
 
 | Crate | What | Status |
 |---|---|---|
-| [`net_backend_server`](crates/net_backend_server/README.md) | The game-backend framework: tokio + axum, modules with hooks, accounts and sessions, a WebSocket hub, storage (saves) and chat, MySQL / PostgreSQL / SQLite, migrations, OpenAPI + AsyncAPI. A library you build your own server binary with. | in development |
-| [`net_backend_protocol`](crates/net_backend_protocol/README.md) | The shared message types: plain Rust + serde, no networking, no async runtime, no engine. Used by the server and by Rust clients. | in development |
-| [`net_backend_client`](crates/net_backend_client/README.md) | A small Rust client for apps that do not use Bevy, built on the protocol. | planned |
+| [`net_backend_server`](crates/net_backend_server/README.md) | The game-backend framework: tokio + axum, modules with hooks, accounts and sessions, a WebSocket hub, storage (saves) and chat, MySQL / PostgreSQL / SQLite, migrations, OpenAPI + AsyncAPI. A library you build your own server binary with. | 0.1.0 |
+| [`net_backend_protocol`](crates/net_backend_protocol/README.md) | The shared message types: plain Rust + serde, no networking, no async runtime, no engine. Used by the server and by Rust clients. | 0.1.0 |
+| [`net_backend_client`](crates/net_backend_client/README.md) | A small Rust client for apps that do not use Bevy, built on the protocol. | 0.1.0 |
 
 Each crate has its own version, changelog and README (the full manual).
 
@@ -50,8 +44,9 @@ The server does not care which client connects; the JSON on the wire is the cont
 
 | Your client is… | Use |
 |---|---|
-| a **Bevy** game | [`bevy_net_backend`](https://crates.io/crates/bevy_net_backend) for the connection (HTTP, WebSocket), the recommended path, + `net_backend_protocol` for the message types. |
-| **another Rust** app (other engine, tool, bot, CLI) | `net_backend_protocol` + the HTTP / WebSocket library you already use (for example reqwest, ureq, tokio-tungstenite). `net_backend_client` is coming. |
+| a **Rust** app (tool, bot, CLI, other engine) | [`net_backend_client`](crates/net_backend_client/README.md) for the connection (HTTP, WebSocket, SSH / SFTP) + `net_backend_protocol` for the message types. |
+| a **Bevy** game | [`bevy_net_backend`](https://crates.io/crates/bevy_net_backend) for the connection (HTTP, WebSocket, SSH / SFTP) + `net_backend_protocol` for the message types. |
+| **other** | `net_backend_protocol` + any HTTP / WebSocket library (for example reqwest, ureq, tokio-tungstenite). |
 | **not Rust** (C#, GDScript, JavaScript, …) | The API directly: the server's OpenAPI document describes every HTTP route and can generate typed clients; its AsyncAPI document (`/v1/asyncapi.json`) and README describe every WebSocket frame. |
 
 ## Repository layout
@@ -60,7 +55,7 @@ The server does not care which client connects; the JSON on the wire is the cont
 crates/
 ├── net_backend_server/     the server framework
 ├── net_backend_protocol/   the shared message types
-├── net_backend_client/     the client (planned)
+├── net_backend_client/     the Rust client
 └── e2e_tests/              end-to-end tests with the Bevy client (never published)
 ```
 
