@@ -1,0 +1,19 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+# Shared metadata; every crate inherits it with `<key>.workspace = true`.
+[workspace.package]
+edition = "2021"
+# The minimum users need (the same as the sister crates); keep it honest.
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/warmar94/net_backend"
+
+# Dependencies used by two or more crates. Caret minimums: ubiquitous shared crates must be able to
+# move with the rest of a user's build. A crate adds its own features on top
+# (`serde = { workspace = true, features = [..] }`).
+[workspace.dependencies]
+serde = { version = "1.0.219", features = ["derive"] }
+# Untyped JSON payloads (the envelope's `data`, error `details`, storage values).
+serde_json = "1.0.140"

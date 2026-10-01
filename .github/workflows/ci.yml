@@ -1,0 +1,221 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  RUSTDOCFLAGS: -D warnings
+
+# Rust is pinned to the dev version (never @stable): a newer Rust's new clippy lints must not turn CI red on
+# unchanged code. Upgrading Rust = bump this in every job, run clippy, fix. Users are unaffected (rust-version).
+#
+# One workspace, one lockfile. Every job selects its crate with `-p`, so only that crate's features are enabled
+# (resolver 2): the server is never built with the protocol's `bevy_net_backend` feature.
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  # net_backend_protocol: every feature combination on its own (build, clippy, tests incl. the README doctests, docs).
+  protocol:
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - "--no-default-features"
+          - ""
+          - "--features bevy_net_backend"
+          - "--all-features"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p net_backend_protocol --locked --all-targets ${{ matrix.features }}
+      - run: cargo clippy -p net_backend_protocol --locked --all-targets ${{ matrix.features }} -- -D warnings
+      - run: cargo test -p net_backend_protocol --locked ${{ matrix.features }}
+      - run: cargo doc -p net_backend_protocol --locked --no-deps ${{ matrix.features }}
+
+  # net_backend_server: each database backend alone, the default and everything (build, clippy, tests, docs).
+  # SQLite runs in process; the MySQL / PostgreSQL suites are ignored here and run in `databases`.
+  server:
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - "--no-default-features --features mysql"
+          - "--no-default-features --features postgres"
+          - "--no-default-features --features sqlite"
+          - ""
+          - "--all-features"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p net_backend_server --locked --all-targets ${{ matrix.features }}
+      - run: cargo clippy -p net_backend_server --locked --all-targets ${{ matrix.features }} -- -D warnings
+      - run: cargo test -p net_backend_server --locked ${{ matrix.features }}
+      - run: cargo doc -p net_backend_server --locked --no-deps ${{ matrix.features }}
+      # Without any backend the crate must still compile (starting a server then fails clearly).
+      - if: matrix.features == '--all-features'
+        run: |
+          cargo build -p net_backend_server --locked --no-default-features
+          cargo test -p net_backend_server --locked --no-default-features --lib
+          cargo clippy -p net_backend_server --locked --all-targets --no-default-features --features steam,smtp -- -D warnings
+          cargo test -p net_backend_server --locked --no-default-features --features sqlite,steam,smtp --test external_fakes
+
+  # net_backend_client: the skeleton builds cleanly.
+  client:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p net_backend_client --locked --all-targets
+      - run: cargo clippy -p net_backend_client --locked --all-targets -- -D warnings
+      - run: cargo test -p net_backend_client --locked
+      - run: cargo doc -p net_backend_client --locked --no-deps
+
+  # The server's database and auth suites against real MySQL 8.4, MariaDB 11.4 and PostgreSQL 16 (each test creates
+  # and drops its own database).
+  databases:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: nbs-ci-password
+          MYSQL_DATABASE: nbs
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -pnbs-ci-password"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      mariadb:
+        image: mariadb:11.4
+        env:
+          MARIADB_ROOT_PASSWORD: nbs-ci-password
+          MARIADB_DATABASE: nbs
+        ports: ["3307:3306"]
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: nbs-ci-password
+          POSTGRES_DB: nbs
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      NBS_TEST_MYSQL_URL: mysql://root:nbs-ci-password@127.0.0.1:3306/nbs
+      NBS_TEST_POSTGRES_URL: postgres://postgres:nbs-ci-password@127.0.0.1:5432/nbs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p net_backend_server --locked --all-features --test db --test auth -- --include-ignored
+      - run: cargo test -p net_backend_server --locked --no-default-features --features mysql --test db --test auth -- --include-ignored
+      - run: cargo test -p net_backend_server --locked --no-default-features --features postgres --test db --test auth -- --include-ignored
+      - name: MariaDB (through the mysql feature)
+        run: cargo test -p net_backend_server --locked --no-default-features --features mysql --test db --test auth -- --include-ignored
+        env:
+          NBS_TEST_MYSQL_URL: mysql://root:nbs-ci-password@127.0.0.1:3307/nbs
+
+  # The minimum supported Rust version (`rust-version` in the workspace Cargo.toml).
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p net_backend_protocol --locked --no-default-features
+      - run: cargo build -p net_backend_protocol --locked --all-features
+      - run: cargo build -p net_backend_server --locked --no-default-features --features sqlite
+      - run: cargo build -p net_backend_server --locked --all-features
+      - run: cargo build -p net_backend_client --locked
+
+  # The dependency rules.
+  deps:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+      # Protocol: no engine, async runtime or I/O crate without the feature.
+      - name: protocol has no runtime, I/O or engine by default
+        run: |
+          for f in "--no-default-features" ""; do
+            if cargo tree -p net_backend_protocol --locked --target all -e normal,build $f --prefix none | grep -E '^(bevy[a-z_]*|tokio|mio|async-[a-z-]+|futures[a-z-]*|hyper|reqwest|ureq|tungstenite|rustls|ring|openssl-sys) '; then
+              echo "forbidden dependency in net_backend_protocol with [$f]"; exit 1
+            fi
+          done
+      # Protocol with the client feature: every bevy* crate at 0.19.0 (the client's exact pin), exactly one bevy_ecs.
+      - name: one Bevy, 0.19.0
+        run: |
+          if grep -A1 -E '^name = "bevy' Cargo.lock | grep -E '^version' | grep -v '"0.19.0"' | grep -v -E '"0\.1\.[0-9]+"'; then
+            echo "a bevy* crate other than 0.19.0 is in Cargo.lock"; exit 1
+          fi
+          if [ "$(cargo tree -p net_backend_protocol --locked --all-features -e normal -i bevy_ecs --depth 0 --prefix none | wc -l)" != "1" ]; then
+            echo "more than one bevy_ecs"; exit 1
+          fi
+      # Server and client: no OpenSSL / native-tls / aws-lc, no game engine, exactly one tokio.
+      - name: server and client have no OpenSSL / native-tls / aws-lc / engine, one tokio
+        run: |
+          check() {
+            if cargo tree "$@" --locked --target all -e normal,build --prefix none | grep -E '^(openssl|openssl-sys|native-tls|aws-lc-rs|aws-lc-sys|bevy[a-z_]*) '; then
+              echo "forbidden dependency with [$*]"; exit 1
+            fi
+          }
+          check -p net_backend_client
+          for f in "--all-features" "" "--no-default-features --features sqlite" "--no-default-features --features postgres" "--no-default-features --features sqlite,steam,smtp"; do
+            check -p net_backend_server $f
+            # `-i tokio` can print the same version several times (one block per target set): count VERSIONS.
+            if [ "$(cargo tree -p net_backend_server --locked --target all -e normal $f -i tokio --depth 0 --prefix none | grep -E '^tokio v' | sort -u | wc -l)" != "1" ]; then
+              echo "more than one tokio with [$f]"; exit 1
+            fi
+          done
+
+  # Nothing private in any package. `--list` only: packaging the server for real needs the protocol on crates.io.
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+      - run: |
+          for c in net_backend_protocol net_backend_server; do
+            cargo package -p $c --locked --list --allow-dirty > files-$c.txt
+            echo "== $c"; cat files-$c.txt
+            if grep -E '(^|/)(NOTES\.md|docs/)' files-$c.txt; then echo "private files in the $c package"; exit 1; fi
+            for f in README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE Cargo.toml src/lib.rs; do
+              grep -qx "$f" files-$c.txt || { echo "$f missing from the $c package"; exit 1; }
+            done
+          done

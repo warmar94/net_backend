@@ -1,0 +1,26 @@
+# Build output (the workspace's, and any a crate's tests create in its own folder)
+target/
+**/*.rs.bk
+*.pdb
+
+# Editors / OS
+.vs/
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Secrets — never in the repo
+.env
+.env.*
+*.pem
+*.key
+credentials.toml
+.cargo/credentials*
+
+# Private notes — local only (the workspace's and every crate's)
+**/NOTES.md
+
+# Private design docs — local only (at any depth)
+**/docs/

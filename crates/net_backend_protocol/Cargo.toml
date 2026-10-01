@@ -1,0 +1,43 @@
+[package]
+name = "net_backend_protocol"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "Shared message types for net_backend_server: plain Rust + serde, usable from any Rust client."
+license.workspace = true
+repository.workspace = true
+homepage = "https://github.com/warmar94/net_backend/tree/main/crates/net_backend_protocol"
+readme = "README.md"
+keywords = ["gamedev", "protocol", "serde", "websocket", "backend"]
+categories = ["game-development", "network-programming", "encoding"]
+# Not part of the published package.
+exclude = ["NOTES.md", "docs/", "/target"]
+
+[features]
+# Plain Rust + serde by default: no engine, no I/O, no async runtime.
+default = []
+# Implements `bevy_net_backend`'s `WsRequest` / `WsPushMessage` for the WebSocket messages of this
+# crate, so they plug straight into that client's typed requests and pushes. Brings that crate (and
+# with it that crate's own dependencies); never needed by a server.
+bevy_net_backend = ["dep:bevy_net_backend"]
+
+[dependencies]
+serde = { workspace = true }
+# Untyped JSON payloads: the envelope's `data`, an error's `details`, storage values. Caret, not
+# `=`: a ubiquitous shared crate must be able to move with the rest of a build.
+serde_json = { workspace = true }
+# Optional integration with the published client. A plain version (newest compatible 0.1.x), never
+# a path. Only the WebSocket + JSON parts are needed for the traits.
+bevy_net_backend = { version = "0.1.0", default-features = false, features = ["ws", "json"], optional = true }
+
+[[example]]
+name = "print_frames"
+
+# Runs this crate's frames through the published client's own encoder and decoder.
+[[test]]
+name = "client_compat"
+required-features = ["bevy_net_backend"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

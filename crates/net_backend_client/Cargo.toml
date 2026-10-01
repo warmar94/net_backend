@@ -1,0 +1,20 @@
+[package]
+name = "net_backend_client"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "A small Rust client for net_backend_server, built on net_backend_protocol."
+license.workspace = true
+repository.workspace = true
+homepage = "https://github.com/warmar94/net_backend/tree/main/crates/net_backend_client"
+readme = "README.md"
+keywords = ["gamedev", "client", "backend", "websocket", "protocol"]
+categories = ["game-development", "network-programming"]
+# Not part of the published package.
+exclude = ["NOTES.md", "docs/", "/target"]
+# A skeleton: nothing to publish yet. Remove when the first real version is ready.
+publish = false
+
+[dependencies]
+# The shared message types.
+net_backend_protocol = { path = "../net_backend_protocol", version = "0.1.0" }
