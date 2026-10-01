@@ -170,8 +170,9 @@ async fn start(tweak: impl FnOnce(&mut Config)) -> Server {
 }
 
 async fn start_with(tweak: impl FnOnce(&mut Config), url: &str, auth: AuthConfig) -> Server {
-    // The whole suite runs in ~30 s; a hang aborts the binary after 10 minutes (CI hang, 2026-10-02).
-    common::watchdog(Duration::from_secs(600));
+    // The whole suite runs in ~30 s; a hang aborts the binary after 30 minutes (CI hang, 2026-10-02;
+    // the CI stack dump fires after 2 minutes, independently).
+    common::watchdog(Duration::from_secs(1800));
     let mut config = Config::default();
     config.database.url = SecretString::new(url);
     config.database.migrations_dir = common::temp_dir("ws-migrations");
