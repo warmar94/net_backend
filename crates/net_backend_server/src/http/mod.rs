@@ -15,6 +15,7 @@
 //! which the client would retry forever). `GET /metrics` (`metrics.enabled`) is served on its own
 //! listener (`metrics.bind`), never on the API port.
 
+pub mod call;
 pub(crate) mod client_ip;
 pub(crate) mod middleware;
 pub(crate) mod routes;

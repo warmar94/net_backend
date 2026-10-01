@@ -76,6 +76,8 @@ pub struct NetBackendServer {
     commands: Vec<Arc<dyn AppCommand>>,
     ws_handlers: WsHandlers,
     broadcaster: Option<Arc<dyn Broadcaster>>,
+    /// Registration mistakes found before build (reported by it).
+    problems: Vec<String>,
 }
 
 impl NetBackendServer {
@@ -94,6 +96,7 @@ impl NetBackendServer {
             commands: Vec::new(),
             ws_handlers: WsHandlers::new(),
             broadcaster: None,
+            problems: Vec::new(),
         }
     }
 
@@ -129,6 +132,26 @@ impl NetBackendServer {
         self
     }
 
+    /// Add an undocumented typed route for the protocol call `C` (or a game's own
+    /// [`HttpCall`](net_backend_protocol::HttpCall)): mounted at `C::ROUTE` with its method; the
+    /// handler takes [`Call<C>`](crate::http::call::Call) last and answers
+    /// [`CallResult<C>`](crate::http::call::CallResult). Documented ones: `.routes(call_route!(C, handler))`.
+    /// With `C::ROUTE.auth` the route answers 401 to a request without a valid token before the
+    /// handler runs. A method this server version does not know: `build` fails.
+    pub fn call<C, H, T, M>(mut self, handler: H) -> Self
+    where
+        C: net_backend_protocol::HttpCall + 'static,
+        H: crate::http::call::CallHandler<C, T> + axum::handler::Handler<M, AppState>,
+        T: 'static,
+        M: 'static,
+    {
+        if !crate::http::call::supported_method(C::ROUTE.method) {
+            self.problems.push(format!("the route {} {} uses a method this server version cannot serve", C::ROUTE.method, C::ROUTE.path));
+        }
+        self.route_ops.push(Box::new(move |api| crate::http::call::undocumented::<C, H, T, M>(api, handler)));
+        self
+    }
+
     /// Nest a whole router under a path prefix.
     pub fn nest(mut self, path: &str, router: Router<AppState>) -> Self {
         let path = path.to_string();
@@ -157,6 +180,17 @@ impl NetBackendServer {
         Fut: Future<Output = Result<Decision<E>, AppError>> + Send + 'static,
     {
         self.hooks.before(hook);
+        self
+    }
+
+    /// Register an `in_tx` hook for events of type `E` (runs inside the module's transaction; see
+    /// [`Hooks::in_tx`]).
+    pub fn in_tx<E, F>(mut self, hook: F) -> Self
+    where
+        E: Event,
+        F: for<'a> Fn(&'a mut crate::db::DbTx, &'a HookCtx, &'a E) -> futures_util::future::BoxFuture<'a, Result<(), AppError>> + Send + Sync + 'static,
+    {
+        self.hooks.in_tx(hook);
         self
     }
 
@@ -279,6 +313,9 @@ impl NetBackendServer {
     pub async fn build(self) -> Result<PreparedServer, Error> {
         self.config.validate()?;
         self.modules.validate()?;
+        if !self.problems.is_empty() {
+            return Err(Error::Module(self.problems.join("; ")));
+        }
         let unknown = self.config.unknown_module_sections(&self.modules.names());
         if !unknown.is_empty() {
             return Err(Error::Config(unknown.iter().map(|name| format!("[modules.{name}]: no module named `{name}` is registered (a typo?)")).collect()));
@@ -296,6 +333,7 @@ impl NetBackendServer {
             commands: _,
             mut ws_handlers,
             broadcaster,
+            problems: _,
         } = self;
         let db = match db {
             Some(db) => db,

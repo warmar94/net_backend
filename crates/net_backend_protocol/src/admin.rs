@@ -1,5 +1,6 @@
 //! Administration: list and inspect accounts, ban and unban them, revoke their sessions, grant
-//! and revoke roles, read the audit log. Routes: [`routes::admin`](crate::routes::admin); every one
+//! and revoke roles, read the audit log, read and write a user's storage objects
+//! ([`AdminPutObject`] may set the server write lock). Routes: [`routes::admin`](crate::routes::admin); every one
 //! needs an access token of an account with the [`ADMIN_ROLE`] role (others get 403 `forbidden`).
 //!
 //! These routes are for operator tools (a dashboard, a script), not for game clients. A server
@@ -356,6 +357,436 @@ fn check_cursor(cursor: Option<&Cursor>, details: &mut ValidationDetails) {
         details.add("cursor", format!("is longer than {MAX_CURSOR_BYTES} bytes"));
     }
 }
+
+// ---- typed HTTP calls (see `http_call`) ---------------------------------------------------------
+
+/// The typed HTTP calls of this module (in their own scope: their imports stay out of the
+/// module's doc-link scope).
+mod calls {
+    use super::*;
+
+    use crate::envelope::Ack;
+    use crate::http_call::{payload_call, HttpCall, NoPayload, PathParams, PayloadKind, NO_PAYLOAD};
+    use crate::page::{Page, PageRequest};
+    use crate::routes::{self, HttpMethod, Route};
+    use crate::storage::{is_valid_name, DeleteObject, ObjectAck, ObjectVersion, StorageObject, StorageObjectInfo, WriteAccess};
+
+    payload_call!(UserListQuery, Get, routes::admin::USERS, true, Query, Page<AdminUser>);
+    payload_call!(AuditQuery, Get, routes::admin::AUDIT, true, Query, Page<AuditEntry>);
+
+    const NOT_A_NAME: &str = "is not a valid storage name";
+
+    /// An administration call about one account with no payload (`{user}` is the only parameter).
+    macro_rules! user_call {
+        ($(#[$meta:meta])* $name:ident, $method:ident, $path:expr, $response:ty) => {
+            $(#[$meta])*
+            #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+            #[non_exhaustive]
+            pub struct $name {
+                /// The account.
+                pub user: UserId,
+            }
+
+            impl $name {
+                /// The call for `user`.
+                pub const fn new(user: UserId) -> Self {
+                    Self { user }
+                }
+            }
+
+            impl HttpCall for $name {
+                type Payload = NoPayload;
+                type Response = $response;
+                const ROUTE: Route = Route::new(HttpMethod::$method, $path, true);
+                const PAYLOAD: PayloadKind = PayloadKind::Empty;
+
+                fn payload(&self) -> &NoPayload {
+                    &NO_PAYLOAD
+                }
+
+                fn path_params(&self) -> PathParams {
+                    PathParams::new().with("user", self.user)
+                }
+
+                fn from_parts(params: &PathParams, _payload: NoPayload) -> Result<Self, ApiError> {
+                    Ok(Self::new(params.id("user")?))
+                }
+            }
+        };
+    }
+
+    user_call!(
+        /// One account: `GET /v1/admin/users/{user}` → [`AdminUser`].
+        GetUser,
+        Get,
+        routes::admin::USER,
+        AdminUser
+    );
+    user_call!(
+        /// Lift a ban: `POST /v1/admin/users/{user}/unban` → [`Ack`].
+        UnbanUser,
+        Post,
+        routes::admin::UNBAN,
+        Ack
+    );
+    user_call!(
+        /// Revoke every session of an account: `DELETE /v1/admin/users/{user}/sessions` → [`Ack`].
+        RevokeSessions,
+        Delete,
+        routes::admin::SESSIONS,
+        Ack
+    );
+
+    /// Ban an account: `POST /v1/admin/users/{user}/ban` with a [`BanRequest`] → [`Ack`].
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub struct BanUser {
+        /// The account.
+        pub user: UserId,
+        /// The ban.
+        pub ban: BanRequest,
+    }
+
+    impl BanUser {
+        /// Ban `user`.
+        pub fn new(user: UserId, ban: BanRequest) -> Self {
+            Self { user, ban }
+        }
+    }
+
+    impl HttpCall for BanUser {
+        type Payload = BanRequest;
+        type Response = Ack;
+        const ROUTE: Route = Route::new(HttpMethod::Post, routes::admin::BAN, true);
+        const PAYLOAD: PayloadKind = PayloadKind::Json;
+
+        fn payload(&self) -> &BanRequest {
+            &self.ban
+        }
+
+        fn path_params(&self) -> PathParams {
+            PathParams::new().with("user", self.user)
+        }
+
+        fn from_parts(params: &PathParams, ban: BanRequest) -> Result<Self, ApiError> {
+            Ok(Self::new(params.id("user")?, ban))
+        }
+    }
+
+    /// Unlink a login provider from an account: `DELETE /v1/admin/users/{user}/identities/{provider}` → [`Ack`].
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub struct UnlinkUserIdentity {
+        /// The account.
+        pub user: UserId,
+        /// The provider (`steam`).
+        pub provider: String,
+    }
+
+    impl UnlinkUserIdentity {
+        /// Unlink `provider` from `user`.
+        pub fn new(user: UserId, provider: impl Into<String>) -> Self {
+            Self { user, provider: provider.into() }
+        }
+    }
+
+    impl HttpCall for UnlinkUserIdentity {
+        type Payload = NoPayload;
+        type Response = Ack;
+        const ROUTE: Route = Route::new(HttpMethod::Delete, routes::admin::IDENTITY, true);
+        const PAYLOAD: PayloadKind = PayloadKind::Empty;
+
+        fn payload(&self) -> &NoPayload {
+            &NO_PAYLOAD
+        }
+
+        fn path_params(&self) -> PathParams {
+            PathParams::new().with("user", self.user).with("provider", &self.provider)
+        }
+
+        fn from_parts(params: &PathParams, _payload: NoPayload) -> Result<Self, ApiError> {
+            Ok(Self::new(params.id("user")?, params.checked("provider", crate::auth::is_valid_provider, "is not a provider name")?))
+        }
+    }
+
+    /// A role call: `PUT` grants, `DELETE` revokes `/v1/admin/users/{user}/roles/{role}`.
+    macro_rules! role_call {
+        ($(#[$meta:meta])* $name:ident, $method:ident) => {
+            $(#[$meta])*
+            #[derive(Clone, Debug, PartialEq, Eq)]
+            #[non_exhaustive]
+            pub struct $name {
+                /// The account.
+                pub user: UserId,
+                /// The role ([`is_valid_role`]).
+                pub role: String,
+            }
+
+            impl $name {
+                /// The call for `user` and `role`.
+                pub fn new(user: UserId, role: impl Into<String>) -> Self {
+                    Self { user, role: role.into() }
+                }
+            }
+
+            impl HttpCall for $name {
+                type Payload = NoPayload;
+                type Response = Ack;
+                const ROUTE: Route = Route::new(HttpMethod::$method, routes::admin::ROLE, true);
+                const PAYLOAD: PayloadKind = PayloadKind::Empty;
+
+                fn payload(&self) -> &NoPayload {
+                    &NO_PAYLOAD
+                }
+
+                fn path_params(&self) -> PathParams {
+                    PathParams::new().with("user", self.user).with("role", &self.role)
+                }
+
+                fn from_parts(params: &PathParams, _payload: NoPayload) -> Result<Self, ApiError> {
+                    Ok(Self::new(params.id("user")?, params.checked("role", is_valid_role, "is not a role name ([a-z][a-z0-9_.-]*, at most 64 bytes)")?))
+                }
+            }
+        };
+    }
+
+    role_call!(
+        /// Grant a role: `PUT /v1/admin/users/{user}/roles/{role}` → [`Ack`].
+        GrantRole,
+        Put
+    );
+    role_call!(
+        /// Revoke a role: `DELETE /v1/admin/users/{user}/roles/{role}` → [`Ack`].
+        RevokeRole,
+        Delete
+    );
+
+    // ---- a user's storage ---------------------------------------------------------------------------
+
+    /// List one collection of a user's storage: `GET /v1/admin/users/{user}/storage/{collection}` →
+    /// [`Page`]`<`[`StorageObjectInfo`]`>` (no values; audited as `admin.storage_list`).
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub struct ListUserObjects {
+        /// The account.
+        pub user: UserId,
+        /// The collection.
+        pub collection: String,
+        /// Which page.
+        pub page: PageRequest,
+    }
+
+    impl ListUserObjects {
+        /// The first page of `user`'s `collection`.
+        pub fn new(user: UserId, collection: impl Into<String>) -> Self {
+            Self { user, collection: collection.into(), page: PageRequest::first() }
+        }
+
+        /// The same call for this page.
+        pub fn with_page(mut self, page: PageRequest) -> Self {
+            self.page = page;
+            self
+        }
+    }
+
+    impl HttpCall for ListUserObjects {
+        type Payload = PageRequest;
+        type Response = Page<StorageObjectInfo>;
+        const ROUTE: Route = Route::new(HttpMethod::Get, routes::admin::USER_STORAGE, true);
+        const PAYLOAD: PayloadKind = PayloadKind::Query;
+
+        fn payload(&self) -> &PageRequest {
+            &self.page
+        }
+
+        fn path_params(&self) -> PathParams {
+            PathParams::new().with("user", self.user).with("collection", &self.collection)
+        }
+
+        fn from_parts(params: &PathParams, page: PageRequest) -> Result<Self, ApiError> {
+            Ok(Self::new(params.id("user")?, params.checked("collection", is_valid_name, NOT_A_NAME)?).with_page(page))
+        }
+    }
+
+    /// Read one of a user's objects: `GET /v1/admin/users/{user}/storage/{collection}/{key}` →
+    /// [`StorageObject`] (audited as `admin.storage_read`).
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub struct GetUserObject {
+        /// The account.
+        pub user: UserId,
+        /// The collection.
+        pub collection: String,
+        /// The key.
+        pub key: String,
+    }
+
+    impl GetUserObject {
+        /// Read `user`'s object.
+        pub fn new(user: UserId, collection: impl Into<String>, key: impl Into<String>) -> Self {
+            Self { user, collection: collection.into(), key: key.into() }
+        }
+    }
+
+    fn object_params(user: UserId, collection: &str, key: &str) -> PathParams {
+        PathParams::new().with("user", user).with("collection", collection).with("key", key)
+    }
+
+    fn object_names(params: &PathParams) -> Result<(UserId, String, String), ApiError> {
+        Ok((params.id("user")?, params.checked("collection", is_valid_name, NOT_A_NAME)?, params.checked("key", is_valid_name, NOT_A_NAME)?))
+    }
+
+    impl HttpCall for GetUserObject {
+        type Payload = NoPayload;
+        type Response = StorageObject;
+        const ROUTE: Route = Route::new(HttpMethod::Get, routes::admin::USER_OBJECT, true);
+        const PAYLOAD: PayloadKind = PayloadKind::Empty;
+
+        fn payload(&self) -> &NoPayload {
+            &NO_PAYLOAD
+        }
+
+        fn path_params(&self) -> PathParams {
+            object_params(self.user, &self.collection, &self.key)
+        }
+
+        fn from_parts(params: &PathParams, _payload: NoPayload) -> Result<Self, ApiError> {
+            let (user, collection, key) = object_names(params)?;
+            Ok(Self::new(user, collection, key))
+        }
+    }
+
+    /// An administrator's write: like [`PutObject`](crate::storage::PutObject), plus the write lock.
+    ///
+    /// JSON: `{"value":{…},"if_version":3,"write":"server"}` (`if_version` and `write` optional;
+    /// without `write` an existing object keeps its lock and a new one is owner-writable).
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct AdminPutObject {
+        /// The value.
+        pub value: Value,
+        /// Only write if the stored version is this one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub if_version: Option<ObjectVersion>,
+        /// Set who may write it afterwards ([`WriteAccess::Server`] locks it against the owner).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub write: Option<WriteAccess>,
+    }
+
+    impl AdminPutObject {
+        /// An unconditional write of `value`.
+        pub fn new(value: Value) -> Self {
+            Self { value, if_version: None, write: None }
+        }
+
+        /// Only write if the stored version is `version`.
+        pub fn if_version(mut self, version: ObjectVersion) -> Self {
+            self.if_version = Some(version);
+            self
+        }
+
+        /// Set the write access.
+        pub fn with_write(mut self, write: WriteAccess) -> Self {
+            self.write = Some(write);
+            self
+        }
+    }
+
+    /// Write one of a user's objects: `PUT /v1/admin/users/{user}/storage/{collection}/{key}` with an
+    /// [`AdminPutObject`] → [`ObjectAck`] (audited as `admin.storage_write`).
+    #[derive(Clone, Debug, PartialEq)]
+    #[non_exhaustive]
+    pub struct WriteUserObject {
+        /// The account.
+        pub user: UserId,
+        /// The collection.
+        pub collection: String,
+        /// The key.
+        pub key: String,
+        /// The write.
+        pub put: AdminPutObject,
+    }
+
+    impl WriteUserObject {
+        /// Write `user`'s object.
+        pub fn new(user: UserId, collection: impl Into<String>, key: impl Into<String>, put: AdminPutObject) -> Self {
+            Self { user, collection: collection.into(), key: key.into(), put }
+        }
+    }
+
+    impl HttpCall for WriteUserObject {
+        type Payload = AdminPutObject;
+        type Response = ObjectAck;
+        const ROUTE: Route = Route::new(HttpMethod::Put, routes::admin::USER_OBJECT, true);
+        const PAYLOAD: PayloadKind = PayloadKind::Json;
+
+        fn payload(&self) -> &AdminPutObject {
+            &self.put
+        }
+
+        fn path_params(&self) -> PathParams {
+            object_params(self.user, &self.collection, &self.key)
+        }
+
+        fn from_parts(params: &PathParams, put: AdminPutObject) -> Result<Self, ApiError> {
+            let (user, collection, key) = object_names(params)?;
+            Ok(Self::new(user, collection, key, put))
+        }
+    }
+
+    /// Delete one of a user's objects: `DELETE /v1/admin/users/{user}/storage/{collection}/{key}` →
+    /// [`Ack`] (audited as `admin.storage_delete`; server-locked objects too).
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub struct RemoveUserObject {
+        /// The account.
+        pub user: UserId,
+        /// The collection.
+        pub collection: String,
+        /// The key.
+        pub key: String,
+        /// The condition.
+        pub delete: DeleteObject,
+    }
+
+    impl RemoveUserObject {
+        /// Delete `user`'s object.
+        pub fn new(user: UserId, collection: impl Into<String>, key: impl Into<String>) -> Self {
+            Self { user, collection: collection.into(), key: key.into(), delete: DeleteObject::new() }
+        }
+
+        /// Only delete if the stored version is `version`.
+        pub fn if_version(mut self, version: ObjectVersion) -> Self {
+            self.delete = self.delete.if_version(version);
+            self
+        }
+    }
+
+    impl HttpCall for RemoveUserObject {
+        type Payload = DeleteObject;
+        type Response = Ack;
+        const ROUTE: Route = Route::new(HttpMethod::Delete, routes::admin::USER_OBJECT, true);
+        const PAYLOAD: PayloadKind = PayloadKind::Query;
+
+        fn payload(&self) -> &DeleteObject {
+            &self.delete
+        }
+
+        fn path_params(&self) -> PathParams {
+            object_params(self.user, &self.collection, &self.key)
+        }
+
+        fn from_parts(params: &PathParams, delete: DeleteObject) -> Result<Self, ApiError> {
+            let (user, collection, key) = object_names(params)?;
+            Ok(Self { user, collection, key, delete })
+        }
+    }
+}
+
+pub use calls::{
+    AdminPutObject, BanUser, GetUser, GetUserObject, GrantRole, ListUserObjects, RemoveUserObject, RevokeRole, RevokeSessions, UnbanUser, UnlinkUserIdentity,
+    WriteUserObject,
+};
 
 #[cfg(test)]
 mod tests {

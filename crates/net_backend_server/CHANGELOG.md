@@ -11,6 +11,48 @@ In development. This entry grows until the first release.
 
 ### Added
 
+- Typed routes (`http::call`): the extractor `Call<C>` (path parameters + JSON body or query of a
+  protocol `HttpCall`, shape-checked), the answer `Reply<C>` / `CallResult<C>` (with headers), the
+  handler marker `CallHandler`, `documented` / `undocumented` / `method_router`, the macro
+  `call_route!` and the builder method `.call::<C, ..>(handler)`: a route is mounted at
+  `C::ROUTE` with its method, and its OpenAPI path and method always come from the protocol. Every
+  auth, account and admin route is mounted this way now.
+- The storage module (feature `storage`, `storage::Storage`, settings `[modules.storage]` /
+  `StorageConfig`): `/v1/storage` (list without values, get / put / delete with `ETag`, batch get /
+  put in one transaction), optimistic versions (`if_version`, `If-Match: "N"`, `If-None-Match: *`,
+  409 `version_conflict` with the current version and the failing batch index; exactly one winner
+  among simultaneous conditional writes), the server write lock (`write: "server"`), the value
+  size limit and per-route body limits, the per-user quota (exact under concurrent creates), hooks
+  (`BeforeStorageWrite`, `InStorageWriteTx`, `AfterStorageWrite`, `BeforeStorageDelete`,
+  `AfterStorageDelete`), audited admin access (`/v1/admin/users/{user}/storage/...`),
+  `StorageService` for server code, migrations for the three databases, OpenAPI schemas.
+- The chat module (feature `chat`, `chat::Chat`, settings `[modules.chat]` / `ChatConfig`,
+  `RoomSpec`): public rooms from the settings, group rooms and DM rooms; the WebSocket kinds
+  `chat.join` / `leave` / `send` / `history` / `members` and the pushes `chat.message` /
+  `chat.deleted` / `chat.presence` (registered for the AsyncAPI document with schemas); the HTTP
+  routes for rooms, history, DMs and message deletion; the answer before the sender's echo (with
+  its `nonce`); member caps (exact under simultaneous joins), the per-user send rate, the text
+  rules, the history retention with a purge task; presence per user with a cap and a per-room
+  rate; moderation hooks (`BeforeChatJoin`, `BeforeChatSend`, `AfterChatSend`,
+  `BeforeDirectOpen`, `AfterChatDelete`), sender / moderator deletion (audited); `ChatService` for
+  server code (rooms, groups, members, `send_as`, `delete_message`, `online`, `purge`); migrations
+  for the three databases.
+- `in_tx` hooks: `Hooks::in_tx` / `run_in_tx` / `in_tx_count` and `NetBackendServer::in_tx` (inside a
+  module's transaction; time limit, contained panics, the transaction rolls back on refusal).
+- `Module::depends_on` (a module's required modules, registered before it; checked at build).
+- `Db::begin_write` (a transaction that writes; SQLite `BEGIN IMMEDIATE`).
+- `db::Retry`, `DbError::is_retryable`, `db::is_retryable_error` and `DbTx::finish`: a write
+  transaction the database aborts as a deadlock (MySQL 1213, PostgreSQL `40P01` / `40001`, a busy
+  SQLite) runs again from the start, bounded; every framework write transaction uses it.
+- Storage: `StorageConfig::max_bytes_per_user` (4 MiB of values per user; only growth is checked),
+  `write_rate` / `write_rate_window_secs` (60 owner writes per 60 s per user; 429), and
+  `server_collections` (default `["server"]`: owners never create, change or delete objects there;
+  new ones are server-locked). The quotas bind only the owner's writes. A batch item's failure
+  carries its `index` also for a hook's refusal and a quota.
+- Chat: `ChatConfig::dm_open_rate` / `dm_open_window_secs` (20 DM opens per 600 s per user; 429).
+- Hub: `Control` deliveries (`Delivery::control`, `Control::LeaveRoom`) through the `Broadcaster`
+  and `Hub::remove_from_room(user, room)`: that user's sockets leave the room on every instance.
+
 - The WebSocket hub at `/v1/ws` (module `ws`, settings `[ws]` / `WsConfig`, on by default): the
   protocol's envelope (requests, answers, pushes; malformed frames with an id answered
   `bad_request`, `unknown_type` for unregistered kinds); authentication at the handshake through
@@ -91,6 +133,30 @@ In development. This entry grows until the first release.
   hash is built at start; `AuthContext::session_started_at`, `rate_limit::{ip_key, RecentSet}`.
 
 ### Changed
+
+- Path-parameter errors of the auth / account / admin routes come from the protocol's
+  `HttpCall::from_parts`: an invalid role is 400 `bad_request` (as before) with a message naming
+  the parameter; a provider name that is not a provider name (`DELETE
+  /v1/account/identities/Steam`, also the admin route) is now 400 `bad_request` before any lookup
+  (it answered 404 "no such linked login" before).
+- Typed routes enforce `ROUTE.auth`: a route marked "token required" answers 401 (or the
+  authenticator's 403) before its handler runs, also when the handler never takes an
+  `AuthContext` (a game's own `HttpCall` included). A route with a method this version cannot
+  serve answers 405, and `NetBackendServer::call` refuses it at build.
+- Storage: every write and delete takes the owner's account lock, reads the object, then updates
+  the existing row or inserts (no statement on an absent row): first saves of different players
+  no longer deadlock on MySQL; conditional writes take the lock too. PostgreSQL locks the account
+  `FOR NO KEY UPDATE`.
+- Chat: a DM send updates the room before inserting the message (concurrent DM sends in one room
+  no longer deadlock on MySQL). `chat.members` on a DM room lists only the caller (a DM never
+  reveals whether the peer is online). A removed group member is refused at once on every
+  instance (the membership is checked on every group send and re-checked after a join) and leaves
+  the room everywhere. A DM's push and the history show the `nonce` to its sender only. Room and
+  group names are validated (1-64 characters, no invisible characters); group members are
+  deduplicated, an unknown one is 404. Cached rooms refresh after 60 s. The retention purge
+  deletes in batches of 1000. The join looks up the display name before joining the hub room.
+- Tests wait for conditions with generous upper bounds instead of tight fixed timeouts (a CI
+  runner raced a push against the socket's registration).
 
 - `ws.query_token` defaults to `false` (reverse proxies log URLs with their query). `Hub::publish` returns
   `Result<(), PushError>`.

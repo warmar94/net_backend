@@ -1,18 +1,18 @@
 //! The account routes (`/v1/auth/*`, `/v1/account*`), exactly as the protocol defines them.
 
-use axum::extract::{FromRequestParts, Path, State};
+use axum::extract::{FromRequestParts, State};
 use http::request::Parts;
 use net_backend_protocol::auth::{
-    Account, AuthSession, ChangePasswordRequest, ForgotPasswordRequest, LoginRequest, LogoutRequest, RefreshRequest, RegisterRequest, ResetPasswordRequest,
-    SteamLoginRequest, TokenPair, UpdateAccountRequest, VerifyEmailRequest,
+    ChangePasswordRequest, ForgotPasswordRequest, GetAccount, LoginRequest, LogoutRequest, RefreshRequest, RegisterRequest, ResendVerification,
+    ResetPasswordRequest, SteamLoginRequest, UnlinkIdentity, UpdateAccountRequest, VerifyEmailRequest,
 };
 use net_backend_protocol::Ack;
 
 use super::openapi as doc;
 use super::service::{user_agent, AuthService, ReqInfo};
 use super::{AuthContext, MaybeAuth};
-use crate::error::AppError;
-use crate::http::{ApiJson, ClientIp, Ext, RequestId};
+use crate::http::call::{Call, CallResult, Reply};
+use crate::http::{ClientIp, Ext, RequestId};
 use crate::openapi::ErrorBody;
 use crate::state::AppState;
 
@@ -39,9 +39,9 @@ pub(crate) async fn register(
     State(state): State<AppState>,
     Ext(service): Ext<AuthService>,
     info: ReqInfo,
-    ApiJson(body): ApiJson<RegisterRequest>,
-) -> Result<ApiJson<AuthSession>, AppError> {
-    service.register(&state, &info, body).await.map(ApiJson)
+    Call(body): Call<RegisterRequest>,
+) -> CallResult<RegisterRequest> {
+    service.register(&state, &info, body).await.map(Reply::new)
 }
 
 /// Log in with email and password.
@@ -57,9 +57,9 @@ pub(crate) async fn login(
     State(state): State<AppState>,
     Ext(service): Ext<AuthService>,
     info: ReqInfo,
-    ApiJson(body): ApiJson<LoginRequest>,
-) -> Result<ApiJson<AuthSession>, AppError> {
-    service.login(&state, &info, body).await.map(ApiJson)
+    Call(body): Call<LoginRequest>,
+) -> CallResult<LoginRequest> {
+    service.login(&state, &info, body).await.map(Reply::new)
 }
 
 /// Log in with a Steam Web API ticket (the first login creates the account; with a Bearer token
@@ -78,9 +78,9 @@ pub(crate) async fn steam(
     Ext(service): Ext<AuthService>,
     info: ReqInfo,
     MaybeAuth(current): MaybeAuth,
-    ApiJson(body): ApiJson<SteamLoginRequest>,
-) -> Result<ApiJson<AuthSession>, AppError> {
-    service.steam_login(&state, &info, current, body).await.map(ApiJson)
+    Call(body): Call<SteamLoginRequest>,
+) -> CallResult<SteamLoginRequest> {
+    service.steam_login(&state, &info, current, body).await.map(Reply::new)
 }
 
 /// Exchange a refresh token for a new pair (rotation; a retry within 30 s answers the same pair,
@@ -95,9 +95,9 @@ pub(crate) async fn refresh(
     State(state): State<AppState>,
     Ext(service): Ext<AuthService>,
     info: ReqInfo,
-    ApiJson(body): ApiJson<RefreshRequest>,
-) -> Result<ApiJson<TokenPair>, AppError> {
-    service.refresh(&state, &info, body).await.map(ApiJson)
+    Call(body): Call<RefreshRequest>,
+) -> CallResult<RefreshRequest> {
+    service.refresh(&state, &info, body).await.map(Reply::new)
 }
 
 /// Revoke this session (or every session) with the access token or the refresh token.
@@ -111,9 +111,9 @@ pub(crate) async fn logout(
     Ext(service): Ext<AuthService>,
     info: ReqInfo,
     current: Option<AuthContext>,
-    ApiJson(body): ApiJson<LogoutRequest>,
-) -> Result<ApiJson<Ack>, AppError> {
-    service.logout(&state, &info, current, body).await.map(|()| ApiJson(Ack::new()))
+    Call(body): Call<LogoutRequest>,
+) -> CallResult<LogoutRequest> {
+    service.logout(&state, &info, current, body).await.map(|()| Reply::new(Ack::new()))
 }
 
 /// Confirm an email address with the token from the mail.
@@ -123,16 +123,21 @@ pub(crate) async fn verify_email(
     State(state): State<AppState>,
     Ext(service): Ext<AuthService>,
     info: ReqInfo,
-    ApiJson(body): ApiJson<VerifyEmailRequest>,
-) -> Result<ApiJson<Ack>, AppError> {
-    service.verify_email(&state, &info, body).await.map(|()| ApiJson(Ack::new()))
+    Call(body): Call<VerifyEmailRequest>,
+) -> CallResult<VerifyEmailRequest> {
+    service.verify_email(&state, &info, body).await.map(|()| Reply::new(Ack::new()))
 }
 
 /// Send the verification mail again (nothing happens when the address is confirmed already).
 #[utoipa::path(post, path = "/v1/auth/email/resend", tag = "auth", operation_id = "resend_verification", security(("bearer" = [])),
     responses((status = 200, description = "Queued (or nothing to do)", body = doc::Ack), (status = 401, description = "`unauthorized` / `token_expired`", body = ErrorBody), (status = 429, description = "`rate_limited`", body = ErrorBody)))]
-pub(crate) async fn resend_verification(State(state): State<AppState>, Ext(service): Ext<AuthService>, current: AuthContext) -> Result<ApiJson<Ack>, AppError> {
-    service.resend_verification(&state, &current).await.map(|()| ApiJson(Ack::new()))
+pub(crate) async fn resend_verification(
+    State(state): State<AppState>,
+    Ext(service): Ext<AuthService>,
+    current: AuthContext,
+    _call: Call<ResendVerification>,
+) -> CallResult<ResendVerification> {
+    service.resend_verification(&state, &current).await.map(|()| Reply::new(Ack::new()))
 }
 
 /// Ask for a password-reset mail. Always answers the same, whether or not the address has an
@@ -143,10 +148,10 @@ pub(crate) async fn forgot_password(
     State(state): State<AppState>,
     Ext(service): Ext<AuthService>,
     info: ReqInfo,
-    ApiJson(body): ApiJson<ForgotPasswordRequest>,
-) -> ApiJson<Ack> {
+    Call(body): Call<ForgotPasswordRequest>,
+) -> CallResult<ForgotPasswordRequest> {
     service.forgot_password(&state, &info, body);
-    ApiJson(Ack::new())
+    Ok(Reply::new(Ack::new()))
 }
 
 /// Set a new password with the token from the reset mail; every session is revoked.
@@ -156,16 +161,21 @@ pub(crate) async fn reset_password(
     State(state): State<AppState>,
     Ext(service): Ext<AuthService>,
     info: ReqInfo,
-    ApiJson(body): ApiJson<ResetPasswordRequest>,
-) -> Result<ApiJson<Ack>, AppError> {
-    service.reset_password(&state, &info, body).await.map(|()| ApiJson(Ack::new()))
+    Call(body): Call<ResetPasswordRequest>,
+) -> CallResult<ResetPasswordRequest> {
+    service.reset_password(&state, &info, body).await.map(|()| Reply::new(Ack::new()))
 }
 
 /// The caller's account.
 #[utoipa::path(get, path = "/v1/account", tag = "account", operation_id = "account", security(("bearer" = [])),
     responses((status = 200, description = "The account", body = doc::Account), (status = 401, description = "`unauthorized` / `token_expired`", body = ErrorBody)))]
-pub(crate) async fn account(State(state): State<AppState>, Ext(service): Ext<AuthService>, current: AuthContext) -> Result<ApiJson<Account>, AppError> {
-    service.account(&state, current.user_id).await.map(ApiJson)
+pub(crate) async fn account(
+    State(state): State<AppState>,
+    Ext(service): Ext<AuthService>,
+    current: AuthContext,
+    _call: Call<GetAccount>,
+) -> CallResult<GetAccount> {
+    service.account(&state, current.user_id).await.map(Reply::new)
 }
 
 /// Change the caller's account (absent fields stay).
@@ -176,9 +186,9 @@ pub(crate) async fn update_account(
     Ext(service): Ext<AuthService>,
     info: ReqInfo,
     current: AuthContext,
-    ApiJson(body): ApiJson<UpdateAccountRequest>,
-) -> Result<ApiJson<Account>, AppError> {
-    service.update_account(&state, &info, &current, body).await.map(ApiJson)
+    Call(body): Call<UpdateAccountRequest>,
+) -> CallResult<UpdateAccountRequest> {
+    service.update_account(&state, &info, &current, body).await.map(Reply::new)
 }
 
 /// Change the password (knowing the current one); the other sessions are revoked.
@@ -189,9 +199,9 @@ pub(crate) async fn change_password(
     Ext(service): Ext<AuthService>,
     info: ReqInfo,
     current: AuthContext,
-    ApiJson(body): ApiJson<ChangePasswordRequest>,
-) -> Result<ApiJson<Ack>, AppError> {
-    service.change_password(&state, &info, &current, body).await.map(|()| ApiJson(Ack::new()))
+    Call(body): Call<ChangePasswordRequest>,
+) -> CallResult<ChangePasswordRequest> {
+    service.change_password(&state, &info, &current, body).await.map(|()| Reply::new(Ack::new()))
 }
 
 /// Unlink a login provider (`steam`) from the caller's account. Needs a recent login; refused when
@@ -209,7 +219,7 @@ pub(crate) async fn unlink_identity(
     Ext(service): Ext<AuthService>,
     info: ReqInfo,
     current: AuthContext,
-    Path(provider): Path<String>,
-) -> Result<ApiJson<Ack>, AppError> {
-    service.unlink_own_identity(&state, &info, &current, &provider).await.map(|()| ApiJson(Ack::new()))
+    Call(call): Call<UnlinkIdentity>,
+) -> CallResult<UnlinkIdentity> {
+    service.unlink_own_identity(&state, &info, &current, &call.provider).await.map(|()| Reply::new(Ack::new()))
 }

@@ -130,6 +130,9 @@ fn storage_types() {
     same(BatchPut::new(vec![BatchPutItem::new("saves", "a", PutObject::new(json!("x")))]));
     same(BatchAcks::new(vec![ObjectAck::new("saves", "a", ObjectVersion(1), T0)]));
     same(ObjectVersion::ABSENT);
+    same(AdminPutObject::new(json!({"gold": 5})).if_version(ObjectVersion(2)).with_write(WriteAccess::Server));
+    same(AdminPutObject::new(json!(null)));
+    same(NoPayload::new());
     for access in [WriteAccess::Owner, WriteAccess::Server] {
         same(access);
     }
@@ -156,6 +159,14 @@ fn chat_types() {
     same(ChatMessage::new(MessageId(1), RoomId(4), UserId(2), "hi", T0).with_sender_name("Ada"));
     same(MessageDeleted::new(MessageId(1), RoomId(4)));
     same(OpenDirect::new(UserId(9)));
+    same(ListMembers::new(RoomId(4)));
+    same(RoomMember::new(UserId(2)).with_name("Ada"));
+    same(RoomMembers::new(RoomId(4), vec![RoomMember::new(UserId(2))], 1));
+    same(RoomMembers::new(RoomId(4), vec![], 500).truncated());
+    for event in [PresenceEvent::Joined, PresenceEvent::Left] {
+        same(Presence::new(RoomId(4), UserId(2), event).with_name("Ada").with_count(3));
+    }
+    same(Presence::new(RoomId(4), UserId(2), PresenceEvent::Left));
 }
 
 #[test]

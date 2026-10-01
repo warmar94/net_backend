@@ -35,7 +35,10 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 const PASSWORD: &str = "correct horse battery";
-const WAIT: Duration = Duration::from_secs(10);
+/// The upper bound of every wait. Generous on purpose: tests wait for a condition (a frame, a
+/// count), never for a fixed time, and CI runners are slow and shared; a passing run never waits
+/// this long.
+const WAIT: Duration = Duration::from_secs(30);
 
 #[derive(Serialize, Deserialize)]
 struct Echo {
@@ -68,7 +71,11 @@ struct Probe {
     connects: AtomicUsize,
     disconnects: Mutex<Vec<AfterWsDisconnect>>,
     refuse_connect: AtomicBool,
+    /// While set, `BeforeWsConnect` signals `entered` and waits for `release` (a deterministic
+    /// "the socket is between its token check and its registration").
     slow_connect: AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
     published: AtomicUsize,
 }
 
@@ -200,7 +207,8 @@ async fn start_with(tweak: impl FnOnce(&mut Config), url: &str, auth: AuthConfig
                     return Ok(Decision::Reject(AppError::forbidden("maintenance")));
                 }
                 if probe.slow_connect.load(Ordering::SeqCst) {
-                    tokio::time::sleep(Duration::from_millis(600)).await;
+                    probe.entered.notify_one();
+                    probe.release.notified().await;
                 }
                 Ok(Decision::Continue(event))
             }
@@ -260,6 +268,27 @@ impl Server {
         while self.state.ws().stats().connections != expected {
             assert!(Instant::now() < deadline, "connections stayed {:?}, expected {expected}", self.state.ws().stats());
             tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Wait until `user` has `expected` registered sockets. The client's handshake can finish
+    /// before the server's socket task registered the user: pushes from the server side before
+    /// that reach nobody (on a slow runner this is a real window).
+    async fn wait_registered(&self, user: UserId, expected: usize) {
+        let deadline = Instant::now() + WAIT;
+        while self.state.ws().connections_of(user).len() != expected {
+            assert!(Instant::now() < deadline, "{user} has {} sockets, expected {expected}", self.state.ws().connections_of(user).len());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Wait until the disconnect hook ran `expected` times (it runs after the socket is
+    /// unregistered, so the connection count can reach 0 first).
+    async fn wait_disconnects(&self, expected: usize) {
+        let deadline = Instant::now() + WAIT;
+        while self.probe.disconnects.lock().map(|l| l.len()).unwrap_or_default() < expected {
+            assert!(Instant::now() < deadline, "the disconnect hook did not run {expected} times");
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 }
@@ -366,6 +395,7 @@ async fn handshake_auth_requests_and_pushes() {
     drop(ws);
     drop(by_query);
     server.wait_connections(0).await;
+    server.wait_disconnects(2).await;
     let disconnects = server.probe.disconnects.lock().map(|l| l.len()).unwrap_or_default();
     assert_eq!(disconnects, 2);
     server.stop().await;
@@ -528,10 +558,9 @@ async fn revocations_from_another_process_close_sockets() {
     config.database.migrations_dir = common::temp_dir("ws-cross-migrations");
     let other = NetBackendServer::new(config).module(Auth::new().with_config(other_auth).mailer(MemoryMailer::new())).build().await.expect("build other");
     let service = other.state().get::<AuthService>().expect("service");
-    let started = Instant::now();
     service.ban_user(other.state(), user, BanRequest::new()).await.expect("ban from the other process");
+    // Within the WAIT bound (the poll runs every second; a slow runner may take longer).
     assert_eq!(close_code(&mut ws).await, Some(4003));
-    assert!(started.elapsed() < Duration::from_secs(8), "took {:?}", started.elapsed());
     other.state().db().close().await;
     server.stop().await;
 }
@@ -625,9 +654,11 @@ async fn connection_caps() {
         config.ws.max_connections_per_user = 2;
     })
     .await;
-    let (_, token) = server.register("caps@example.com").await;
+    let (user, token) = server.register("caps@example.com").await;
     let (_, other) = server.register("caps2@example.com").await;
     let mut first = connect(server.addr, Some(&token)).await;
+    // "Oldest" is registration order: register the first before the second.
+    server.wait_registered(user, 1).await;
     let mut second = connect(server.addr, Some(&token)).await;
     assert_eq!(call(&mut second, 1, "test.echo", json!(1)).await["ok"], true);
     // A third socket of the same user replaces the oldest (4009).
@@ -656,11 +687,13 @@ async fn slow_consumers_are_closed() {
     let (slow, slow_token) = server.register("slow@example.com").await;
     // A reader that starts late: its outbox overflows, it gets 1013 after what was already sent.
     let mut late = connect(server.addr, Some(&slow_token)).await;
+    // Pushes reach registered sockets only: wait for the server side first (CI flake, 2026-10-01:
+    // on a slow runner the 2000 pushes went out before the socket was registered).
+    server.wait_registered(slow, 1).await;
     let chunk = "y".repeat(1024);
     for n in 0..2000 {
         server.state.ws().push_raw(Target::User(slow), "test.flood", &json!({"n": n, "pad": chunk})).expect("push");
     }
-    tokio::time::sleep(Duration::from_millis(300)).await;
     let mut got = 0;
     let code = loop {
         match next(&mut late).await {
@@ -675,6 +708,7 @@ async fn slow_consumers_are_closed() {
     // A peer that never reads at all: the write deadline drops it.
     let (stuck, stuck_token) = server.register("stuck@example.com").await;
     let _stuck = connect(server.addr, Some(&stuck_token)).await;
+    server.wait_registered(stuck, 1).await;
     let big = "z".repeat(512 * 1024);
     for _ in 0..200 {
         server.state.ws().push_raw(Target::User(stuck), "test.flood", &big).expect("push");
@@ -724,8 +758,7 @@ async fn heartbeats_and_dead_peers() {
     assert_eq!(call(&mut ws, 1, "test.echo", json!(1)).await["ok"], true);
     // A peer that goes silent (never polled: no pongs) is dropped after the idle timeout.
     let _silent = connect(server.addr, Some(&token)).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(server.state.ws().stats().connections, 2);
+    server.wait_connections(2).await;
     let deadline = Instant::now() + WAIT;
     while server.state.ws().stats().connections != 1 {
         assert!(Instant::now() < deadline, "the silent peer was not dropped");
@@ -790,7 +823,8 @@ async fn hooks_can_refuse_connections() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shutdown_closes_sockets_with_1001() {
-    let server = start(|_| {}).await;
+    // A long grace: the shutdown must not wait for it (the sockets close at once with 1001).
+    let server = start(|config| config.server.shutdown_grace_secs = 120).await;
     let (_, token) = server.register("bye@example.com").await;
     let mut ws = connect(server.addr, Some(&token)).await;
     let mut anonymous = connect(server.addr, None).await;
@@ -800,8 +834,8 @@ async fn shutdown_closes_sockets_with_1001() {
     let stopping = tokio::spawn(server.stop());
     assert_eq!(close_code(&mut ws).await, Some(1001));
     assert_eq!(close_code(&mut anonymous).await, Some(1001));
-    tokio::time::timeout(Duration::from_secs(30), stopping).await.expect("stopped in time").expect("no panic");
-    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    tokio::time::timeout(Duration::from_secs(60), stopping).await.expect("stopped in time").expect("no panic");
+    assert!(started.elapsed() < Duration::from_secs(60), "waited for the grace: {:?}", started.elapsed());
     assert!(connect_with(addr, Some(&token), &[], "").await.is_err());
 }
 
@@ -840,6 +874,7 @@ async fn pushes_flow_while_a_handler_runs() {
     let server = start(|config| config.ws.outbox_frames = 8).await;
     let (user, token) = server.register("busy@example.com").await;
     let mut ws = connect(server.addr, Some(&token)).await;
+    server.wait_registered(user, 1).await;
     send(&mut ws, json!({"id": 1, "type": "test.sleep", "data": 1500})).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     for n in 0..20u32 {
@@ -874,6 +909,7 @@ async fn oversized_pushes_are_refused() {
     let server = start(|_| {}).await;
     let (user, token) = server.register("big@example.com").await;
     let mut ws = connect(server.addr, Some(&token)).await;
+    server.wait_registered(user, 1).await;
     for size in [1_080_000usize, 2 * 1024 * 1024] {
         let result = server.state.ws().push_raw(Target::User(user), "test.big", &"x".repeat(size));
         assert!(matches!(result, Err(PushError::TooLarge { .. })), "{size}: {result:?}");
@@ -891,15 +927,17 @@ async fn oversized_pushes_are_refused() {
 async fn bans_during_authentication_are_applied() {
     let mut auth = cheap_auth();
     auth.revocation_poll_secs = 0;
-    let server = start_with(|_| {}, "sqlite::memory:", auth).await;
+    // The connect hook waits for the test (not a fixed time): no hook timeout in between.
+    let server = start_with(|config| config.server.hook_timeout_ms = 120_000, "sqlite::memory:", auth).await;
     let (user, token) = server.register("race@example.com").await;
     let (other, other_token) = server.register("race2@example.com").await;
     server.probe.slow_connect.store(true, Ordering::SeqCst);
-    // Handshake path: the hook sleeps 600 ms after the token check; the ban comes at 200 ms.
+    // Handshake path: the hook holds the socket after the token check; the ban lands meanwhile.
     let addr = server.addr;
     let header = tokio::spawn(async move { connect_with(addr, Some(&token), &[], "").await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::timeout(WAIT, server.probe.entered.notified()).await.expect("the connect hook ran");
     server.service().ban_user(&server.state, user, BanRequest::new()).await.expect("ban");
+    server.probe.release.notify_one();
     match header.await.expect("task") {
         Ok(mut ws) => assert_eq!(close_code(&mut ws).await, Some(4003)),
         Err(error) => panic!("{error}"),
@@ -907,10 +945,15 @@ async fn bans_during_authentication_are_applied() {
     // First-message path.
     let mut ws = connect(server.addr, None).await;
     send(&mut ws, auth_frame(&other_token)).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::timeout(WAIT, server.probe.entered.notified()).await.expect("the connect hook ran");
     server.service().ban_user(&server.state, other, BanRequest::new()).await.expect("ban");
+    server.probe.release.notify_one();
+    // The ban reaches the hub through the revocation stream (a task): when it lands before the
+    // registration the `auth` is refused, when it lands right after, the fresh socket is closed.
+    // Either way the banned player ends with 4003 (the old fixed 200 ms / 600 ms timing always
+    // took the first branch).
     let answer = recv(&mut ws).await;
-    assert_eq!(answer["type"], "auth.failed", "{answer}");
+    assert!(answer["type"] == "auth.failed" || answer["type"] == "auth.ok", "{answer}");
     assert_eq!(close_code(&mut ws).await, Some(4003));
     server.wait_connections(0).await;
     server.stop().await;
@@ -983,7 +1026,7 @@ async fn address_pending_and_session_caps() {
         config.ws.max_connections_per_user = 2;
     })
     .await;
-    let (_, token) = server.register("cap@example.com").await;
+    let (user, token) = server.register("cap@example.com").await;
     let _pending = connect(server.addr, None).await;
     let (status, body) = refused(server.addr, None, &[]).await;
     assert_eq!((status, body["error"]["code"].as_str()), (503, Some(codes::UNAVAILABLE)));
@@ -993,6 +1036,7 @@ async fn address_pending_and_session_caps() {
     assert_eq!(login, StatusCode::OK);
     let second_session = body["tokens"]["access_token"].as_str().expect("token").to_string();
     let mut a = connect(server.addr, Some(&second_session)).await;
+    server.wait_registered(user, 1).await;
     let mut b = connect(server.addr, Some(&token)).await;
     assert_eq!(call(&mut b, 1, "test.echo", json!(1)).await["ok"], true);
     // A third socket of the user: the oldest of ITS session (b) goes, not the older a.

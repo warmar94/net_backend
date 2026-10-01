@@ -228,8 +228,10 @@ fn app() -> App {
     app
 }
 
+/// Step the app until `done`, bounded by a generous deadline (a condition, never a fixed time: CI
+/// runners are slow and shared; a passing run never comes close).
 fn step_until(app: &mut App, what: &str, mut done: impl FnMut(&App) -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !done(app) {
         assert!(Instant::now() < deadline, "timed out waiting for: {what}");
         app.update();
@@ -373,27 +375,30 @@ fn bad_token_is_final() {
 }
 
 /// Heartbeats both ways with the real client: the server answers the client's pings (a client
-/// with a 600 ms dead-peer limit stays up), and the client answers the server's pings (the server
-/// drops sockets silent for 3 s; a client that itself pings only every 15 s stays up).
+/// with a 2.5 s dead-peer limit stays up), and the client answers the server's pings (the server
+/// drops sockets silent for 4 s; a client that itself pings only every 15 s stays up).
 #[test]
 fn heartbeats_keep_both_sides_alive() {
     let server = Server::start_with(|config| {
         config.ws.ping_interval_secs = 1;
-        config.ws.idle_timeout_secs = 3;
+        config.ws.idle_timeout_secs = 4;
         config.ws.request_timeout_secs = 1;
     });
     let (user, token) = server.register("e2e-heartbeat@example.com");
     let mut app = app();
     set_credentials(&mut app, BearerToken::new(token));
     let client = app.world().resource::<WsClient>();
-    client.connect("fast", WsSettings::new(server.url.clone()).with_heartbeat(Duration::from_millis(200), Duration::from_millis(600)));
+    // The client pings every 250 ms and gives the server 2.5 s to answer (tight enough to notice a
+    // server that never answers, loose enough for a slow runner).
+    client.connect("fast", WsSettings::new(server.url.clone()).with_heartbeat(Duration::from_millis(250), Duration::from_millis(2500)));
     client.connect("slow", WsSettings::new(server.url.clone()));
     let both = |app: &App| {
         let connections = app.world().resource::<WsConnections>();
         connections.is_connected("fast") && connections.is_connected("slow")
     };
     step_until(&mut app, "both connected", both);
-    step_for(&mut app, Duration::from_secs(5));
+    // Longer than the server's idle timeout (4 s) and the client's dead-peer limit.
+    step_for(&mut app, Duration::from_secs(6));
     assert!(both(&app), "a connection dropped: {:?}", app.world().resource::<Seen>().states);
     assert_eq!(connects(&app), 2, "a connection was re-established: {:?}", app.world().resource::<Seen>().states);
     assert_eq!(server.connections_of(user), 2);

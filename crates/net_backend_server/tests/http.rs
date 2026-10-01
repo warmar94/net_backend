@@ -196,7 +196,7 @@ async fn request_timeout_answers_503() {
     let router = router_of(NetBackendServer::new(config).route(
         "/v1/game/slow",
         get(|| async {
-            tokio::time::sleep(Duration::from_secs(10)).await;
+            tokio::time::sleep(Duration::from_secs(120)).await;
             "late"
         }),
     ))
@@ -205,7 +205,8 @@ async fn request_timeout_answers_503() {
     let (status, _, body) = call(&router, get_req("/v1/game/slow")).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(body["error"]["code"], codes::UNAVAILABLE);
-    assert!(started.elapsed() < Duration::from_secs(5));
+    // Cut at the 1 s timeout, not after the handler's 120 s (generous bound: slow CI runners).
+    assert!(started.elapsed() < Duration::from_secs(60), "{:?}", started.elapsed());
 }
 
 /// A module with one route and one hook.
@@ -290,7 +291,8 @@ async fn hooks_modify_reject_time_out_and_contain_panics() {
     let runs = after_runs.clone();
     let runs2 = after_runs.clone();
     let mut config = http_config();
-    config.server.hook_timeout_ms = 200;
+    // Long enough for the quick hooks on a slow runner; the sleeping one (60 s) always runs out.
+    config.server.hook_timeout_ms = 1500;
     let prepared = NetBackendServer::new(config)
         .before::<Trade, _, _>(|_ctx, mut trade| async move {
             trade.amount *= 2;
@@ -300,7 +302,7 @@ async fn hooks_modify_reject_time_out_and_contain_panics() {
             match trade.amount {
                 a if a > 1000 => Ok(Decision::Reject(AppError::forbidden("too much"))),
                 666 => {
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    tokio::time::sleep(Duration::from_secs(60)).await;
                     Ok(Decision::Continue(trade))
                 }
                 84 => panic!("hook bug"),

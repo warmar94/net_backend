@@ -3,12 +3,15 @@
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use axum::routing::{delete, get, post, put};
 use futures_util::future::BoxFuture;
 use http::request::Parts;
+use net_backend_protocol::admin::{AuditQuery, BanUser, GetUser, GrantRole, RevokeRole, RevokeSessions, UnbanUser, UnlinkUserIdentity, UserListQuery};
+use net_backend_protocol::auth::{
+    ChangePasswordRequest, ForgotPasswordRequest, GetAccount, LoginRequest, LogoutRequest, RefreshRequest, RegisterRequest, ResendVerification,
+    ResetPasswordRequest, SteamLoginRequest, UnlinkIdentity, UpdateAccountRequest, VerifyEmailRequest,
+};
 use net_backend_protocol::routes;
 use utoipa_axum::router::OpenApiRouter;
-use utoipa_axum::routes as api_routes;
 
 use super::config::{AuthConfig, MailerKind};
 use super::password::Hasher;
@@ -16,9 +19,11 @@ use super::service::AuthService;
 use super::steam::SteamVerifier;
 use super::tokens::ACCESS_PREFIX;
 use super::{admin_routes, migrations, routes as handlers, AuthContext, Authenticator};
+use crate::call_route;
 use crate::command::AppCommand;
 use crate::db::Dialect;
 use crate::error::{AppError, Error};
+use crate::http::call::undocumented;
 use crate::mail::{LogMailer, MailQueue, Mailer};
 use crate::migrate::Migration;
 use crate::module::{Module, Setup};
@@ -226,40 +231,43 @@ impl Module for Auth {
     }
 
     fn routes(&self) -> OpenApiRouter<AppState> {
+        // Every route is mounted from its protocol call: path and method cannot drift.
         let mut router = OpenApiRouter::new()
-            .routes(api_routes!(handlers::register))
-            .routes(api_routes!(handlers::login))
-            .routes(api_routes!(handlers::steam))
-            .routes(api_routes!(handlers::refresh))
-            .routes(api_routes!(handlers::logout))
-            .routes(api_routes!(handlers::verify_email))
-            .routes(api_routes!(handlers::resend_verification))
-            .routes(api_routes!(handlers::forgot_password))
-            .routes(api_routes!(handlers::reset_password))
-            .routes(api_routes!(handlers::account, handlers::update_account))
-            .routes(api_routes!(handlers::change_password))
-            .routes(api_routes!(handlers::unlink_identity));
+            .routes(call_route!(RegisterRequest, handlers::register))
+            .routes(call_route!(LoginRequest, handlers::login))
+            .routes(call_route!(SteamLoginRequest, handlers::steam))
+            .routes(call_route!(RefreshRequest, handlers::refresh))
+            .routes(call_route!(LogoutRequest, handlers::logout))
+            .routes(call_route!(VerifyEmailRequest, handlers::verify_email))
+            .routes(call_route!(ResendVerification, handlers::resend_verification))
+            .routes(call_route!(ForgotPasswordRequest, handlers::forgot_password))
+            .routes(call_route!(ResetPasswordRequest, handlers::reset_password))
+            .routes(call_route!(GetAccount, handlers::account))
+            .routes(call_route!(UpdateAccountRequest, handlers::update_account))
+            .routes(call_route!(ChangePasswordRequest, handlers::change_password))
+            .routes(call_route!(UnlinkIdentity, handlers::unlink_identity));
         let documented = self.service.get().is_some_and(|s| s.config().admin_in_openapi);
         if documented {
             router = router
-                .routes(api_routes!(admin_routes::list_users))
-                .routes(api_routes!(admin_routes::get_user))
-                .routes(api_routes!(admin_routes::ban))
-                .routes(api_routes!(admin_routes::unban))
-                .routes(api_routes!(admin_routes::revoke_sessions))
-                .routes(api_routes!(admin_routes::unlink_identity))
-                .routes(api_routes!(admin_routes::grant_role, admin_routes::revoke_role))
-                .routes(api_routes!(admin_routes::audit));
+                .routes(call_route!(UserListQuery, admin_routes::list_users))
+                .routes(call_route!(GetUser, admin_routes::get_user))
+                .routes(call_route!(BanUser, admin_routes::ban))
+                .routes(call_route!(UnbanUser, admin_routes::unban))
+                .routes(call_route!(RevokeSessions, admin_routes::revoke_sessions))
+                .routes(call_route!(UnlinkUserIdentity, admin_routes::unlink_identity))
+                .routes(call_route!(GrantRole, admin_routes::grant_role))
+                .routes(call_route!(RevokeRole, admin_routes::revoke_role))
+                .routes(call_route!(AuditQuery, admin_routes::audit));
         } else {
-            router = router
-                .route(routes::admin::USERS, get(admin_routes::list_users))
-                .route(routes::admin::USER, get(admin_routes::get_user))
-                .route(routes::admin::BAN, post(admin_routes::ban))
-                .route(routes::admin::UNBAN, post(admin_routes::unban))
-                .route(routes::admin::SESSIONS, delete(admin_routes::revoke_sessions))
-                .route(routes::admin::IDENTITY, delete(admin_routes::unlink_identity))
-                .route(routes::admin::ROLE, put(admin_routes::grant_role).delete(admin_routes::revoke_role))
-                .route(routes::admin::AUDIT, get(admin_routes::audit));
+            router = undocumented::<UserListQuery, _, _, _>(router, admin_routes::list_users);
+            router = undocumented::<GetUser, _, _, _>(router, admin_routes::get_user);
+            router = undocumented::<BanUser, _, _, _>(router, admin_routes::ban);
+            router = undocumented::<UnbanUser, _, _, _>(router, admin_routes::unban);
+            router = undocumented::<RevokeSessions, _, _, _>(router, admin_routes::revoke_sessions);
+            router = undocumented::<UnlinkUserIdentity, _, _, _>(router, admin_routes::unlink_identity);
+            router = undocumented::<GrantRole, _, _, _>(router, admin_routes::grant_role);
+            router = undocumented::<RevokeRole, _, _, _>(router, admin_routes::revoke_role);
+            router = undocumented::<AuditQuery, _, _, _>(router, admin_routes::audit);
         }
         router
     }

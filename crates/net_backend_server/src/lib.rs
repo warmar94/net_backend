@@ -32,16 +32,21 @@
 //! sessions, verification and reset mails ([`mail`]), roles, the audit log, `/v1/admin`, rate
 //! limits ([`rate_limit`])); and the WebSocket hub ([`ws`]: `/v1/ws` with the protocol's envelope,
 //! handlers by kind, pushes, rooms, caps, close codes, an AsyncAPI document at
-//! [`ASYNCAPI_PATH`]). The storage and chat modules come next.
+//! [`ASYNCAPI_PATH`]); typed routes mounted from the protocol's `HttpCall` ([`http::call`]); and
+//! the modules `storage` (per-user JSON objects with versions) and `chat` (rooms, direct
+//! messages, history, presence, moderation), each behind its cargo feature.
 //!
 //! Cargo features: `mysql` (default), `postgres`, `sqlite` (additive, any combination compiles,
 //! at least one is needed to run a server); `steam` (the built-in Steam ticket check) and `smtp`
-//! (the SMTP mailer).
+//! (the SMTP mailer); `storage` and `chat` (the modules; off by default).
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod auth;
+#[cfg(feature = "chat")]
+#[cfg_attr(docsrs, doc(cfg(feature = "chat")))]
+pub mod chat;
 pub mod cli;
 pub mod command;
 pub mod config;
@@ -55,6 +60,9 @@ pub mod module;
 pub mod rate_limit;
 pub mod shutdown;
 pub mod state;
+#[cfg(feature = "storage")]
+#[cfg_attr(docsrs, doc(cfg(feature = "storage")))]
+pub mod storage;
 pub mod ws;
 
 mod app;
@@ -82,8 +90,9 @@ pub use sqlx;
 pub use utoipa;
 pub use utoipa_axum;
 
-/// The README's Rust blocks, compiled as doctests.
-#[cfg(doctest)]
+/// The README's Rust blocks, compiled as doctests (they show the storage and chat modules too, so
+/// they run with both features).
+#[cfg(all(doctest, feature = "storage", feature = "chat"))]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
 

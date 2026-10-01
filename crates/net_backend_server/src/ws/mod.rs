@@ -74,5 +74,5 @@ mod handlers;
 mod hub;
 
 pub use handlers::{KindDoc, WsCtx, WsHandlers};
-pub use hub::{Broadcaster, ConnectionId, ConnectionInfo, Delivery, HubStats, JoinError, LocalBroadcaster, LocalDelivery, PushError, Target};
+pub use hub::{Broadcaster, ConnectionId, ConnectionInfo, Control, Delivery, HubStats, JoinError, LocalBroadcaster, LocalDelivery, PushError, Target};
 pub use hub::{Hub, MAX_ROOM_NAME_BYTES};

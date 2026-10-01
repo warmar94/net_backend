@@ -6,9 +6,10 @@
   <img alt="Rust 1.95+" src="https://img.shields.io/badge/rust-1.95%2B-orange">
 </p>
 
-> **Status: in development.** Nothing is published yet. The core, the accounts module and the
-> WebSocket hub described below work and are tested; the storage and chat modules are being built
-> next (see [Roadmap](#roadmap)). APIs may still change before 0.1.0.
+> **Status: in development.** Nothing is published yet. The core, the accounts module, the
+> WebSocket hub and the storage and chat modules described below work and are tested; deployment
+> (Compose / systemd, Caddy, backups) comes next (see [Roadmap](#roadmap)). APIs may still change
+> before 0.1.0.
 
 A Rust framework for building **game backend servers**: async (tokio + axum) and modular. It speaks
 plain HTTP + WebSocket + JSON, so any client can use it. Rust clients share the message types through
@@ -55,6 +56,9 @@ The server does not care which client connects; the JSON on the wire is the cont
 - [Modules and hooks](#modules-and-hooks)
 - [Accounts and authentication](#accounts-and-authentication)
 - [WebSocket](#websocket)
+- [Typed routes (HttpCall)](#typed-routes-httpcall)
+- [Storage](#storage)
+- [Chat](#chat)
 - [Databases](#databases)
 - [Migrations](#migrations)
 - [The command line](#the-command-line)
@@ -75,8 +79,8 @@ The server does not care which client connects; the JSON on the wire is the cont
 | Part | What |
 |---|---|
 | App builder | `NetBackendServer::new(config)` with `.module(..)`, `.route(..)` / `.routes(..)` / `.nest(..)` / `.merge(..)`, `.state(..)`, hooks, `.run()` / `.serve(listener)`. |
-| Modules | The `Module` trait: name, routes, migrations per dialect, hooks, OpenAPI parts, `start` / `shutdown`. Deterministic order (registration order). |
-| Hooks | Typed `before` hooks (pass on, modify or reject) and `after` hooks per event type, start and shutdown hooks; each call has a time limit and panics are contained. |
+| Modules | The `Module` trait: name, dependencies (`depends_on`), routes, migrations per dialect, hooks, OpenAPI parts, `start` / `shutdown`. Deterministic order (registration order). |
+| Hooks | Typed `before` hooks (pass on, modify or reject), `in_tx` hooks (inside a module's transaction) and `after` hooks per event type, start and shutdown hooks; each call has a time limit and panics are contained. |
 | Configuration | A TOML file plus `NBS__SECTION__KEY` environment overrides and secrets from files; typed, validated (every problem reported at once, unknown keys and module sections refused), secrets never in `Debug`. |
 | Databases | MySQL (default), PostgreSQL, SQLite through one `Db` handle; statements built once with sea-query for all three; portable column types. |
 | Migrations | Plain SQL per dialect, ordered, tracked and checksummed, namespaced per module, safe against concurrent runs on every backend, precise recovery messages; modules' migrations can be **published** into the app, which then owns them. |
@@ -86,6 +90,9 @@ The server does not care which client connects; the JSON on the wire is the cont
 | Operations | Optional Prometheus metrics on their own loopback listener, a command line (`serve`, `migrate`, `migrations publish`, `config check`, `openapi export`, `asyncapi export`), graceful shutdown with an enforced deadline. |
 | Accounts | The `Auth` module: email + password (argon2id) and Steam logins, opaque access and rotating refresh tokens stored as hashes, sessions and revocation, email verification and password reset (log or SMTP mailer), roles, an audit log, `/v1/admin` routes, rate limits and a failed-login lockout, hooks, `user:*` commands. |
 | WebSocket hub | `/v1/ws` with the protocol's envelope: auth at the handshake (Bearer / `?token=`) or by first message, request handlers by kind (typed or JSON) for the game and modules, pushes to a socket / user / room / everyone, rooms with caps, close on revocation (4001) and ban (4003), connection caps, per-socket rate limits and bounded outboxes, heartbeats, hooks, 1001 on shutdown, a pub/sub seam for several instances. |
+| Typed routes | Every protocol route is mounted from its `HttpCall` (method, path, payload, answer); the same for your own routes (`.call::<C, ..>(handler)`, `call_route!`). |
+| Storage | The `Storage` module (feature `storage`): per-user JSON objects with versions, conditional writes (`if_version`, `If-Match`, `ETag`), batches, a server write lock, quotas, hooks (incl. in the transaction), audited admin access. |
+| Chat | The `Chat` module (feature `chat`): public, group and DM rooms, the answer before the echo, history pages, caps and rates, moderation hooks and deletion, presence with a cap and a rate, retention. |
 | Seams | Authenticators (`Authenticator`, the `AuthContext` / `RequireRole` extractors), rate limiters (with an in-memory `MemoryRateLimiter`), trusted-proxy client addresses, app commands, the WebSocket `Broadcaster`. |
 
 ## Features
@@ -97,10 +104,13 @@ The server does not care which client connects; the JSON on the wire is the cont
 | `sqlite` | no | SQLite, compiled in (no system library needed). |
 | `steam` | no | The built-in Steam ticket check (`SteamWebApiVerifier`: hyper + rustls with ring). |
 | `smtp` | no | The SMTP mailer (`SmtpMailer`: lettre with rustls + ring). |
+| `storage` | no | The [storage](#storage) module (no extra dependency). |
+| `chat` | no | The [chat](#chat) module (no extra dependency). |
 
 The backends are additive: any combination compiles, and the server uses the one its
 `database.url` names. At least one is needed to run a server; without any, starting fails with a
-clear message. No OpenSSL, no aws-lc.
+clear message. No OpenSSL, no aws-lc. Modules are features and off by default: a server compiles
+only what it registers (`features = ["mysql", "storage", "chat"]`).
 
 ## Install
 
@@ -308,10 +318,14 @@ async fn start(config: Config) -> Result<(), net_backend_server::Error> {
   own), routes merge in that order, `start` runs in that order and `shutdown` in reverse. A name
   is registered once; names match `[a-z][a-z0-9_]*` (at most 32 bytes); `app`, `core` and `nbs`
   are reserved.
+- **Dependencies:** a module names the modules it needs (`depends_on`, e.g. `["auth"]` for tables
+  with a foreign key to the accounts); each must be registered before it, or the build fails.
 - **Hooks:** `before` hooks run in order — the game's hooks (registered on the builder) first,
   then each module's, modules in registration order — and may pass the event on, modify it or
-  reject it (the first rejection answers the client); `after` hooks run after the work and only
-  log their errors. A module runs its hook points with `state.hooks().run_before(&ctx, event)`.
+  reject it (the first rejection answers the client); `in_tx` hooks (`.in_tx::<E, _>(..)`) run
+  inside a module's transaction after its own write and may write with it or refuse (everything
+  rolls back); `after` hooks run after the work and only log their errors. A module runs its hook
+  points with `state.hooks().run_before(&ctx, event)` / `run_in_tx(&mut tx, &ctx, &event)`.
   Each call has a time limit (`server.hook_timeout_ms`; a `before` hook that runs out answers 503
   `hook_timeout`); a panic in a hook is caught (500 `internal`), the server keeps running.
 - **Lifecycle:** `on_start` (an error aborts the start and shuts down what already started) and
@@ -734,13 +748,15 @@ pushes that handler makes to its own socket wait for its answer (up to `outbox_f
   that authenticates with cookies must check it), `AfterWsConnect` (in its own task),
   `AfterWsDisconnect` (with the rooms it left; not for sockets dropped when the shutdown grace ran
   out), `BeforeWsFrame` (change a request's `data` or refuse it; its `kind` is read-only).
-- **Presence** (who is in a room) is not the hub's job: the chat module builds it on these hooks.
+- **Presence** (who is in a room) is not the hub's job: the [chat](#chat) module builds it on these hooks.
 - **Several instances:** pushes to users, rooms and everyone go through a `Broadcaster`
   (`.broadcaster(..)`); the default `LocalBroadcaster` delivers in this process. A pub/sub
-  implementation publishes each `Delivery` (serde-serializable) to every instance, which hands it to
-  its own sockets with the `LocalDelivery` it got in `start`. `push_connection` never leaves the
-  process (connection ids are per instance), and rooms, `is_online`, `close_user` and the caps are
-  per instance.
+  implementation publishes each `Delivery` (serde-serializable) AS A WHOLE to every instance, which
+  hands it to its own sockets with the `LocalDelivery` it got in `start`. A delivery may carry a
+  `Control` instead of a frame (`Hub::remove_from_room(user, room)`: that user's sockets leave the
+  room on every instance); an implementation must forward its `control` field unchanged.
+  `push_connection` never leaves the process (connection ids are per instance), and rooms,
+  `is_online`, `close_user` and the caps are per instance.
 - **Shutdown:** every socket gets close 1001 when the shutdown starts; the hub waits for them
   within `server.shutdown_grace_secs`, then drops the rest.
 
@@ -759,6 +775,201 @@ ws.connect("main", WsSettings::new("wss://game.example.com/v1/ws"));
 whose access token expired meanwhile gets 401 `token_expired` and goes `Disconnected`: watch
 `WsStateChanged` for that error, refresh the token (`POST /v1/auth/refresh`), set the new
 credentials and `connect` again. Refreshing shortly before expiry avoids it.
+
+## Typed routes (HttpCall)
+
+Every HTTP route of the protocol has an [`HttpCall`](https://github.com/warmar94/net_backend/tree/main/crates/net_backend_protocol#typed-http-calls-httpcall)
+type naming its method, path, payload and answer. The server mounts its handlers FROM those types,
+so a path, a method or an answer type cannot drift from what the clients use, and a test checks that
+every route of `routes::ALL` is served and documented. Your own routes can do the same with your
+own `HttpCall` types (a `Route::new(..)` of your own):
+
+```rust,no_run
+use net_backend_server::http::call::{Call, CallResult, Reply};
+use net_backend_server::protocol::routes::{HttpMethod, Route};
+use net_backend_server::protocol::{ApiError, HttpCall, NoPayload, PathParams, PayloadKind};
+use net_backend_server::{AuthContext, Config, NetBackendServer};
+use serde::{Deserialize, Serialize};
+
+/// `GET /v1/game/inventory/{slot}` → `Item`.
+struct GetSlot { slot: i64 }
+#[derive(Serialize, Deserialize)]
+struct Item { name: String }
+
+impl HttpCall for GetSlot {
+    type Payload = NoPayload;
+    type Response = Item;
+    const ROUTE: Route = Route::new(HttpMethod::Get, "/v1/game/inventory/{slot}", true);
+    const PAYLOAD: PayloadKind = PayloadKind::Empty;
+    fn payload(&self) -> &NoPayload { &net_backend_server::protocol::http_call::NO_PAYLOAD }
+    fn path_params(&self) -> PathParams { PathParams::new().with("slot", self.slot) }
+    fn from_parts(params: &PathParams, _: NoPayload) -> Result<Self, ApiError> { Ok(GetSlot { slot: params.id("slot")? }) }
+}
+
+// The handler takes `Call<C>` last and answers `CallResult<C>` (`Reply::new(..)`, plus headers).
+async fn get_slot(_who: AuthContext, Call(call): Call<GetSlot>) -> CallResult<GetSlot> {
+    Ok(Reply::new(Item { name: format!("slot {}", call.slot) }))
+}
+
+let server = NetBackendServer::new(Config::default()).call::<GetSlot, _, _, _>(get_slot);
+// Documented: `#[utoipa::path(..)]` on the handler and `.routes(net_backend_server::call_route!(GetSlot, get_slot))`.
+# let _ = server;
+```
+
+`Call<C>` decodes the path parameters, the JSON body or query string, and checks the parameters'
+shape (an id that is not a number, a name that is not a storage name: 400 `bad_request`).
+**`ROUTE.auth` is enforced by the mount:** a route marked "token required" answers 401
+(`unauthorized` / `token_expired`, or 403 `banned`) to a request without a valid token before the
+handler runs, also when the handler does not take an `AuthContext` (as `get_slot` above would not
+need to). The flag in the protocol and the OpenAPI document is a guarantee, not a convention.
+
+## Storage
+
+The `Storage` module (feature `storage`, name `storage`) keeps per-user JSON objects: save slots,
+settings, inventory snapshots. Register it after `Auth`.
+
+```rust,no_run
+use net_backend_server::auth::Auth;
+use net_backend_server::hooks::Decision;
+use net_backend_server::storage::events::BeforeStorageWrite;
+use net_backend_server::storage::{Storage, StorageConfig};
+use net_backend_server::{AppError, Config, NetBackendServer};
+
+async fn start(config: Config) -> Result<(), net_backend_server::Error> {
+    let mut storage = StorageConfig::default();
+    storage.max_objects_per_user = 200;
+    NetBackendServer::new(config)
+        .module(Auth::new())
+        .module(Storage::new().with_config(storage))
+        // The game decides what a valid save is.
+        .before::<BeforeStorageWrite, _, _>(|_ctx, write| async move {
+            if write.collection == "saves" && write.value.get("level").is_none() {
+                return Ok(Decision::Reject(AppError::bad_request("a save needs a level")));
+            }
+            Ok(Decision::Continue(write))
+        })
+        .run()
+        .await
+}
+```
+
+| Route | What |
+|---|---|
+| `GET /v1/storage/{collection}` | a page of the caller's objects, **without values** (key, version, size, write access, time), ordered by key |
+| `GET / PUT / DELETE /v1/storage/{collection}/{key}` | one object; a GET or PUT answer carries the object's version as an `ETag` (`"3"`; a DELETE answer has none) |
+| `POST /v1/storage/_batch/get`, `/_batch/put` | up to 16 objects and 4 MiB of values; a batch put is one transaction (all or nothing) |
+| `GET / PUT / DELETE /v1/admin/users/{user}/storage/...` | any user's objects, role `admin`, every access in the audit log (`admin.storage_*`) |
+
+- **Versions:** every write bumps the version (1 for a new object). Without a condition the last
+  write wins; `if_version: N` in the body (or `If-Match: "N"`) writes only over version N, and
+  `if_version: 0` (or `If-None-Match: *`) only if the object is new. Otherwise: 409
+  `version_conflict` with `{"current_version":N}` (+ `"index"` of the failing item in a batch) and
+  nothing changes. A header and a body that disagree are a 400. Deleting an absent object is fine
+  unless a version is named. Simultaneous conditional writes are safe: exactly one wins.
+- **Concurrency:** every write and delete of a player's objects takes that account's lock first,
+  then reads the object, then writes exactly the row that exists (or inserts a new one). One
+  player's writes run one at a time (exact conditions and quotas); different players' writes never
+  wait for each other, and never deadlock on MySQL (no gap locks: nothing updates or deletes a row
+  that is not there). A transaction the database still aborts as a deadlock is retried.
+- **Write lock:** objects written by server code or an admin with `write: "server"` are read-only
+  for their owner (403); the server keeps writing them (`StorageService::put`).
+- **Server-owned collections:** `server_collections` (default `["server"]`; an entry `x` covers
+  `x` and `x.*`) are written only by server code and admins: the owner reads objects there but can
+  never create, change or delete one (403), so a player cannot pre-create a key the server will
+  own (`wallet/gold`: add `"wallet"`). New objects there are server-locked.
+- **Limits:** `max_object_bytes` (256 KiB of JSON per value; at most 4 MiB), `max_objects_per_user`
+  (1000) and `max_bytes_per_user` (4 MiB of values; a write that does not grow an object always
+  passes) — both 403 `quota_exceeded`, exact under concurrent writes, binding the owner's writes
+  only (server code and admins may always write; their objects still count). Owner writes (PUT,
+  DELETE, a batch put counts once) per user: `write_rate` per `write_rate_window_secs` (60 per
+  60 s: a burst of 60, then one a second; 429 `rate_limited` + `retry_after_ms`; 0 = off). Names
+  1-128 bytes of `[A-Za-z0-9_.-]` starting with a letter or digit; the PUT body limit follows
+  `max_object_bytes`. A failing batch item is named by `"index"` in the error's details (a
+  conflict, a lock, a quota, a hook's refusal).
+- **Hooks** (`storage::events`): `BeforeStorageWrite` (validate, change the value or refuse),
+  `InStorageWriteTx` (inside the write's transaction: write your own rows with THAT transaction,
+  or refuse and roll everything back; it may run again when the transaction is retried after a
+  deadlock, so it does nothing outside the database), `AfterStorageWrite`, `BeforeStorageDelete`,
+  `AfterStorageDelete`; each says who writes (`Writer::Owner`, `Server`, `Admin`).
+- **Server code:** `StorageService` (`Ext<StorageService>`, `state.get::<StorageService>()`):
+  `get`, `list`, `get_many`, `put` (with the lock), `delete` for any user.
+- **Table:** `storage_objects` (one row per object, the value as JSON bytes, cascading with the
+  account); publishable like every module's migrations.
+
+## Chat
+
+The `Chat` module (feature `chat`, name `chat`) runs rooms, direct messages, history, presence and
+moderation over the WebSocket hub. Register it after `Auth`; it needs `ws.enabled`.
+
+```rust,no_run
+use net_backend_server::auth::Auth;
+use net_backend_server::chat::events::BeforeChatSend;
+use net_backend_server::chat::{Chat, ChatConfig, RoomSpec};
+use net_backend_server::hooks::Decision;
+use net_backend_server::{AppError, Config, NetBackendServer};
+
+async fn start(config: Config) -> Result<(), net_backend_server::Error> {
+    let mut chat = ChatConfig::default();
+    chat.rooms = vec![RoomSpec::new("world").with_name("World").with_max_members(500), RoomSpec::new("trade")];
+    NetBackendServer::new(config)
+        .module(Auth::new())
+        .module(Chat::new().with_config(chat))
+        // Moderation is the game's: filter, rewrite or refuse.
+        .before::<BeforeChatSend, _, _>(|_ctx, mut message| async move {
+            if message.text.contains("buy gold") {
+                return Ok(Decision::Reject(AppError::forbidden("no advertising")));
+            }
+            message.text = message.text.replace("darn", "d**n");
+            Ok(Decision::Continue(message))
+        })
+        .run()
+        .await
+}
+```
+
+| Kind / route | What |
+|---|---|
+| `chat.join` / `chat.leave` | by id or a public room's key; membership lasts as long as the connection (rejoin after a reconnect) |
+| `chat.send` | to a room joined on this connection, or a DM room (no join); answered with the stored id BEFORE the sender's own `chat.message` echo, which carries the sender's `nonce` (in public and group rooms every member's push carries it: use a random value, never a secret; in DMs and in the history only the sender sees it) |
+| `chat.history`, `GET /v1/chat/rooms/{room}/messages` | cursor pages, newest first (public rooms: anyone; group and DM rooms: their members) |
+| `chat.members` | who is online in a joined room (each user once; this instance); a DM room lists only the caller: a DM never reveals whether the peer is online |
+| pushes `chat.message`, `chat.deleted`, `chat.presence` | to the room's members; a DM's to every connection of both users |
+| `GET /v1/chat/rooms` | the public rooms, with online counts and caps |
+| `POST /v1/chat/dm`, `GET /v1/chat/dms` | open (or find) a DM room with another user (`dm_open_rate`: 20 per 600 s per user, then 429); the caller's DM rooms, newest activity first |
+| `DELETE /v1/chat/rooms/{room}/messages/{message}` | its sender (`allow_self_delete`) or a `moderator_roles` member (audited as `chat.message_deleted`) |
+
+- **Rooms:** public rooms from `[[modules.chat.rooms]]` (created or updated at start) or
+  `ChatService::create_room`; group rooms (members only) from `ChatService::create_group` /
+  `add_member` / `remove_member`; DM rooms from `POST /v1/chat/dm`. Server code also sends
+  (`send_as`, e.g. system messages) and deletes (`delete_message`).
+- **DMs are open:** anyone may open a DM with any account (it only has to exist). Blocking is the
+  game's: refuse in `BeforeDirectOpen` (opening) and `BeforeChatSend` (sending). Opening is rate
+  limited per user (`dm_open_rate` per `dm_open_window_secs`, a burst of 20, then one every 30 s),
+  which also bounds probing which account ids exist.
+- **Limits:** a member cap per room (`max_room_members` 200 unless the room has its own,
+  `max_group_members` for groups; `room_full` 409, exact also under simultaneous joins). The cap
+  counts CONNECTIONS, while `RoomInfo.member_count` and `chat.members` count USERS: a room of 150
+  users with 200 sockets is full. 16 rooms per connection (`ws.max_rooms_per_connection`;
+  `quota_exceeded`), `max_text_chars` (500) with the protocol's text rules (no control or invisible
+  characters, something visible, no huge stacks of combining marks), a send rate per user as a
+  token bucket (`rate_messages` per `rate_window_secs`: a burst of 5, then one every 2 s;
+  `rate_limited` with `retry_after_ms`, about 2000 right after a burst), the history retention
+  (`history_retention_days`, 30; a background purge that deletes in batches of 1000).
+- **Presence:** a user's first connection in a room pushes `chat.presence` `joined` to the room, its
+  last one `left` (leave or disconnect), with the online count; the joiner's own connections get it
+  too. Rooms with more online users than `presence_max_members` (100) get none, and each room has a
+  push rate (`presence_per_second`, 10): a big room never floods. `chat.members` is the full list.
+- **Hooks** (`chat::events`): `BeforeChatJoin`, `BeforeChatSend` (filter / rewrite / refuse; a
+  rewrite follows the text rules), `AfterChatSend` (in its own task: never delays the answer),
+  `BeforeDirectOpen` (blocks, privacy), `AfterChatDelete`.
+- **Group members:** `remove_member` cuts a member off at once everywhere: every instance checks
+  the `chat_members` table on each group send, join and history read, and the member's sockets
+  leave the room on every instance (`Hub::remove_from_room` through the `Broadcaster`), also when
+  the removal races with a join.
+- **Several instances:** messages, deletions and group removals travel through the hub's
+  `Broadcaster`; joined rooms, caps, presence and the send rate are per instance.
+- **Tables:** `chat_rooms`, `chat_members`, `chat_messages` (a deletion clears the body and keeps
+  the row); publishable.
 
 ## Databases
 
@@ -793,6 +1004,12 @@ async fn top(db: &Db) -> Result<Vec<Score>, DbError> {
   rollback, the same methods plus `insert_id` / `fetch_one`), `fetch_one`, `ping`, `close`;
   `DbError::is_unique_violation()` / `is_foreign_key_violation()` on every backend. Unsigned values
   above `i64::MAX` are refused with an error (every portable integer column is a signed `BIGINT`).
+- **Deadlocks:** `DbError::is_retryable()` is true when the database aborted a transaction to
+  resolve a conflict (a MySQL deadlock 1213, PostgreSQL `40P01` / `40001`, a busy SQLite);
+  `db::Retry` runs such a transaction again from the start (bounded, with a short jittered pause)
+  and `DbTx::finish(result)` commits or rolls back. The framework's own write transactions use
+  both; use them for yours whenever the transaction can run twice (nothing outside the database
+  inside it).
 - **Portable column types** (`db::schema`): `BIGINT` ids, `BIGINT` unix-millisecond timestamps,
   bytes for JSON and binary payloads (`LONGBLOB` / `BYTEA` / `BLOB`), `VARCHAR(n)` strings. On
   MySQL tables use `utf8mb4` with the binary collation `utf8mb4_bin`, so comparisons and unique
@@ -892,6 +1109,10 @@ machine).
   `post(upload).layer(net_backend_server::http::body_limit(1024 * 1024))`. That limit applies to
   the body extractors (`ApiJson`, `Json`, `Bytes`, `String`); on top, `http.max_body_bytes`
   (32 MiB) caps every body, also raw body streams and raised per-route limits (413).
+- **Behind a reverse proxy** its own request body limit must allow the largest route: with the
+  storage module a batch put is up to ~4.2 MB (4 MiB of values plus JSON). In Caddy a site-wide
+  `request_body { max_size .. }` wins over a route's own, so set it for the API's site, e.g.
+  `request_body { max_size 5MB }`.
 - **Slow clients:** a client must send a request's headers within
   `server.header_read_timeout_secs` (15 s), else the connection is closed; idle keep-alive
   connections are closed after the same time.
@@ -981,9 +1202,9 @@ above the grace period plus the module shutdown time.
 |---|---|
 | core | the builder, modules, databases, migrations, HTTP, OpenAPI, command line |
 | accounts | the `Auth` module, rate limits, trusted proxies, app commands |
-| WebSocket (this) | the hub: the client's envelope, handlers, pushes, rooms, bounded outboxes, close codes, revocation closes, AsyncAPI |
-| next | the storage (saves) and chat modules |
-| then | deployment (Docker Compose or systemd, Caddy, backups) and a measured load test |
+| WebSocket | the hub: the client's envelope, handlers, pushes, rooms, bounded outboxes, close codes, revocation closes, AsyncAPI |
+| modules (this) | storage (saves) and chat (with presence); typed routes from the protocol's `HttpCall` |
+| next | deployment (Docker Compose or systemd, Caddy, backups) and a measured load test |
 
 Later versions: OAuth providers, notifications, friends, leaderboards, groups, lobbies, an
 optional SeaORM layer, multi-instance pub/sub, payment connectors.
@@ -995,7 +1216,13 @@ optional SeaORM layer, multi-instance pub/sub, payment connectors.
   instances (through a `Broadcaster`; the built-in one is in process). No permessage-deflate.
   Sockets waiting for their first-message `auth` count against `ws.max_connections` for up to
   `ws.auth_timeout_secs`.
-- Rate limits and the failed-login counters are in memory, per process.
+- Rate limits, the failed-login counters, chat presence and the chat send rate are in memory, per
+  process.
+- Storage values are JSON (binary data as a string in JSON); no file storage yet. No public
+  (other users') storage objects.
+- Chat: no read receipts, typing indicators or message editing; presence is per room and per
+  instance; no online status for DM peers (a friends module will offer it); no client-created
+  rooms (server code creates rooms and groups).
 - Revocations from other processes reach this process's subscribers by a database poll
   (`revocation_poll_secs`, 5 s), not instantly.
 - No compile-checked SQL inside the framework (three dialects); the CI matrix runs every query on
@@ -1013,10 +1240,12 @@ optional SeaORM layer, multi-instance pub/sub, payment connectors.
 ## Testing
 
 ```text
-cargo test -p net_backend_server --no-default-features --features sqlite   # everything runs in process
+cargo test -p net_backend_server --no-default-features --features sqlite,storage,chat   # everything runs in process
 NBS_TEST_MYSQL_URL=mysql://root:pw@127.0.0.1:3306/nbs \
 NBS_TEST_POSTGRES_URL=postgres://postgres:pw@127.0.0.1:5432/nbs \
-  cargo test -p net_backend_server --all-features -- --ignored               # the database and auth suites on MySQL / PostgreSQL
+  cargo test -p net_backend_server --all-features -- --ignored               # the database, auth, storage and chat suites on MySQL / PostgreSQL
+# incl. the concurrency stress tests: mysql_first_saves_stress, postgres_first_saves_stress (40 new
+# players save at once), mysql_dm_stress, postgres_dm_stress (200 DM sends into one room at once)
 ```
 
 The database suite (migrations: order, idempotence, checksums, failing multi-statement
@@ -1031,6 +1260,19 @@ Steam (a fake verifier), roles, admin routes, the audit log, rate limits and loc
 same answer for known and unknown addresses, redaction (no secret in logs, `Debug` or errors) and
 hashing on the blocking pool; it runs on SQLite here and on MySQL / MariaDB / PostgreSQL in CI. The
 real Steam and SMTP clients are tested against fakes on 127.0.0.1, never a real service.
+The storage suite covers every route, versions and conditions (body and headers), isolation
+between users, batches, limits and the quota, the server lock, the hooks (before, in the
+transaction, after), audited admin access and the races (one winner among simultaneous
+conditional writes, the quota under concurrent creates, first saves of many new players at once),
+the byte quota, the write rate and the server-owned collections; the chat suite runs a loopback
+server with a WebSocket client: rooms, the answer before the echo, history, caps (also simultaneous
+joins at the cap), the send rate, the text rules, hooks, DMs to every connection of both users (and
+many concurrent DM sends into one room), the DM-open rate, DM privacy (no peer presence), groups
+(a removal racing with a join; two instances sharing a database and a broadcaster), deletion and
+moderation, presence (transitions, disconnects, the cap and the rate) and retention.
+Both run on SQLite here and on MySQL / MariaDB / PostgreSQL in CI. A routes test checks that every
+protocol route is served with its method and documented, and that a game's own call marked
+`auth` answers 401 without a token although its handler never asks for the caller.
 The WebSocket suite runs a loopback server with a WebSocket client: both ways to authenticate, the
 auth deadline, every refusal, version mismatches, token expiry, logout / ban / another process's
 ban closing sockets, malformed frames, handler panics and timeouts, rooms and their caps,
@@ -1038,7 +1280,8 @@ connection caps, slow consumers, heartbeats and dead peers, the rate and size li
 shutdown. A separate unpublished crate in the repository drives the server with the published
 `bevy_net_backend` client in a headless app (Bearer and first-message auth with the
 acknowledgement, requests, pushes, reconnecting after 1001, staying away after 4003 / 4010 / 401,
-heartbeats both ways). `tests/ws_memory.rs` measures the heap per idle socket (ignored; run it in
+heartbeats both ways; storage over HTTP with the protocol's `HttpCall` types; chat with the
+protocol's own types as the client's typed requests and pushes). `tests/ws_memory.rs` measures the heap per idle socket (ignored; run it in
 release with `--ignored --nocapture`).
 CI runs fmt, clippy, docs, the tests for each backend alone and all together,
 the external-database job, the end-to-end client job, the dependency rules and the package contents.
@@ -1065,5 +1308,5 @@ Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your 
 This crate lives in the [`net_backend`](https://github.com/warmar94/net_backend) repository
 together with the protocol and the client. Issues and pull requests are welcome. Please run
 `cargo fmt --all`, `cargo clippy -p net_backend_server --all-targets --all-features -- -D warnings`
-and `cargo test -p net_backend_server --no-default-features --features sqlite` before sending a
+and `cargo test -p net_backend_server --no-default-features --features sqlite,storage,chat` before sending a
 change; changes to database code should also pass the MySQL / PostgreSQL suite.

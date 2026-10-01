@@ -1082,6 +1082,7 @@ dependencies = [
  "bevy",
  "bevy_net_backend",
  "http",
+ "net_backend_protocol",
  "net_backend_server",
  "serde",
  "serde_json",

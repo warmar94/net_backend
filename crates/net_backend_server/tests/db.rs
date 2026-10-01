@@ -479,10 +479,11 @@ async fn mysql_lock_is_per_database_and_times_out() {
         .expect("lock");
     assert_eq!(got, Some(1));
     let dir = common::temp_dir("db-mysql-lock");
-    let b = prepare_with(&url_b, &dir, false, 2).await;
+    // B's lock wait is long (60 s): finishing far below it shows B never waited for A's lock.
+    let b = prepare_with(&url_b, &dir, false, 60).await;
     let started = std::time::Instant::now();
     assert_eq!(b.migrate().await.expect("database B is not blocked").applied.len(), 3);
-    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    assert!(started.elapsed() < std::time::Duration::from_secs(30), "{:?}", started.elapsed());
     let a = prepare_with(&url_a, &dir, false, 1).await;
     let error = a.migrate().await.err().map(|e| e.to_string()).unwrap_or_default();
     assert!(error.contains("migrations lock") && error.contains("waited 1 s"), "{error}");
@@ -511,7 +512,8 @@ async fn postgres_lock_times_out() {
     let started = std::time::Instant::now();
     let error = server.migrate().await.err().map(|e| e.to_string()).unwrap_or_default();
     assert!(error.contains("migrations lock") && error.contains("waited 1 s"), "{error}");
-    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    // Bounded by the 1 s wait (generous upper bound for slow runners).
+    assert!(started.elapsed() < std::time::Duration::from_secs(30), "{:?}", started.elapsed());
     let _ = holder.close().await;
     assert_eq!(server.migrate().await.expect("free again").applied.len(), 3);
     server.state().db().close().await;

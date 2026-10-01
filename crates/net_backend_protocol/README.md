@@ -39,6 +39,7 @@ This crate defines **what** is said; a client library decides **how** it is sent
 - [Quick start: a server](#quick-start-a-server)
 - [The WebSocket envelope](#the-websocket-envelope)
 - [HTTP routes](#http-routes)
+- [Typed HTTP calls (HttpCall)](#typed-http-calls-httpcall)
 - [Errors](#errors)
 - [Accounts and sessions](#accounts-and-sessions)
 - [Storage (saves)](#storage-saves)
@@ -61,9 +62,10 @@ This crate defines **what** is said; a client library decides **how** it is sent
 | `error` | `ApiError { code, message, details }`, the HTTP body `ErrorBody`, the stable `codes`, `ValidationDetails`, `http_status_for`. |
 | `ids`, `time`, `page` | `UserId`, `RoomId`, `MessageId` (`i64`), `UnixMillis` (`i64` milliseconds), cursor pagination (`PageRequest`, `Page<T>`, `Cursor`). |
 | `auth` | Register, login, Steam login, refresh, logout, account, email verification, password reset; `TokenPair`; redacted `Password`, `AccessToken`, `RefreshToken`, `Secret`. |
-| `admin` | Operator routes: list / inspect accounts (`AdminUser`), ban (`BanRequest`, `BanInfo`), revoke sessions, roles, the audit log (`AuditEntry`, `AuditQuery`). |
+| `admin` | Operator routes: list / inspect accounts (`AdminUser`), ban (`BanRequest`, `BanInfo`), revoke sessions, roles, the audit log (`AuditEntry`, `AuditQuery`), a user's storage (`AdminPutObject`). |
 | `storage` | Per-user key-value objects (save slots): put / get / list / delete / batch with optimistic versions. |
-| `chat` | Rooms, direct messages, join / leave / send / history, the pushes `chat.message` and `chat.deleted`. |
+| `chat` | Rooms, direct messages, join / leave / send / history / members, the pushes `chat.message`, `chat.deleted` and `chat.presence`, message deletion. |
+| `http_call` | `HttpCall` (route + payload + answer type of every HTTP route), `PathParams`, `PayloadKind`, `NoPayload`. |
 | `text` | The character rules behind `validate()`: control, invisible and direction-changing characters. |
 | `kinds`, `routes` | Every WebSocket `type` and every `/v1` HTTP path as constants (plus a route table). |
 | `version` | `PROTOCOL_VERSION`, `PROTOCOL_HEADER`, `ServerInfo`. |
@@ -241,6 +243,7 @@ Everything versioned is under `/v1` (`routes::PREFIX`). "auth" = `Authorization:
 | POST | `/v1/storage/_batch/put` | auth | `BatchPut` → `BatchAcks` |
 | GET | `/v1/chat/rooms` | auth | query `PageRequest` → `Page<RoomInfo>` |
 | GET | `/v1/chat/rooms/{room}/messages` | auth | query `PageRequest` → `Page<ChatMessage>` |
+| DELETE | `/v1/chat/rooms/{room}/messages/{message}` | auth (its sender or a moderator) | → `Ack` (the room gets `chat.deleted`) |
 | POST | `/v1/chat/dm` | auth | `OpenDirect` → `RoomInfo` |
 | GET | `/v1/chat/dms` | auth | query `PageRequest` → `Page<RoomInfo>` (the caller's DMs, with `peer`) |
 | GET | `/v1/admin/users` | admin | query `UserListQuery` (`q`, `cursor`, `limit`) → `Page<AdminUser>` |
@@ -251,13 +254,72 @@ Everything versioned is under `/v1` (`routes::PREFIX`). "auth" = `Authorization:
 | DELETE | `/v1/admin/users/{user}/identities/{provider}` | admin | → `Ack` (unlink a provider) |
 | PUT / DELETE | `/v1/admin/users/{user}/roles/{role}` | admin | → `Ack` (grant / revoke) |
 | GET | `/v1/admin/audit` | admin | query `AuditQuery` (`user`, `action`, `cursor`, `limit`) → `Page<AuditEntry>` |
+| GET | `/v1/admin/users/{user}/storage/{collection}` | admin | query `PageRequest` → `Page<StorageObjectInfo>` |
+| GET | `/v1/admin/users/{user}/storage/{collection}/{key}` | admin | → `StorageObject` |
+| PUT | `/v1/admin/users/{user}/storage/{collection}/{key}` | admin | `AdminPutObject` (may set `write`) → `ObjectAck` |
+| DELETE | `/v1/admin/users/{user}/storage/{collection}/{key}` | admin | query `DeleteObject` → `Ack` |
 | GET (upgrade) | `/v1/ws` | header or first message | the WebSocket |
 
 Unversioned: `/healthz` (liveness) and `/readyz` (readiness). `routes::ALL` holds the table as data
-(method, path, auth; `Route::new` builds entries for your own routes); `routes::storage_object_path`
-and friends fill in path parameters. Request body limits: 64 KiB for JSON routes
+(method, path, auth; `Route::new` builds entries for your own routes); every route has an
+[`HttpCall`](#typed-http-calls-httpcall) type, and `routes::storage_object_path` and friends fill in
+path parameters. Request body limits: 64 KiB for JSON routes
 (`routes::DEFAULT_BODY_LIMIT_BYTES`), 272 KiB for a storage PUT, 4.06 MiB for a batch put; every
 answer stays far below the 10 MiB `bevy_net_backend` accepts by default.
+
+## Typed HTTP calls (HttpCall)
+
+`HttpCall` is the HTTP twin of `WsCall`: a request type knows its route (method, path template,
+whether a Bearer token is needed), its payload (a JSON body, a query string, or nothing) and its
+answer type. Every route of `routes::ALL` has exactly one `HttpCall` type (a golden test checks
+it), and the server mounts its handlers from the same types, so client and server cannot drift.
+
+- Routes without path parameters use their body / query type directly: `LoginRequest`,
+  `RegisterRequest`, `BatchGet`, `BatchPut`, `OpenDirect`, `UserListQuery`, `AuditQuery`, ….
+- Routes with path parameters (or without a payload) have a small call type: `GetObject`,
+  `WriteObject` (its `PutObject` body), `RemoveObject`, `ListObjects`, `ListMessages`,
+  `DeleteMessage`, `ListRooms`, `ListDirects`, `GetAccount`, `ResendVerification`,
+  `UnlinkIdentity`, `GetServerInfo`, and in `admin` `GetUser`, `BanUser`, `UnbanUser`,
+  `RevokeSessions`, `UnlinkUserIdentity`, `GrantRole`, `RevokeRole`, `ListUserObjects`,
+  `GetUserObject`, `WriteUserObject`, `RemoveUserObject`. They are not wire types: what travels
+  is the path, the payload and the answer.
+
+A client sends `C::ROUTE.method` to `call.path()` with `call.payload()` as JSON
+(`PayloadKind::Json`), as the query (`PayloadKind::Query`) or nothing (`PayloadKind::Empty`), plus
+the Bearer token when `C::ROUTE.auth`; a 2xx answer decodes as `C::Response`, every error as
+`ErrorBody`:
+
+```rust
+use net_backend_protocol::storage::{GetObject, ObjectVersion, PutObject, StorageObject, WriteObject};
+use net_backend_protocol::{HttpCall, PayloadKind};
+
+let put = WriteObject::new("saves", "slot-1", PutObject::new(serde_json::json!({"level": 3})).if_version(ObjectVersion(2)));
+assert_eq!(WriteObject::ROUTE.method.as_str(), "PUT");
+assert!(WriteObject::ROUTE.auth);
+assert_eq!(put.path().as_deref(), Some("/v1/storage/saves/slot-1"));
+assert_eq!(WriteObject::PAYLOAD, PayloadKind::Json);
+let body = serde_json::to_string(put.payload()).unwrap(); // {"value":{"level":3},"if_version":2}
+assert!(body.contains("if_version"));
+
+// The answer type is part of the call: `GetObject` answers a `StorageObject`.
+fn decode<C: HttpCall>(json: &str) -> C::Response {
+    serde_json::from_str(json).unwrap()
+}
+let object: StorageObject = decode::<GetObject>(r#"{"collection":"saves","key":"slot-1","owner":42,"value":{"level":3},"version":3,"write":"owner","updated_at":1790000000000}"#);
+assert_eq!(object.version, ObjectVersion(3));
+
+// Only path-safe values are sent: a name that would need escaping gives no path.
+assert_eq!(GetObject::new("saves", "../etc").path(), None);
+```
+
+A server rebuilds a call from what it received with `C::from_parts(&path_params, payload)`, which
+checks the parameters' shape (an id that is not a number, an invalid name: `bad_request`). Your
+own routes can have `HttpCall` types too (`Route::new(HttpMethod::Get, "/v1/game/…", true)`;
+`net_backend_server` enforces the `auth` flag: no valid token, no handler).
+`PathParams`, `is_path_safe` (RFC 3986 path characters that need no escaping: letters, digits,
+`- . _ ~ ! $ & ' ( ) * + , ; = : @`), `http_call::placeholders` and `http_call::query_pairs` (a
+`Query` payload as name / value pairs for your HTTP library; absent fields are left out, never
+sent as `null`) are the helpers.
 
 ## Errors
 
@@ -337,8 +399,9 @@ default is **last write wins**. A write that names the version it expects (`if_v
 `version_conflict` with `{"current_version":N}` (`VersionConflict`; for a batch also `"index":i`,
 the failing item) if the stored one differs, and nothing changes: only then two devices cannot
 silently overwrite each other's save. The server also honours `If-Match: "N"` / `If-None-Match: *`
-on single-object PUT and DELETE and always sends an `ETag`. Deleting an object that does not exist
-answers `Ack` (unless `if_version` is given).
+on single-object PUT and DELETE and sends an `ETag` with every object it returns or writes (GET,
+PUT; not on DELETE). Deleting an object that does not exist answers `Ack` (unless `if_version` is
+given).
 
 ```rust
 use net_backend_protocol::storage::{ObjectVersion, PutObject, DEFAULT_MAX_OBJECT_BYTES};
@@ -376,19 +439,33 @@ history pages and opening a direct-message room are also HTTP routes.
 | `chat.history` | `ChatHistory` → `Page<ChatMessage>` (newest first) |
 | push `chat.message` | `ChatMessage`, to every member, the sender included |
 | push `chat.deleted` | `MessageDeleted` (moderation) |
+| `chat.members` | `ListMembers` → `RoomMembers` (who is online: each user once, up to 200 listed, the total `count`; a DM room lists only the caller: a DM never reveals the peer's online state) |
+| push `chat.presence` | `Presence` (`joined` / `left`, with the user's name and the room's online `count`) |
 
 Public and group rooms: membership lasts as long as the connection; after a reconnect, join
 again. **Direct messages** need no join: their `chat.message` goes to every open connection of
 both members, and `GET /v1/chat/dms` lists the caller's DM rooms (`RoomInfo::peer`). The sender
 gets its own `chat.message` too (the final text after server hooks, also on its other devices); the
 `SendAck` answer comes first, games dedupe by `message_id`, and an optional `nonce` on
-`SendMessage`, echoed in the push, matches a send whose answer was lost. Text: line breaks and tabs
-are allowed; other control characters and invisible / direction-changing characters are refused
-(zero-width joiners stay allowed for emoji). Room keys: 1–64 bytes of `a-z`, `0-9`, `_ - .`.
+`SendMessage`, echoed in the push, matches a send whose answer was lost (in a public or group room
+the other members' pushes carry it too, so use a random value; in a DM and in the history only the
+sender sees it). Text: line breaks and tabs are allowed; other control characters and invisible /
+direction-changing characters are refused (zero-width joiners stay allowed for emoji), a text must
+show something (not only spaces, joiners, tags or marks), and at most 8 combining marks may stack. Room keys: 1–64 bytes of `a-z`, `0-9`, `_ - .`.
 `ChatHistory` is WebSocket-only; over HTTP the room is in the path and the page in the query.
-Defaults (a server may configure others): 500 characters per message, 5 messages per 10 seconds per user, 30 days of
-history, 200 members per public room, 16 joined rooms per connection. Public rooms are capped on
+Defaults (a server may configure others): 500 characters per message, a send rate per user of a
+burst of 5 messages, then one every 2 seconds (5 per 10 s as a token bucket; `rate_limited` carries
+`retry_after_ms`), 30 days of history, 200 connections per public room, 16 joined rooms per
+connection. Public rooms are capped on
 purpose: one huge room multiplies every message by its member count.
+
+**Presence:** when a user's first connection joins a room, the room's members (the joiner's own
+connections too) get `chat.presence` `joined`; when its last one leaves (or disconnects), `left`.
+It is best effort on purpose: rooms with more online users than the server's presence cap
+(`DEFAULT_PRESENCE_MAX_MEMBERS`, 100) get none, and a burst beyond the per-room rate
+(`DEFAULT_PRESENCE_PER_SECOND`, 10) is not pushed; `chat.members` always answers the current list.
+**Deleting** a message (`DELETE /v1/chat/rooms/{room}/messages/{message}`, its sender or a
+moderator) pushes `chat.deleted` and removes it from the history.
 
 ## Ids, timestamps, pages
 
@@ -420,7 +497,8 @@ purpose: one huge room multiplies every message by its member count.
 ## Optional integration with bevy_net_backend
 
 With the feature `bevy_net_backend`, this crate's WebSocket messages implement that client's
-`WsRequest` / `WsPushMessage` (same kinds, same answer types) and `AccessToken` implements its
+`WsRequest` / `WsPushMessage` (same kinds, same answer types: `JoinRoom`, `LeaveRoom`, `SendMessage`,
+`ChatHistory`, `ListMembers`; pushes `ChatMessage`, `MessageDeleted`, `Presence`) and `AccessToken` implements its
 `Credentials` (a `Bearer` header on every request and WebSocket handshake). The client's default
 envelope is the one above, so nothing else is needed:
 
@@ -467,7 +545,7 @@ of this crate.
 ## Testing
 
 ```sh
-cargo test -p net_backend_protocol                              # unit, golden JSON, round trips, redaction, forward compatibility
+cargo test -p net_backend_protocol                              # unit, golden JSON, round trips, redaction, forward compatibility, HttpCall table
 cargo test -p net_backend_protocol --features bevy_net_backend  # plus the frames through the client's own JsonEnvelope
 cargo run -p net_backend_protocol --example print_frames        # prints the JSON of every frame
 ```

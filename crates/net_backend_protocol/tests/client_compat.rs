@@ -3,7 +3,10 @@
 //! decoder) and come out as this crate's types, in both directions.
 
 use bevy_net_backend::{Credentials, JsonEnvelope, OutgoingRequest, Rejection, WsFrame, WsIncoming, WsProtocol, WsPushMessage, WsRequest};
-use net_backend_protocol::chat::{ChatHistory, ChatMessage, JoinRoom, LeaveRoom, MessageDeleted, RoomInfo, RoomKind, SendAck, SendMessage};
+use net_backend_protocol::chat::{
+    ChatHistory, ChatMessage, JoinRoom, LeaveRoom, ListMembers, MessageDeleted, Presence, PresenceEvent, RoomInfo, RoomKind, RoomMember, RoomMembers, SendAck,
+    SendMessage,
+};
 use net_backend_protocol::{
     codes, AccessToken, Ack, ApiError, CloseCode, MessageId, Page, RoomId, UnixMillis, UserId, WsAuth, WsAuthOk, WsCall, WsClientFrame, WsPushFrame,
     WsRequestFrame, WsResponseFrame, WsServerFrame,
@@ -47,6 +50,7 @@ fn requests_from_the_client_parse_on_the_server() {
     server_sees(3, LeaveRoom::new(RoomId(12)));
     server_sees(4, SendMessage::new(RoomId(12), "hello \u{1F600} \"quoted\""));
     server_sees(u64::MAX, ChatHistory::new(RoomId(12)));
+    server_sees(5, ListMembers::new(RoomId(12)));
 }
 
 /// The client turns a server answer into `T` exactly as its typed route does (`serde_json::from_slice`
@@ -67,6 +71,7 @@ fn answers_from_the_server_decode_in_the_client() {
     client_decodes_answer(1, RoomInfo::new(RoomId(12), RoomKind::Room).with_key("world"));
     client_decodes_answer(2, Ack::new());
     client_decodes_answer(3, SendAck::new(MessageId(981), NOW));
+    client_decodes_answer(4, RoomMembers::new(RoomId(12), vec![RoomMember::new(UserId(42)).with_name("Ada")], 1));
     client_decodes_answer(u64::MAX, Page::new(vec![ChatMessage::new(MessageId(1), RoomId(2), UserId(3), "x", NOW)], None));
 }
 
@@ -96,6 +101,15 @@ fn pushes_from_the_server_decode_in_the_client() {
     let deleted = MessageDeleted::new(MessageId(1), RoomId(2));
     let wire = text(&WsPushFrame::push(deleted));
     assert!(matches!(JsonEnvelope.decode(&WsFrame::Text(wire)), WsIncoming::Push { kind, .. } if kind == "chat.deleted"));
+    let presence = Presence::new(RoomId(12), UserId(42), PresenceEvent::Joined).with_count(2);
+    let wire = text(&WsPushFrame::push(presence.clone()));
+    match JsonEnvelope.decode(&WsFrame::Text(wire.clone())) {
+        WsIncoming::Push { kind, data } => {
+            assert_eq!(kind, <Presence as WsPushMessage>::KIND);
+            assert_eq!(serde_json::from_slice::<Presence>(&data).ok(), Some(presence));
+        }
+        other => panic!("{wire} decoded as {other:?}"),
+    }
 }
 
 #[test]
@@ -172,6 +186,8 @@ fn trait_impls_match_the_protocol() {
     same_response::<LeaveRoom>();
     same_response::<SendMessage>();
     same_response::<ChatHistory>();
+    same_response::<ListMembers>();
+    assert_eq!(<Presence as WsPushMessage>::KIND, "chat.presence");
     assert_eq!(<ChatMessage as WsPushMessage>::KIND, "chat.message");
     assert_eq!(<MessageDeleted as WsPushMessage>::KIND, "chat.deleted");
     assert!(!SendMessage::new(RoomId(1), "x").resend_on_reconnect());

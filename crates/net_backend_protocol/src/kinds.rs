@@ -20,6 +20,10 @@ pub const CHAT_HISTORY: &str = "chat.history";
 pub const CHAT_MESSAGE: &str = "chat.message";
 /// Push: a chat message was deleted (moderation) ([`MessageDeleted`](crate::chat::MessageDeleted)).
 pub const CHAT_DELETED: &str = "chat.deleted";
+/// Request: who is online in a room ([`ListMembers`](crate::chat::ListMembers)).
+pub const CHAT_MEMBERS: &str = "chat.members";
+/// Push: a user came online in a room or left it ([`Presence`](crate::chat::Presence)).
+pub const CHAT_PRESENCE: &str = "chat.presence";
 
 /// Whether `kind` is reserved for authentication (`auth`, `auth.ok`, `auth.failed`): never a push
 /// or a game's own request kind.
@@ -28,7 +32,7 @@ pub fn is_reserved(kind: &str) -> bool {
 }
 
 /// Every kind this crate defines (for tests and for a server's routing table).
-pub const ALL: &[&str] = &[AUTH, AUTH_OK, AUTH_FAILED, CHAT_JOIN, CHAT_LEAVE, CHAT_SEND, CHAT_HISTORY, CHAT_MESSAGE, CHAT_DELETED];
+pub const ALL: &[&str] = &[AUTH, AUTH_OK, AUTH_FAILED, CHAT_JOIN, CHAT_LEAVE, CHAT_SEND, CHAT_HISTORY, CHAT_MESSAGE, CHAT_DELETED, CHAT_MEMBERS, CHAT_PRESENCE];
 
 #[cfg(test)]
 mod tests {

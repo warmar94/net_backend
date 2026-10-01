@@ -480,6 +480,197 @@ impl BatchAcks {
     }
 }
 
+// ---- typed HTTP calls (see `http_call`) ---------------------------------------------------------
+
+/// The typed HTTP calls of this module (in their own scope: their imports stay out of the
+/// module's doc-link scope).
+mod calls {
+    use super::*;
+
+    use crate::envelope::Ack;
+    use crate::http_call::{payload_call, HttpCall, NoPayload, PathParams, PayloadKind, NO_PAYLOAD};
+    use crate::page::{Page, PageRequest};
+    use crate::routes::{self, HttpMethod, Route};
+
+    payload_call!(BatchGet, Post, routes::storage::BATCH_GET, true, Json, BatchObjects);
+    payload_call!(BatchPut, Post, routes::storage::BATCH_PUT, true, Json, BatchAcks);
+
+    const NOT_A_NAME: &str = "is not a valid storage name";
+
+    fn names(params: &PathParams) -> Result<(String, String), ApiError> {
+        Ok((params.checked("collection", is_valid_name, NOT_A_NAME)?, params.checked("key", is_valid_name, NOT_A_NAME)?))
+    }
+
+    /// List the caller's objects in a collection: `GET /v1/storage/{collection}?cursor=…&limit=…` →
+    /// [`Page`]`<`[`StorageObjectInfo`]`>` (no values; ordered by key).
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub struct ListObjects {
+        /// The collection.
+        pub collection: String,
+        /// Which page.
+        pub page: PageRequest,
+    }
+
+    impl ListObjects {
+        /// The first page of `collection`.
+        pub fn new(collection: impl Into<String>) -> Self {
+            Self { collection: collection.into(), page: PageRequest::first() }
+        }
+
+        /// The same call for this page.
+        pub fn with_page(mut self, page: PageRequest) -> Self {
+            self.page = page;
+            self
+        }
+    }
+
+    impl HttpCall for ListObjects {
+        type Payload = PageRequest;
+        type Response = Page<StorageObjectInfo>;
+        const ROUTE: Route = Route::new(HttpMethod::Get, routes::storage::COLLECTION, true);
+        const PAYLOAD: PayloadKind = PayloadKind::Query;
+
+        fn payload(&self) -> &PageRequest {
+            &self.page
+        }
+
+        fn path_params(&self) -> PathParams {
+            PathParams::new().with("collection", &self.collection)
+        }
+
+        fn from_parts(params: &PathParams, page: PageRequest) -> Result<Self, ApiError> {
+            Ok(Self::new(params.checked("collection", is_valid_name, NOT_A_NAME)?).with_page(page))
+        }
+    }
+
+    /// Read one of the caller's objects: `GET /v1/storage/{collection}/{key}` → [`StorageObject`]
+    /// (the `ETag` header carries its version).
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub struct GetObject {
+        /// The collection.
+        pub collection: String,
+        /// The key.
+        pub key: String,
+    }
+
+    impl GetObject {
+        /// Read `collection` / `key`.
+        pub fn new(collection: impl Into<String>, key: impl Into<String>) -> Self {
+            Self { collection: collection.into(), key: key.into() }
+        }
+    }
+
+    impl HttpCall for GetObject {
+        type Payload = NoPayload;
+        type Response = StorageObject;
+        const ROUTE: Route = Route::new(HttpMethod::Get, routes::storage::OBJECT, true);
+        const PAYLOAD: PayloadKind = PayloadKind::Empty;
+
+        fn payload(&self) -> &NoPayload {
+            &NO_PAYLOAD
+        }
+
+        fn path_params(&self) -> PathParams {
+            PathParams::new().with("collection", &self.collection).with("key", &self.key)
+        }
+
+        fn from_parts(params: &PathParams, _payload: NoPayload) -> Result<Self, ApiError> {
+            let (collection, key) = names(params)?;
+            Ok(Self::new(collection, key))
+        }
+    }
+
+    /// Write one of the caller's objects: `PUT /v1/storage/{collection}/{key}` with a [`PutObject`]
+    /// → [`ObjectAck`].
+    #[derive(Clone, Debug, PartialEq)]
+    #[non_exhaustive]
+    pub struct WriteObject {
+        /// The collection.
+        pub collection: String,
+        /// The key.
+        pub key: String,
+        /// The write.
+        pub put: PutObject,
+    }
+
+    impl WriteObject {
+        /// Write `put` to `collection` / `key`.
+        pub fn new(collection: impl Into<String>, key: impl Into<String>, put: PutObject) -> Self {
+            Self { collection: collection.into(), key: key.into(), put }
+        }
+    }
+
+    impl HttpCall for WriteObject {
+        type Payload = PutObject;
+        type Response = ObjectAck;
+        const ROUTE: Route = Route::new(HttpMethod::Put, routes::storage::OBJECT, true);
+        const PAYLOAD: PayloadKind = PayloadKind::Json;
+
+        fn payload(&self) -> &PutObject {
+            &self.put
+        }
+
+        fn path_params(&self) -> PathParams {
+            PathParams::new().with("collection", &self.collection).with("key", &self.key)
+        }
+
+        fn from_parts(params: &PathParams, put: PutObject) -> Result<Self, ApiError> {
+            let (collection, key) = names(params)?;
+            Ok(Self::new(collection, key, put))
+        }
+    }
+
+    /// Delete one of the caller's objects: `DELETE /v1/storage/{collection}/{key}?if_version=…` →
+    /// [`Ack`] (idempotent without `if_version`).
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub struct RemoveObject {
+        /// The collection.
+        pub collection: String,
+        /// The key.
+        pub key: String,
+        /// The condition.
+        pub delete: DeleteObject,
+    }
+
+    impl RemoveObject {
+        /// Delete `collection` / `key`.
+        pub fn new(collection: impl Into<String>, key: impl Into<String>) -> Self {
+            Self { collection: collection.into(), key: key.into(), delete: DeleteObject::new() }
+        }
+
+        /// Only delete if the stored version is `version`.
+        pub fn if_version(mut self, version: ObjectVersion) -> Self {
+            self.delete = self.delete.if_version(version);
+            self
+        }
+    }
+
+    impl HttpCall for RemoveObject {
+        type Payload = DeleteObject;
+        type Response = Ack;
+        const ROUTE: Route = Route::new(HttpMethod::Delete, routes::storage::OBJECT, true);
+        const PAYLOAD: PayloadKind = PayloadKind::Query;
+
+        fn payload(&self) -> &DeleteObject {
+            &self.delete
+        }
+
+        fn path_params(&self) -> PathParams {
+            PathParams::new().with("collection", &self.collection).with("key", &self.key)
+        }
+
+        fn from_parts(params: &PathParams, delete: DeleteObject) -> Result<Self, ApiError> {
+            let (collection, key) = names(params)?;
+            Ok(Self { collection, key, delete })
+        }
+    }
+}
+
+pub use calls::{GetObject, ListObjects, RemoveObject, WriteObject};
+
 #[cfg(test)]
 mod tests {
     use super::*;

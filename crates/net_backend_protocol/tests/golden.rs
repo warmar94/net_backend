@@ -2,7 +2,10 @@
 //! the wire contract; a change here is a protocol change.
 
 use net_backend_protocol::auth::{AccessToken, Account, AuthSession, LoginRequest, RefreshToken, TokenPair};
-use net_backend_protocol::chat::{ChatHistory, ChatMessage, JoinRoom, LeaveRoom, MessageDeleted, RoomInfo, RoomKind, SendAck, SendMessage};
+use net_backend_protocol::chat::{
+    ChatHistory, ChatMessage, JoinRoom, LeaveRoom, ListMembers, MessageDeleted, Presence, PresenceEvent, RoomInfo, RoomKind, RoomMember, RoomMembers, SendAck,
+    SendMessage,
+};
 use net_backend_protocol::storage::{ObjectVersion, PutObject};
 use net_backend_protocol::{
     codes, Ack, ApiError, ErrorBody, MessageId, Page, RoomId, UnixMillis, UserId, WsAuth, WsAuthOk, WsClientFrame, WsPushFrame, WsRequestFrame,
@@ -27,6 +30,7 @@ fn request_frames() {
     assert_eq!(json_of(&WsRequestFrame::call(8, JoinRoom::new("world"))), r#"{"id":8,"type":"chat.join","data":{"room":"world"}}"#);
     assert_eq!(json_of(&WsRequestFrame::call(9, LeaveRoom::new(RoomId(12)))), r#"{"id":9,"type":"chat.leave","data":{"room":12}}"#);
     assert_eq!(json_of(&WsRequestFrame::call(10, ChatHistory::new(RoomId(12)))), r#"{"id":10,"type":"chat.history","data":{"room":12}}"#);
+    assert_eq!(json_of(&WsRequestFrame::call(11, ListMembers::new(RoomId(12)))), r#"{"id":11,"type":"chat.members","data":{"room":12}}"#);
     assert_eq!(json_of(&WsRequestFrame::new(u64::MAX, "game.ping", Value::Null)), r#"{"id":18446744073709551615,"type":"game.ping","data":null}"#);
 }
 
@@ -56,6 +60,14 @@ fn request_frames_decode() {
 fn response_frames() {
     assert_eq!(json_of(&WsResponseFrame::ok(7, SendAck::new(MessageId(981), NOW))), r#"{"id":7,"ok":true,"data":{"message_id":981,"sent_at":1790000000000}}"#);
     assert_eq!(json_of(&WsResponseFrame::ok(9, Ack::new())), r#"{"id":9,"ok":true,"data":{}}"#);
+    assert_eq!(
+        json_of(&WsResponseFrame::ok(11, RoomMembers::new(RoomId(12), vec![RoomMember::new(UserId(42)).with_name("Ada")], 1))),
+        r#"{"id":11,"ok":true,"data":{"room":12,"members":[{"user":42,"name":"Ada"}],"count":1}}"#
+    );
+    assert_eq!(
+        json_of(&WsResponseFrame::ok(12, RoomMembers::new(RoomId(12), vec![], 300).truncated())),
+        r#"{"id":12,"ok":true,"data":{"room":12,"members":[],"count":300,"truncated":true}}"#
+    );
     assert_eq!(
         json_of(&WsResponseFrame::ok(8, RoomInfo::new(RoomId(12), RoomKind::Room).with_key("world"))),
         r#"{"id":8,"ok":true,"data":{"id":12,"kind":"room","key":"world"}}"#
@@ -98,6 +110,14 @@ fn push_frames() {
         r#"{"type":"chat.message","data":{"id":981,"room":12,"sender":42,"sender_name":"Ada","text":"hello","sent_at":1790000000000}}"#
     );
     assert_eq!(json_of(&WsPushFrame::push(MessageDeleted::new(MessageId(981), RoomId(12)))), r#"{"type":"chat.deleted","data":{"id":981,"room":12}}"#);
+    assert_eq!(
+        json_of(&WsPushFrame::push(Presence::new(RoomId(12), UserId(42), PresenceEvent::Joined).with_name("Ada").with_count(7))),
+        r#"{"type":"chat.presence","data":{"room":12,"user":42,"event":"joined","name":"Ada","count":7}}"#
+    );
+    assert_eq!(
+        json_of(&WsPushFrame::push(Presence::new(RoomId(12), UserId(42), PresenceEvent::Left))),
+        r#"{"type":"chat.presence","data":{"room":12,"user":42,"event":"left"}}"#
+    );
     let push: WsPushFrame<ChatMessage> =
         serde_json::from_str(r#"{"type":"chat.message","data":{"id":981,"room":12,"sender":42,"sender_name":"Ada","text":"hello","sent_at":1790000000000}}"#)
             .unwrap_or_else(|e| panic!("{e}"));

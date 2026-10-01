@@ -14,6 +14,8 @@
 //! - [`storage`]: per-user key-value objects (saves) with optimistic versions.
 //! - [`chat`]: rooms, direct messages, sending, history and the `chat.message` push.
 //! - [`kinds`] and [`routes`]: every WebSocket `type` and HTTP path as constants.
+//! - [`http_call`]: the [`HttpCall`] trait pairing every HTTP route with its payload and answer
+//!   type (the HTTP twin of [`WsCall`]).
 //! - [`version`]: [`PROTOCOL_VERSION`] and how it is exchanged.
 //!
 //! Feature `bevy_net_backend` (off by default) implements that client crate's `WsRequest` /
@@ -28,6 +30,7 @@ pub mod auth;
 pub mod chat;
 pub mod envelope;
 pub mod error;
+pub mod http_call;
 pub mod ids;
 pub mod kinds;
 pub mod page;
@@ -45,6 +48,7 @@ pub use envelope::{
     Ack, CloseCode, FrameError, ServerPush, WsAuth, WsAuthOk, WsCall, WsClientFrame, WsPushFrame, WsRequestFrame, WsResponseFrame, WsServerFrame,
 };
 pub use error::{codes, ApiError, ErrorBody, ValidationDetails};
+pub use http_call::{HttpCall, NoPayload, PathParams, PayloadKind};
 pub use ids::{MessageId, RoomId, UserId};
 pub use page::{Cursor, Page, PageRequest};
 pub use time::UnixMillis;

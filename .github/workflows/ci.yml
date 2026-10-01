@@ -49,8 +49,9 @@ jobs:
       - run: cargo test -p net_backend_protocol --locked ${{ matrix.features }}
       - run: cargo doc -p net_backend_protocol --locked --no-deps ${{ matrix.features }}
 
-  # net_backend_server: each database backend alone, the default and everything (build, clippy, tests, docs).
-  # SQLite runs in process; the MySQL / PostgreSQL suites are ignored here and run in `databases`.
+  # net_backend_server: each database backend alone, the default, the modules (storage, chat) alone and together,
+  # and everything (build, clippy, tests, docs). SQLite runs in process; the MySQL / PostgreSQL suites are ignored
+  # here and run in `databases`.
   server:
     strategy:
       fail-fast: false
@@ -60,6 +61,9 @@ jobs:
           - "--no-default-features --features postgres"
           - "--no-default-features --features sqlite"
           - ""
+          - "--no-default-features --features sqlite,storage"
+          - "--no-default-features --features sqlite,chat"
+          - "--no-default-features --features mysql,storage,chat"
           - "--all-features"
     runs-on: ubuntu-latest
     steps:
@@ -78,6 +82,7 @@ jobs:
         run: |
           cargo build -p net_backend_server --locked --no-default-features
           cargo test -p net_backend_server --locked --no-default-features --lib
+          cargo clippy -p net_backend_server --locked --all-targets --no-default-features --features storage,chat -- -D warnings
           cargo clippy -p net_backend_server --locked --all-targets --no-default-features --features steam,smtp -- -D warnings
           cargo test -p net_backend_server --locked --no-default-features --features sqlite,steam,smtp --test external_fakes
 
@@ -96,8 +101,9 @@ jobs:
       - run: cargo test -p net_backend_client --locked
       - run: cargo doc -p net_backend_client --locked --no-deps
 
-  # End to end: the server's WebSocket hub driven by the published Bevy client (`bevy_net_backend` 0.1.0) in a headless
-  # app over loopback. Bevy is only in this unpublished crate (`crates/e2e_tests`), never in the server's own builds.
+  # End to end: the server's WebSocket hub, storage and chat driven by the published Bevy client (`bevy_net_backend`
+  # 0.1.0) in a headless app over loopback. Bevy (and the protocol's `bevy_net_backend` feature) is only in this
+  # unpublished crate (`crates/e2e_tests`), never in the server's own builds (`-p net_backend_server`).
   e2e:
     runs-on: ubuntu-latest
     steps:
@@ -111,8 +117,8 @@ jobs:
       - run: cargo clippy -p e2e_tests --locked --all-targets -- -D warnings
       - run: cargo test -p e2e_tests --locked
 
-  # The server's database and auth suites against real MySQL 8.4, MariaDB 11.4 and PostgreSQL 16 (each test creates
-  # and drops its own database).
+  # The server's database, auth, storage and chat suites against real MySQL 8.4, MariaDB 11.4 and PostgreSQL 16 (each
+  # test creates and drops its own database).
   databases:
     runs-on: ubuntu-latest
     services:
@@ -152,11 +158,11 @@ jobs:
         with:
           toolchain: "1.96.0"
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p net_backend_server --locked --all-features --test db --test auth -- --include-ignored
-      - run: cargo test -p net_backend_server --locked --no-default-features --features mysql --test db --test auth -- --include-ignored
-      - run: cargo test -p net_backend_server --locked --no-default-features --features postgres --test db --test auth -- --include-ignored
+      - run: cargo test -p net_backend_server --locked --all-features --test db --test auth --test storage --test chat -- --include-ignored
+      - run: cargo test -p net_backend_server --locked --no-default-features --features mysql,storage,chat --test db --test auth --test storage --test chat -- --include-ignored
+      - run: cargo test -p net_backend_server --locked --no-default-features --features postgres,storage,chat --test db --test auth --test storage --test chat -- --include-ignored
       - name: MariaDB (through the mysql feature)
-        run: cargo test -p net_backend_server --locked --no-default-features --features mysql --test db --test auth -- --include-ignored
+        run: cargo test -p net_backend_server --locked --no-default-features --features mysql,storage,chat --test db --test auth --test storage --test chat -- --include-ignored
         env:
           NBS_TEST_MYSQL_URL: mysql://root:nbs-ci-password@127.0.0.1:3307/nbs
 
@@ -171,7 +177,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build -p net_backend_protocol --locked --no-default-features
       - run: cargo build -p net_backend_protocol --locked --all-features
-      - run: cargo build -p net_backend_server --locked --no-default-features --features sqlite
+      - run: cargo build -p net_backend_server --locked --no-default-features --features sqlite,storage,chat
       - run: cargo build -p net_backend_server --locked --all-features
       - run: cargo build -p net_backend_client --locked
 
@@ -209,7 +215,7 @@ jobs:
             fi
           }
           check -p net_backend_client
-          for f in "--all-features" "" "--no-default-features --features sqlite" "--no-default-features --features postgres" "--no-default-features --features sqlite,steam,smtp"; do
+          for f in "--all-features" "" "--no-default-features --features sqlite" "--no-default-features --features postgres" "--no-default-features --features sqlite,steam,smtp" "--no-default-features --features mysql,storage,chat"; do
             check -p net_backend_server $f
             # `-i tokio` can print the same version several times (one block per target set): count VERSIONS.
             if [ "$(cargo tree -p net_backend_server --locked --target all -e normal $f -i tokio --depth 0 --prefix none | grep -E '^tokio v' | sort -u | wc -l)" != "1" ]; then

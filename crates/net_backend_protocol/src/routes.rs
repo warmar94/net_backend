@@ -29,6 +29,7 @@
 //! | POST | [`storage::BATCH_PUT`] | auth | [`BatchPut`](crate::storage::BatchPut) → [`BatchAcks`](crate::storage::BatchAcks) |
 //! | GET | [`chat::ROOMS`] | auth | query [`PageRequest`](crate::PageRequest) → [`Page`](crate::Page)`<`[`RoomInfo`](crate::chat::RoomInfo)`>` |
 //! | GET | [`chat::HISTORY`] | auth | query [`PageRequest`](crate::PageRequest) → [`Page`](crate::Page)`<`[`ChatMessage`](crate::chat::ChatMessage)`>` |
+//! | DELETE | [`chat::MESSAGE`] | auth (sender or moderator) | → [`Ack`](crate::Ack) (pushes `chat.deleted`) |
 //! | POST | [`chat::DM`] | auth | [`OpenDirect`](crate::chat::OpenDirect) → [`RoomInfo`](crate::chat::RoomInfo) |
 //! | GET | [`chat::DMS`] | auth | query [`PageRequest`](crate::PageRequest) → [`Page`](crate::Page)`<`[`RoomInfo`](crate::chat::RoomInfo)`>` (the caller's DMs, with `peer`) |
 //! | GET | [`admin::USERS`] | admin | query [`UserListQuery`](crate::admin::UserListQuery) → [`Page`](crate::Page)`<`[`AdminUser`](crate::admin::AdminUser)`>` |
@@ -40,7 +41,14 @@
 //! | PUT | [`admin::ROLE`] | admin | (none) → [`Ack`](crate::Ack) (grant) |
 //! | DELETE | [`admin::ROLE`] | admin | → [`Ack`](crate::Ack) (revoke) |
 //! | GET | [`admin::AUDIT`] | admin | query [`AuditQuery`](crate::admin::AuditQuery) → [`Page`](crate::Page)`<`[`AuditEntry`](crate::admin::AuditEntry)`>` |
+//! | GET | [`admin::USER_STORAGE`] | admin | query [`PageRequest`](crate::PageRequest) → [`Page`](crate::Page)`<`[`StorageObjectInfo`](crate::storage::StorageObjectInfo)`>` (a user's collection) |
+//! | GET | [`admin::USER_OBJECT`] | admin | → [`StorageObject`](crate::storage::StorageObject) |
+//! | PUT | [`admin::USER_OBJECT`] | admin | [`AdminPutObject`](crate::admin::AdminPutObject) → [`ObjectAck`](crate::storage::ObjectAck) (may set the write lock) |
+//! | DELETE | [`admin::USER_OBJECT`] | admin | query [`DeleteObject`](crate::storage::DeleteObject) → [`Ack`](crate::Ack) |
 //! | GET (upgrade) | [`WS`] | header or first message | the WebSocket (see [`envelope`](crate::envelope)) |
+//!
+//! Every route has exactly one [`HttpCall`](crate::HttpCall) type naming its payload and answer
+//! (see [`http_call`](crate::http_call)).
 //!
 //! Unversioned operational routes (not part of `/v1`): [`HEALTH`], [`READY`].
 //!
@@ -124,6 +132,8 @@ pub mod chat {
     pub const ROOMS: &str = "/v1/chat/rooms";
     /// GET: a page of a room's history (newest first).
     pub const HISTORY: &str = "/v1/chat/rooms/{room}/messages";
+    /// DELETE: delete one message (its sender, or a moderator); the room gets `chat.deleted`.
+    pub const MESSAGE: &str = "/v1/chat/rooms/{room}/messages/{message}";
     /// POST: open (or find) the direct-message room with another user.
     pub const DM: &str = "/v1/chat/dm";
     /// GET: the caller's direct-message rooms (newest activity first).
@@ -148,6 +158,10 @@ pub mod admin {
     pub const ROLE: &str = "/v1/admin/users/{user}/roles/{role}";
     /// GET: the audit log.
     pub const AUDIT: &str = "/v1/admin/audit";
+    /// GET: list one collection of a user's storage (metadata only).
+    pub const USER_STORAGE: &str = "/v1/admin/users/{user}/storage/{collection}";
+    /// GET / PUT / DELETE one of a user's storage objects.
+    pub const USER_OBJECT: &str = "/v1/admin/users/{user}/storage/{collection}/{key}";
 }
 
 /// An HTTP method of a [`Route`].
@@ -233,6 +247,7 @@ pub const ALL: &[Route] = &[
     route(HttpMethod::Post, storage::BATCH_PUT, true),
     route(HttpMethod::Get, chat::ROOMS, true),
     route(HttpMethod::Get, chat::HISTORY, true),
+    route(HttpMethod::Delete, chat::MESSAGE, true),
     route(HttpMethod::Post, chat::DM, true),
     route(HttpMethod::Get, chat::DMS, true),
     route(HttpMethod::Get, admin::USERS, true),
@@ -244,6 +259,10 @@ pub const ALL: &[Route] = &[
     route(HttpMethod::Put, admin::ROLE, true),
     route(HttpMethod::Delete, admin::ROLE, true),
     route(HttpMethod::Get, admin::AUDIT, true),
+    route(HttpMethod::Get, admin::USER_STORAGE, true),
+    route(HttpMethod::Get, admin::USER_OBJECT, true),
+    route(HttpMethod::Put, admin::USER_OBJECT, true),
+    route(HttpMethod::Delete, admin::USER_OBJECT, true),
 ];
 
 /// The path of one storage object, or `None` if a name is not a valid storage name
@@ -260,6 +279,23 @@ pub fn storage_collection_path(collection: &str) -> Option<String> {
 /// The history path of a chat room.
 pub fn chat_history_path(room: RoomId) -> String {
     format!("/v1/chat/rooms/{room}/messages")
+}
+
+/// The path of one chat message (DELETE).
+pub fn chat_message_path(room: RoomId, message: crate::MessageId) -> String {
+    format!("/v1/chat/rooms/{room}/messages/{message}")
+}
+
+/// The path of one collection of a user's storage in the administration routes, or `None` for an
+/// invalid storage name.
+pub fn admin_storage_path(user: crate::UserId, collection: &str) -> Option<String> {
+    crate::storage::is_valid_name(collection).then(|| format!("/v1/admin/users/{user}/storage/{collection}"))
+}
+
+/// The path of one of a user's storage objects in the administration routes, or `None` for an
+/// invalid storage name.
+pub fn admin_object_path(user: crate::UserId, collection: &str, key: &str) -> Option<String> {
+    (crate::storage::is_valid_name(collection) && crate::storage::is_valid_name(key)).then(|| format!("/v1/admin/users/{user}/storage/{collection}/{key}"))
 }
 
 /// The path of one account in the administration routes, e.g. `/v1/admin/users/42`.
@@ -329,6 +365,10 @@ mod tests {
         assert_eq!(storage_object_path("_batch", "get"), None);
         assert_eq!(storage_collection_path("saves").as_deref(), Some("/v1/storage/saves"));
         assert_eq!(chat_history_path(RoomId(12)), "/v1/chat/rooms/12/messages");
+        assert_eq!(chat_message_path(RoomId(12), crate::MessageId(9)), "/v1/chat/rooms/12/messages/9");
+        assert_eq!(admin_storage_path(crate::UserId(4), "saves").as_deref(), Some("/v1/admin/users/4/storage/saves"));
+        assert_eq!(admin_object_path(crate::UserId(4), "saves", "a").as_deref(), Some("/v1/admin/users/4/storage/saves/a"));
+        assert_eq!(admin_object_path(crate::UserId(4), "saves", "../a"), None);
         assert_eq!(HttpMethod::Patch.to_string(), "PATCH");
         let user = crate::UserId(42);
         assert_eq!(admin_user_path(user), "/v1/admin/users/42");

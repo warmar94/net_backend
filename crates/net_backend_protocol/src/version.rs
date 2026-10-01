@@ -79,6 +79,33 @@ impl ServerInfo {
     }
 }
 
+/// Server facts: `GET /v1/info` (no authentication, no payload) → [`ServerInfo`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct GetServerInfo {}
+
+impl GetServerInfo {
+    /// The call.
+    pub const fn new() -> Self {
+        Self {}
+    }
+}
+
+impl crate::http_call::HttpCall for GetServerInfo {
+    type Payload = crate::http_call::NoPayload;
+    type Response = ServerInfo;
+    const ROUTE: crate::routes::Route = crate::routes::Route::new(crate::routes::HttpMethod::Get, crate::routes::INFO, false);
+    const PAYLOAD: crate::http_call::PayloadKind = crate::http_call::PayloadKind::Empty;
+
+    fn payload(&self) -> &crate::http_call::NoPayload {
+        &crate::http_call::NO_PAYLOAD
+    }
+
+    fn from_parts(_params: &crate::http_call::PathParams, _payload: crate::http_call::NoPayload) -> Result<Self, crate::ApiError> {
+        Ok(Self::new())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

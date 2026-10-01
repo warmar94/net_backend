@@ -64,6 +64,13 @@ pub trait Module: Send + Sync + 'static {
     /// (`[modules.<name>]`) and its entry in `/v1/info`. Stable public API once released.
     fn name(&self) -> &'static str;
 
+    /// The modules this one needs, by name (e.g. `["auth"]` for tables with a foreign key to the
+    /// accounts). Each must be registered BEFORE this module, so its migrations run first and its
+    /// state values exist in [`setup`](Module::setup); the build fails otherwise.
+    fn depends_on(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// The module's migrations for a dialect, any order (they are sorted by version). Embedded
     /// SQL (e.g. `include_str!`); the app can publish and own them (`migrations publish <name>`).
     fn migrations(&self, dialect: Dialect) -> Vec<Migration> {
@@ -198,7 +205,8 @@ impl ModuleSet {
         self.0.push(module);
     }
 
-    /// Every problem with the names (invalid, reserved, duplicate).
+    /// Every problem with the names (invalid, reserved, duplicate) and the dependencies (missing,
+    /// registered after the module needing them).
     pub(crate) fn validate(&self) -> Result<(), Error> {
         let mut problems = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -206,6 +214,16 @@ impl ModuleSet {
             let name = module.name();
             if let Err(problem) = validate_module_name(name) {
                 problems.push(problem);
+            }
+            for dependency in module.depends_on() {
+                if !seen.contains(dependency) {
+                    let later = self.0.iter().any(|m| m.name() == *dependency);
+                    problems.push(if later {
+                        format!("module `{name}` needs `{dependency}` registered before it (register `{dependency}` first)")
+                    } else {
+                        format!("module `{name}` needs the module `{dependency}` (register it first)")
+                    });
+                }
             }
             if !seen.insert(name) {
                 problems.push(format!("module `{name}` is registered twice"));
@@ -265,5 +283,32 @@ mod tests {
         set.push(Box::new(Named("App")));
         let error = set.validate().err().map(|e| e.to_string()).unwrap_or_default();
         assert!(error.contains("`alpha` is registered twice") && error.contains("`App`"), "{error}");
+    }
+
+    struct Needs(&'static str, &'static [&'static str]);
+    impl Module for Needs {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn depends_on(&self) -> &'static [&'static str] {
+            self.1
+        }
+    }
+
+    #[test]
+    fn dependencies_come_first() {
+        let mut ok = ModuleSet::default();
+        ok.push(Box::new(Needs("auth", &[])));
+        ok.push(Box::new(Needs("chat", &["auth"])));
+        assert!(ok.validate().is_ok());
+        let mut late = ModuleSet::default();
+        late.push(Box::new(Needs("chat", &["auth"])));
+        late.push(Box::new(Needs("auth", &[])));
+        let error = late.validate().err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(error.contains("needs `auth` registered before it"), "{error}");
+        let mut missing = ModuleSet::default();
+        missing.push(Box::new(Needs("chat", &["auth"])));
+        let error = missing.validate().err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(error.contains("needs the module `auth`"), "{error}");
     }
 }

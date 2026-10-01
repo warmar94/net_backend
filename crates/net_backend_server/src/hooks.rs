@@ -8,6 +8,20 @@
 //!   They run in registration order; the first rejection stops the chain. **Order across
 //!   sources:** the game's hooks (registered on the builder) come first, then each module's
 //!   (from [`Module::register_hooks`](crate::Module::register_hooks)), modules in registration order.
+//! - **`in_tx` hooks** run INSIDE the module's database transaction, after its own write and
+//!   before the commit ([`Hooks::in_tx`]): write your own rows atomically with the module's
+//!   (e.g. an inventory table updated with a save), or refuse ([`AppError`] → the whole
+//!   transaction rolls back and the client gets that error). They get the transaction and borrow
+//!   the event (the `for<'a>` + `Box::pin` form: a `Send` bound on an `async` closure borrowing the
+//!   transaction cannot be written on stable Rust). Keep them short: the transaction holds its
+//!   locks while they run (and SQLite has one writer at a time). A hook that runs out of time
+//!   answers 503 `hook_timeout`, a panic 500 `internal`; either way the transaction rolls back.
+//!   **Use only the given transaction** (never a service of the module, e.g. `StorageService`,
+//!   or a second transaction: on SQLite it waits for the outer write lock until the hook times
+//!   out; elsewhere it can deadlock with it). **It may run more than once:** a transaction the
+//!   database aborts as a deadlock is rolled back and run again from the start
+//!   ([`Retry`](crate::db::Retry)), hooks included, so an `in_tx` hook does nothing outside the
+//!   transaction (no mail, no pushes, no HTTP calls: those belong in an `after` hook).
 //! - **`after` hooks** run after the work is done (e.g. after the commit); their errors are
 //!   logged and never undo anything.
 //! - **Lifecycle hooks:** [`on_start`](Hooks::on_start) (after the modules started; an error
@@ -42,6 +56,7 @@ use futures_util::future::BoxFuture;
 use futures_util::FutureExt;
 use net_backend_protocol::codes;
 
+use crate::db::DbTx;
 use crate::error::AppError;
 use crate::http::RequestId;
 use crate::state::AppState;
@@ -95,12 +110,14 @@ impl HookCtx {
 
 type BeforeFn<E> = Arc<dyn Fn(HookCtx, E) -> BoxFuture<'static, Result<Decision<E>, AppError>> + Send + Sync>;
 type AfterFn<E> = Arc<dyn Fn(HookCtx, Arc<E>) -> BoxFuture<'static, Result<(), AppError>> + Send + Sync>;
+type InTxFn<E> = Arc<dyn for<'a> Fn(&'a mut DbTx, &'a HookCtx, &'a E) -> BoxFuture<'a, Result<(), AppError>> + Send + Sync>;
 type StartFn = Arc<dyn Fn(HookCtx) -> BoxFuture<'static, Result<(), AppError>> + Send + Sync>;
 type ShutdownFn = Arc<dyn Fn(HookCtx) -> BoxFuture<'static, ()> + Send + Sync>;
 
 /// The hook registry: `before` / `after` hooks per event type, plus lifecycle hooks.
 pub struct Hooks {
     before: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
+    in_tx: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
     after: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
     on_start: Vec<StartFn>,
     on_shutdown: Vec<ShutdownFn>,
@@ -109,7 +126,14 @@ pub struct Hooks {
 
 impl Default for Hooks {
     fn default() -> Self {
-        Self { before: HashMap::new(), after: HashMap::new(), on_start: Vec::new(), on_shutdown: Vec::new(), timeout: Duration::from_secs(2) }
+        Self {
+            before: HashMap::new(),
+            in_tx: HashMap::new(),
+            after: HashMap::new(),
+            on_start: Vec::new(),
+            on_shutdown: Vec::new(),
+            timeout: Duration::from_secs(2),
+        }
     }
 }
 
@@ -117,6 +141,7 @@ impl fmt::Debug for Hooks {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Hooks")
             .field("before_events", &self.before.len())
+            .field("in_tx_events", &self.in_tx.len())
             .field("after_events", &self.after.len())
             .field("on_start", &self.on_start.len())
             .field("on_shutdown", &self.on_shutdown.len())
@@ -162,6 +187,35 @@ impl Hooks {
         });
         let list = self.before.entry(TypeId::of::<E>()).or_insert_with(|| Box::new(Vec::<BeforeFn<E>>::new()));
         if let Some(list) = list.downcast_mut::<Vec<BeforeFn<E>>>() {
+            list.push(hook);
+        }
+    }
+
+    /// Register an `in_tx` hook for events of type `E`: it runs inside the module's transaction
+    /// (after the module's own write, before the commit) and may write with the transaction or
+    /// refuse (the transaction rolls back, the client gets the error). It uses only `tx` and may
+    /// run more than once (a transaction retried after a deadlock; see the module docs).
+    ///
+    /// ```
+    /// use net_backend_server::hooks::{Event, Hooks};
+    ///
+    /// struct SaveWritten { user: i64 }
+    /// impl Event for SaveWritten { const NAME: &'static str = "game.save_written"; }
+    ///
+    /// let mut hooks = Hooks::default();
+    /// hooks.in_tx::<SaveWritten, _>(|tx, _ctx, event| Box::pin(async move {
+    ///     let _ = (tx, event.user); // e.g. tx.execute(&update_inventory_statement).await?;
+    ///     Ok(())
+    /// }));
+    /// ```
+    pub fn in_tx<E, F>(&mut self, hook: F)
+    where
+        E: Event,
+        F: for<'a> Fn(&'a mut DbTx, &'a HookCtx, &'a E) -> BoxFuture<'a, Result<(), AppError>> + Send + Sync + 'static,
+    {
+        let hook: InTxFn<E> = Arc::new(hook);
+        let list = self.in_tx.entry(TypeId::of::<E>()).or_insert_with(|| Box::new(Vec::<InTxFn<E>>::new()));
+        if let Some(list) = list.downcast_mut::<Vec<InTxFn<E>>>() {
             list.push(hook);
         }
     }
@@ -213,6 +267,38 @@ impl Hooks {
     /// How many `before` hooks are registered for `E`.
     pub fn before_count<E: Event>(&self) -> usize {
         self.before.get(&TypeId::of::<E>()).and_then(|l| l.downcast_ref::<Vec<BeforeFn<E>>>()).map_or(0, Vec::len)
+    }
+
+    /// How many `in_tx` hooks are registered for `E`.
+    pub fn in_tx_count<E: Event>(&self) -> usize {
+        self.in_tx.get(&TypeId::of::<E>()).and_then(|l| l.downcast_ref::<Vec<InTxFn<E>>>()).map_or(0, Vec::len)
+    }
+
+    /// Run the `in_tx` hooks of `E` in order inside `tx`. The first error stops the chain and is
+    /// returned (roll the transaction back); a timeout is 503 `hook_timeout`, a panic 500
+    /// `internal`.
+    pub async fn run_in_tx<E: Event>(&self, tx: &mut DbTx, ctx: &HookCtx, event: &E) -> Result<(), AppError> {
+        let Some(list) = self.in_tx.get(&TypeId::of::<E>()).and_then(|l| l.downcast_ref::<Vec<InTxFn<E>>>()) else {
+            return Ok(());
+        };
+        for (index, hook) in list.iter().enumerate() {
+            // The hook is called inside the guarded future, so a panic in its synchronous part is
+            // caught too.
+            let call: BoxFuture<'_, Result<(), AppError>> = Box::pin(async { hook(&mut *tx, ctx, event).await });
+            match guarded(self.timeout, call).await {
+                Outcome::Done(Ok(())) => {}
+                Outcome::Done(Err(error)) => return Err(error),
+                Outcome::TimedOut => {
+                    tracing::warn!(event = E::NAME, hook = index, "in_tx hook timed out");
+                    return Err(AppError::new(codes::HOOK_TIMEOUT, "a server hook did not answer in time"));
+                }
+                Outcome::Panicked => {
+                    tracing::error!(event = E::NAME, hook = index, "in_tx hook panicked");
+                    return Err(AppError::internal_plain());
+                }
+            }
+        }
+        Ok(())
     }
 
     /// How many `after` hooks are registered for `E`.

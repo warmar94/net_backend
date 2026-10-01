@@ -1,14 +1,14 @@
 //! `/v1/admin/*`: account administration and the audit log. Every route needs the `admin` role.
 
-use axum::extract::{Path, Query, State};
-use net_backend_protocol::admin::{AdminUser, AuditEntry, AuditQuery, BanRequest, UserListQuery};
-use net_backend_protocol::{Ack, Page, UserId};
+use axum::extract::State;
+use net_backend_protocol::admin::{AuditQuery, BanUser, GetUser, GrantRole, RevokeRole, RevokeSessions, UnbanUser, UnlinkUserIdentity, UserListQuery};
+use net_backend_protocol::Ack;
 
 use super::openapi as doc;
 use super::service::{Actor, AuthService, ReqInfo};
 use super::RequireAdmin;
-use crate::error::AppError;
-use crate::http::{ApiJson, Ext};
+use crate::http::call::{Call, CallResult, Reply};
+use crate::http::Ext;
 use crate::openapi::ErrorBody;
 use crate::state::AppState;
 
@@ -28,9 +28,9 @@ pub(crate) async fn list_users(
     State(state): State<AppState>,
     Ext(service): Ext<AuthService>,
     _admin: RequireAdmin,
-    Query(query): Query<UserListQuery>,
-) -> Result<ApiJson<Page<AdminUser>>, AppError> {
-    service.list_users(&state, &query).await.map(ApiJson)
+    Call(query): Call<UserListQuery>,
+) -> CallResult<UserListQuery> {
+    service.list_users(&state, &query).await.map(Reply::new)
 }
 
 /// One account.
@@ -41,9 +41,9 @@ pub(crate) async fn get_user(
     State(state): State<AppState>,
     Ext(service): Ext<AuthService>,
     _admin: RequireAdmin,
-    Path(user): Path<i64>,
-) -> Result<ApiJson<AdminUser>, AppError> {
-    service.admin_user(&state, UserId(user)).await.map(ApiJson)
+    Call(call): Call<GetUser>,
+) -> CallResult<GetUser> {
+    service.admin_user(&state, call.user).await.map(Reply::new)
 }
 
 /// Ban an account: its sessions are revoked, logins answer `banned` while the ban lasts.
@@ -55,10 +55,9 @@ pub(crate) async fn ban(
     Ext(service): Ext<AuthService>,
     admin: RequireAdmin,
     info: ReqInfo,
-    Path(user): Path<i64>,
-    ApiJson(body): ApiJson<BanRequest>,
-) -> Result<ApiJson<Ack>, AppError> {
-    service.ban(&state, &actor(&admin, info), UserId(user), body).await.map(|()| ApiJson(Ack::new()))
+    Call(call): Call<BanUser>,
+) -> CallResult<BanUser> {
+    service.ban(&state, &actor(&admin, info), call.user, call.ban).await.map(|()| Reply::new(Ack::new()))
 }
 
 /// Lift a ban.
@@ -70,9 +69,9 @@ pub(crate) async fn unban(
     Ext(service): Ext<AuthService>,
     admin: RequireAdmin,
     info: ReqInfo,
-    Path(user): Path<i64>,
-) -> Result<ApiJson<Ack>, AppError> {
-    service.unban(&state, &actor(&admin, info), UserId(user)).await.map(|()| ApiJson(Ack::new()))
+    Call(call): Call<UnbanUser>,
+) -> CallResult<UnbanUser> {
+    service.unban(&state, &actor(&admin, info), call.user).await.map(|()| Reply::new(Ack::new()))
 }
 
 /// Revoke every session of an account.
@@ -84,9 +83,9 @@ pub(crate) async fn revoke_sessions(
     Ext(service): Ext<AuthService>,
     admin: RequireAdmin,
     info: ReqInfo,
-    Path(user): Path<i64>,
-) -> Result<ApiJson<Ack>, AppError> {
-    service.admin_revoke(&state, &actor(&admin, info), UserId(user)).await.map(|_| ApiJson(Ack::new()))
+    Call(call): Call<RevokeSessions>,
+) -> CallResult<RevokeSessions> {
+    service.admin_revoke(&state, &actor(&admin, info), call.user).await.map(|_| Reply::new(Ack::new()))
 }
 
 /// Grant a role (takes effect with the account's next request).
@@ -98,9 +97,9 @@ pub(crate) async fn grant_role(
     Ext(service): Ext<AuthService>,
     admin: RequireAdmin,
     info: ReqInfo,
-    Path((user, role)): Path<(i64, String)>,
-) -> Result<ApiJson<Ack>, AppError> {
-    service.set_role(&state, &actor(&admin, info), UserId(user), &role, true).await.map(|()| ApiJson(Ack::new()))
+    Call(call): Call<GrantRole>,
+) -> CallResult<GrantRole> {
+    service.set_role(&state, &actor(&admin, info), call.user, &call.role, true).await.map(|()| Reply::new(Ack::new()))
 }
 
 /// Revoke a role.
@@ -112,9 +111,9 @@ pub(crate) async fn revoke_role(
     Ext(service): Ext<AuthService>,
     admin: RequireAdmin,
     info: ReqInfo,
-    Path((user, role)): Path<(i64, String)>,
-) -> Result<ApiJson<Ack>, AppError> {
-    service.set_role(&state, &actor(&admin, info), UserId(user), &role, false).await.map(|()| ApiJson(Ack::new()))
+    Call(call): Call<RevokeRole>,
+) -> CallResult<RevokeRole> {
+    service.set_role(&state, &actor(&admin, info), call.user, &call.role, false).await.map(|()| Reply::new(Ack::new()))
 }
 
 /// The audit log, newest first.
@@ -130,9 +129,9 @@ pub(crate) async fn audit(
     State(state): State<AppState>,
     Ext(service): Ext<AuthService>,
     _admin: RequireAdmin,
-    Query(query): Query<AuditQuery>,
-) -> Result<ApiJson<Page<AuditEntry>>, AppError> {
-    service.audit_log(&state, &query).await.map(ApiJson)
+    Call(query): Call<AuditQuery>,
+) -> CallResult<AuditQuery> {
+    service.audit_log(&state, &query).await.map(Reply::new)
 }
 
 /// Unlink a login provider from an account.
@@ -144,8 +143,8 @@ pub(crate) async fn unlink_identity(
     Ext(service): Ext<AuthService>,
     admin: RequireAdmin,
     info: ReqInfo,
-    Path((user, provider)): Path<(i64, String)>,
-) -> Result<ApiJson<Ack>, AppError> {
+    Call(call): Call<UnlinkUserIdentity>,
+) -> CallResult<UnlinkUserIdentity> {
     let actor = actor(&admin, info.clone());
-    service.unlink_identity(&state, &info, UserId(user), &provider, Some(&actor)).await.map(|()| ApiJson(Ack::new()))
+    service.unlink_identity(&state, &info, call.user, &call.provider, Some(&actor)).await.map(|()| Reply::new(Ack::new()))
 }

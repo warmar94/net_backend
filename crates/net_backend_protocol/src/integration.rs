@@ -5,7 +5,7 @@
 use bevy_net_backend::{BearerToken, Credentials, OutgoingRequest, WsPushMessage, WsRequest};
 
 use crate::auth::AccessToken;
-use crate::chat::{ChatHistory, ChatMessage, JoinRoom, LeaveRoom, MessageDeleted, SendMessage};
+use crate::chat::{ChatHistory, ChatMessage, JoinRoom, LeaveRoom, ListMembers, MessageDeleted, Presence, SendMessage};
 use crate::envelope::{ServerPush, WsCall};
 
 /// `WsRequest` from this crate's [`WsCall`]: the same kind and answer type. No request asks to be
@@ -32,8 +32,8 @@ macro_rules! ws_pushes {
     };
 }
 
-ws_requests!(JoinRoom, LeaveRoom, SendMessage, ChatHistory);
-ws_pushes!(ChatMessage, MessageDeleted);
+ws_requests!(JoinRoom, LeaveRoom, SendMessage, ChatHistory, ListMembers);
+ws_pushes!(ChatMessage, MessageDeleted, Presence);
 
 /// `Authorization: Bearer <token>` on every HTTP request and WebSocket handshake (the client's
 /// `BearerToken` does the work, including the sensitive-header flag and the refusal of a token

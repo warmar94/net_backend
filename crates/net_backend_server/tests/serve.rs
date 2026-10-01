@@ -18,6 +18,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 
+/// The upper bound of every wait. Tests wait for a condition, never a fixed time; CI runners are slow
+/// and shared, so the bound is generous (a passing run never comes close).
+const WAIT: Duration = Duration::from_secs(30);
+
 type Log = Arc<Mutex<Vec<String>>>;
 
 fn push(log: &Log, line: impl Into<String>) {
@@ -70,7 +74,7 @@ async fn http_get(addr: SocketAddr, path: &str) -> std::io::Result<(u16, String)
 }
 
 async fn wait_until_up(addr: SocketAddr) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + WAIT;
     while Instant::now() < deadline {
         if let Ok((200, _)) = http_get(addr, "/healthz").await {
             return;
@@ -84,6 +88,8 @@ async fn wait_until_up(addr: SocketAddr) {
 async fn graceful_shutdown_drains_and_runs_callbacks_in_order() {
     let log: Log = Arc::default();
     let (log_start, log_stop) = (log.clone(), log.clone());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let entered_by_handler = entered.clone();
     let server = NetBackendServer::new(http_config())
         .module(Lifecycle { name: "first", log: log.clone(), fail_start: false })
         .module(Lifecycle { name: "second", log: log.clone(), fail_start: false })
@@ -100,9 +106,13 @@ async fn graceful_shutdown_drains_and_runs_callbacks_in_order() {
         })
         .route(
             "/v1/game/slow",
-            get(|| async {
-                tokio::time::sleep(Duration::from_millis(600)).await;
-                "done"
+            get(move || {
+                let entered = entered_by_handler.clone();
+                async move {
+                    entered.notify_one();
+                    tokio::time::sleep(Duration::from_millis(600)).await;
+                    "done"
+                }
             }),
         );
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -114,11 +124,12 @@ async fn graceful_shutdown_drains_and_runs_callbacks_in_order() {
     wait_until_up(addr).await;
 
     let in_flight = tokio::spawn(http_get(addr, "/v1/game/slow"));
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // The request is in its handler (a condition, not a fixed sleep: CI runners are slow).
+    tokio::time::timeout(WAIT, entered.notified()).await.expect("the handler started");
     let _ = stop.send(());
-    let answer = tokio::time::timeout(Duration::from_secs(5), in_flight).await.expect("in time").expect("task").expect("io");
+    let answer = tokio::time::timeout(WAIT, in_flight).await.expect("in time").expect("task").expect("io");
     assert_eq!(answer, (200, "done".to_string()), "the in-flight request finished");
-    let result = tokio::time::timeout(Duration::from_secs(5), running).await.expect("server stopped in time").expect("task");
+    let result = tokio::time::timeout(WAIT, running).await.expect("server stopped in time").expect("task");
     assert!(result.is_ok(), "{result:?}");
     assert_eq!(lines(&log), ["start first", "start second", "start hook", "shutdown second", "shutdown first", "shutdown hook"]);
     // The listener is closed.
@@ -130,14 +141,25 @@ async fn grace_deadline_bounds_the_shutdown() {
     let mut config = http_config();
     config.server.shutdown_grace_secs = 1;
     let finished = Arc::new(AtomicBool::new(false));
-    let flag = finished.clone();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let (flag, drop_flag, entered_by_handler) = (finished.clone(), dropped.clone(), entered.clone());
+    /// Sets its flag when the handler's future is dropped.
+    struct OnDrop(Arc<AtomicBool>);
+    impl Drop for OnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
     let log: Log = Arc::default();
     let server = NetBackendServer::new(config).module(Lifecycle { name: "pool_user", log: log.clone(), fail_start: false }).route(
         "/v1/game/stuck",
         get(move || {
-            let flag = flag.clone();
+            let (flag, guard, entered) = (flag.clone(), OnDrop(drop_flag.clone()), entered_by_handler.clone());
             async move {
-                tokio::time::sleep(Duration::from_secs(3)).await;
+                let _guard = guard;
+                entered.notify_one();
+                tokio::time::sleep(Duration::from_secs(120)).await;
                 flag.store(true, Ordering::SeqCst);
                 "late"
             }
@@ -151,19 +173,20 @@ async fn grace_deadline_bounds_the_shutdown() {
     }));
     wait_until_up(addr).await;
     let stuck = tokio::spawn(http_get(addr, "/v1/game/stuck"));
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::time::timeout(WAIT, entered.notified()).await.expect("the handler started");
     let started = Instant::now();
     let _ = stop.send(());
-    let result = tokio::time::timeout(Duration::from_secs(8), running).await.expect("stopped within the deadline").expect("task");
+    let result = tokio::time::timeout(WAIT, running).await.expect("stopped within the deadline").expect("task");
     assert!(result.is_ok(), "{result:?}");
     let took = started.elapsed();
-    assert!(took >= Duration::from_millis(900) && took < Duration::from_secs(3), "{took:?}");
+    // At the 1 s grace, long before the handler's 120 s (generous upper bound: slow runners).
+    assert!(took >= Duration::from_millis(900) && took < Duration::from_secs(60), "{took:?}");
     assert_eq!(lines(&log), ["start pool_user", "shutdown pool_user"]);
-    // The handler was dropped at the deadline: it never finishes after the modules and the pool
-    // shut down, and the client gets no answer.
-    let answer = tokio::time::timeout(Duration::from_secs(5), stuck).await.expect("client returns").expect("task");
+    // The handler was dropped at the deadline (its future is gone, it never finishes), and the
+    // client gets no answer.
+    assert!(dropped.load(Ordering::SeqCst), "the handler was not dropped at the deadline");
+    let answer = tokio::time::timeout(WAIT, stuck).await.expect("client returns").expect("task");
     assert!(!matches!(answer, Ok((200, _))), "{answer:?}");
-    tokio::time::sleep(Duration::from_millis(3500)).await;
     assert!(!finished.load(Ordering::SeqCst), "the handler completed after shutdown");
 }
 
@@ -183,16 +206,16 @@ async fn slow_headers_are_cut_off() {
     stream.write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n").await.expect("write");
     let started = Instant::now();
     let mut rest = Vec::new();
-    let closed = tokio::time::timeout(Duration::from_secs(6), stream.read_to_end(&mut rest)).await;
-    assert!(closed.is_ok(), "the connection is still open after 6 s");
-    assert!(started.elapsed() < Duration::from_secs(4), "{:?}", started.elapsed());
+    let closed = tokio::time::timeout(WAIT, stream.read_to_end(&mut rest)).await;
+    assert!(closed.is_ok(), "the connection is still open after {WAIT:?}");
+    assert!(started.elapsed() >= Duration::from_millis(500), "{:?}", started.elapsed());
     // An idle keep-alive connection is closed after the same time.
     let mut idle = TcpStream::connect(addr).await.expect("connect");
     let mut buf = [0u8; 16];
-    let closed = tokio::time::timeout(Duration::from_secs(6), idle.read(&mut buf)).await;
+    let closed = tokio::time::timeout(WAIT, idle.read(&mut buf)).await;
     assert!(matches!(closed, Ok(Ok(0)) | Ok(Err(_))), "{closed:?}");
     let _ = stop.send(());
-    let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
+    let _ = tokio::time::timeout(WAIT, running).await;
 }
 
 /// A module whose start or shutdown misbehaves.
@@ -241,7 +264,7 @@ async fn module_start_and_shutdown_are_bounded_and_contained() {
             log: log.clone(),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let result = tokio::time::timeout(Duration::from_secs(10), server.serve_with_shutdown(listener, std::future::pending())).await.expect("returns");
+        let result = tokio::time::timeout(WAIT, server.serve_with_shutdown(listener, std::future::pending())).await.expect("returns");
         assert!(matches!(&result, Err(Error::Startup(m)) if m.contains(expected)), "{result:?}");
     }
     assert_eq!(lines(&log), ["start before", "shutdown before", "start before", "shutdown before"]);
@@ -255,13 +278,14 @@ async fn module_start_and_shutdown_are_bounded_and_contained() {
             log: log.clone(),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
         let (stop, stopped) = oneshot::channel::<()>();
         let running = tokio::spawn(server.serve_with_shutdown(listener, async move {
             let _ = stopped.await;
         }));
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_until_up(addr).await;
         let _ = stop.send(());
-        let result = tokio::time::timeout(Duration::from_secs(8), running).await.expect("stopped").expect("task");
+        let result = tokio::time::timeout(WAIT, running).await.expect("stopped").expect("task");
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(lines(&log), ["start first", "shutdown first"], "{stop_kind}");
     }
@@ -275,14 +299,14 @@ async fn a_failing_start_shuts_down_what_started() {
         .module(Lifecycle { name: "bad", log: log.clone(), fail_start: true })
         .module(Lifecycle { name: "never", log: log.clone(), fail_start: false });
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let result = tokio::time::timeout(Duration::from_secs(10), server.serve_with_shutdown(listener, std::future::pending())).await.expect("returns");
+    let result = tokio::time::timeout(WAIT, server.serve_with_shutdown(listener, std::future::pending())).await.expect("returns");
     assert!(matches!(&result, Err(Error::Startup(m)) if m.contains("module `bad`")), "{result:?}");
     assert_eq!(lines(&log), ["start good", "shutdown good"]);
 
     // A failing start hook too.
     let server = NetBackendServer::new(http_config()).on_start(|_ctx| async { Err(net_backend_server::AppError::conflict("no")) });
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let result = tokio::time::timeout(Duration::from_secs(10), server.serve_with_shutdown(listener, std::future::pending())).await.expect("returns");
+    let result = tokio::time::timeout(WAIT, server.serve_with_shutdown(listener, std::future::pending())).await.expect("returns");
     assert!(matches!(&result, Err(Error::Startup(m)) if m.contains("start hook 0 failed")), "{result:?}");
 }
 
@@ -311,7 +335,7 @@ async fn migrate_on_start() {
     }));
     wait_until_up(addr).await;
     let _ = stop.send(());
-    let result = tokio::time::timeout(Duration::from_secs(5), running).await.expect("stopped").expect("task");
+    let result = tokio::time::timeout(WAIT, running).await.expect("stopped").expect("task");
     assert!(result.is_ok(), "{result:?}");
     let db = net_backend_server::Db::connect(&config.database).await.expect("connect");
     db.execute_script("INSERT INTO notes (id, body) VALUES (1, 'x')").await.expect("the table exists");

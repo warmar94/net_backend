@@ -173,6 +173,113 @@ impl DbError {
             _ => false,
         }
     }
+
+    /// Whether the database aborted the transaction to resolve a conflict between concurrent
+    /// transactions, so that running the whole transaction again may succeed: a deadlock (MySQL
+    /// error 1213, SQLSTATE `40001`; PostgreSQL `40P01`), a serialization failure (PostgreSQL
+    /// `40001`) or a busy / locked SQLite database. A lock-wait timeout (MySQL 1205) is not
+    /// retryable (another wait would only add to it).
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            DbError::Sqlx(error) => sqlx_retryable(error),
+            _ => false,
+        }
+    }
+}
+
+fn sqlx_retryable(error: &sqlx::Error) -> bool {
+    let sqlx::Error::Database(e) = error else { return false };
+    #[cfg(feature = "sqlite")]
+    if e.try_downcast_ref::<sqlx::sqlite::SqliteError>().is_some() {
+        return is_sqlite_busy(e.code().as_deref());
+    }
+    #[cfg(feature = "mysql")]
+    if let Some(mysql) = e.try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>() {
+        return mysql.number() == 1213;
+    }
+    matches!(e.code().as_deref(), Some("40001" | "40P01"))
+}
+
+/// Whether `error` (or an error in its source chain, e.g. the [`DbError`] inside an
+/// [`AppError`](crate::AppError)) is [retryable](DbError::is_retryable).
+pub fn is_retryable_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(e) = current {
+        if let Some(db) = e.downcast_ref::<DbError>() {
+            return db.is_retryable();
+        }
+        if let Some(sqlx) = e.downcast_ref::<sqlx::Error>() {
+            return sqlx_retryable(sqlx);
+        }
+        current = e.source();
+    }
+    false
+}
+
+/// Bounded retries of a write transaction that the database aborted as a deadlock / serialization
+/// failure / busy database ([`DbError::is_retryable`]). Use it only around a transaction whose
+/// work can run again from the start: everything it did was rolled back, and nothing outside the
+/// database happened inside it.
+///
+/// ```no_run
+/// # async fn demo(db: net_backend_server::db::Db) -> Result<(), net_backend_server::AppError> {
+/// use net_backend_server::db::Retry;
+///
+/// let mut retry = Retry::new(Retry::DEFAULT_ATTEMPTS);
+/// loop {
+///     let mut tx = db.begin_write().await?;
+///     let result: Result<(), net_backend_server::AppError> = async {
+///         // ... the transaction's statements on `tx` ...
+///         Ok(())
+///     }
+///     .await;
+///     match tx.finish(result).await {
+///         Err(error) if retry.again(&error).await => continue,
+///         other => return other,
+///     }
+/// }
+/// # }
+/// ```
+#[derive(Debug)]
+pub struct Retry {
+    attempt: u32,
+    max: u32,
+}
+
+impl Retry {
+    /// The attempts the framework's own write transactions make in all (the first + 2 retries).
+    pub const DEFAULT_ATTEMPTS: u32 = 3;
+
+    /// At most `max_attempts` attempts in all (at least 1).
+    pub fn new(max_attempts: u32) -> Self {
+        Self { attempt: 1, max: max_attempts.max(1) }
+    }
+
+    /// The attempt running now (1 = the first).
+    pub fn attempt(&self) -> u32 {
+        self.attempt
+    }
+
+    /// After a failed attempt: `true` (after a short, jittered pause) if `error` is
+    /// [retryable](is_retryable_error) and attempts remain; the caller then runs the transaction
+    /// again from the start. `false`: give up and answer the error.
+    pub fn again(&mut self, error: &(dyn std::error::Error + 'static)) -> impl std::future::Future<Output = bool> + Send + 'static {
+        // Decided now: the future holds no reference to the error.
+        let attempt = self.attempt;
+        let go = attempt < self.max && is_retryable_error(error);
+        if go {
+            self.attempt += 1;
+            tracing::debug!(attempt, "retrying a transaction the database aborted (deadlock / serialization / busy)");
+        }
+        async move {
+            if go {
+                // 5-25 ms per attempt so far, spread by the clock's sub-millisecond digits (no RNG crate).
+                let spread = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| u64::from(d.subsec_micros()) % 21);
+                tokio::time::sleep(Duration::from_millis((5 + spread).saturating_mul(u64::from(attempt)))).await;
+            }
+            go
+        }
+    }
 }
 
 // Row decoding bounds per backend. Each is a blanket-implemented marker that is empty when the
@@ -609,6 +716,19 @@ impl Db {
         })
     }
 
+    /// Start a transaction that will write. On SQLite it takes the write lock at once
+    /// (`BEGIN IMMEDIATE`, waiting up to the busy timeout), so a transaction that reads before it
+    /// writes cannot fail with `SQLITE_BUSY` when another connection wrote in between; elsewhere
+    /// it is [`begin`](Self::begin).
+    pub async fn begin_write(&self) -> Result<DbTx, DbError> {
+        match *self {
+            #[cfg(feature = "sqlite")]
+            Db::Sqlite(ref pool) => Ok(DbTx::Sqlite(pool.begin_with("BEGIN IMMEDIATE").await?)),
+            #[allow(unreachable_patterns)]
+            _ => self.begin().await,
+        }
+    }
+
     /// Start a transaction.
     pub async fn begin(&self) -> Result<DbTx, DbError> {
         Ok(match *self {
@@ -739,7 +859,7 @@ async fn sqlite_enable_wal(options: &sqlx::sqlite::SqliteConnectOptions, wait: D
 }
 
 /// SQLITE_BUSY (5) and its extended codes (e.g. 517 SQLITE_BUSY_SNAPSHOT), SQLITE_LOCKED (6).
-#[allow(dead_code)]
+#[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
 fn is_sqlite_busy(code: Option<&str>) -> bool {
     code.and_then(|c| c.parse::<i32>().ok()).is_some_and(|c| matches!(c & 0xff, 5 | 6))
 }
@@ -896,6 +1016,21 @@ impl DbTx {
         Ok(())
     }
 
+    /// Commit if `result` is `Ok` (a failed commit becomes the error), roll back otherwise; the
+    /// result.
+    pub async fn finish<T, E: From<DbError>>(self, result: Result<T, E>) -> Result<T, E> {
+        match result {
+            Ok(value) => {
+                self.commit().await?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = self.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
     /// Roll back (dropping the transaction does the same).
     pub async fn rollback(self) -> Result<(), DbError> {
         match self {
@@ -936,6 +1071,18 @@ mod tests {
         let bad = sea_query::Values(vec![sea_query::Value::BigUnsigned(Some(u64::MAX))]);
         assert!(matches!(check_values(&bad), Err(DbError::Build(m)) if m.contains("does not fit")));
         assert!(is_sqlite_busy(Some("5")) && is_sqlite_busy(Some("517")) && is_sqlite_busy(Some("6")) && !is_sqlite_busy(Some("19")) && !is_sqlite_busy(None));
+    }
+
+    #[tokio::test]
+    async fn only_conflicts_are_retried() {
+        let plain = DbError::Build("x".into());
+        assert!(!plain.is_retryable());
+        let mut retry = Retry::new(3);
+        assert!(!retry.again(&plain).await, "not a conflict");
+        assert_eq!(retry.attempt(), 1);
+        let wrapped = crate::AppError::internal(DbError::Sqlx(sqlx::Error::PoolTimedOut));
+        assert!(!is_retryable_error(&wrapped));
+        assert_eq!(Retry::new(0).attempt(), 1);
     }
 
     #[tokio::test]

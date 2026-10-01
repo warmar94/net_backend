@@ -41,7 +41,7 @@ mod steam {
                     }
                     match query.get("ticket").map(String::as_str) {
                         Some("5105") => {
-                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            tokio::time::sleep(Duration::from_secs(60)).await;
                             (StatusCode::OK, Json(Value::Null))
                         }
                         Some("0a0b") if query.get("identity").map(String::as_str) == Some("my game/1") && query.get("appid").map(String::as_str) == Some("480") => (
@@ -64,7 +64,8 @@ mod steam {
     #[tokio::test]
     async fn web_api_verifier_against_a_local_fake() {
         let (url, seen) = fake_steam().await;
-        let verifier = SteamWebApiVerifier::new(url.clone(), SecretString::new(KEY), 480, Duration::from_secs(1)).expect("verifier");
+        // A generous timeout for the answering fake (slow CI runners); the slow ticket gets its own 1 s one.
+        let verifier = SteamWebApiVerifier::new(url.clone(), SecretString::new(KEY), 480, Duration::from_secs(20)).expect("verifier");
         assert!(!format!("{verifier:?}").contains(KEY), "the key never shows in Debug");
         let identity = verifier.verify("0a0b", "my game/1").await.expect("valid ticket");
         assert_eq!(identity.steam_id, 76561190000000009);
@@ -77,9 +78,10 @@ mod steam {
         assert_eq!(query.get("identity").map(String::as_str), Some("my game/1"));
 
         assert_eq!(verifier.verify("ffff", "my game/1").await, Err(SteamError::Rejected("Invalid ticket (code 101)".into())));
-        let slow = verifier.verify("5105", "my game/1").await;
+        let impatient = SteamWebApiVerifier::new(url.clone(), SecretString::new(KEY), 480, Duration::from_secs(1)).expect("verifier");
+        let slow = impatient.verify("5105", "my game/1").await;
         assert!(matches!(&slow, Err(SteamError::Unavailable(m)) if m.contains("no answer")), "{slow:?}");
-        let wrong_key = SteamWebApiVerifier::new(url, SecretString::new("WRONG"), 480, Duration::from_secs(1)).expect("verifier");
+        let wrong_key = SteamWebApiVerifier::new(url, SecretString::new("WRONG"), 480, Duration::from_secs(20)).expect("verifier");
         let refused = wrong_key.verify("0a0b", "my game/1").await;
         assert!(matches!(&refused, Err(SteamError::Unavailable(m)) if m.contains("403") && !m.contains("WRONG")), "{refused:?}");
         // Nobody listening.
@@ -174,14 +176,14 @@ mod smtp {
     async fn smtp_mailer_against_a_local_fake() {
         let (port, transcript) = fake_smtp().await;
         let mailer =
-            SmtpMailer::new("127.0.0.1", Some(port), SmtpTls::None, None, "Space Game <no-reply@example.com>", Duration::from_secs(5)).expect("mailer");
+            SmtpMailer::new("127.0.0.1", Some(port), SmtpTls::None, None, "Space Game <no-reply@example.com>", Duration::from_secs(20)).expect("mailer");
         mailer.send(&Mail::new("ada@example.com", "Hello there", "the body text")).await.expect("sent");
         let text = transcript.lock().expect("lock").clone();
         assert!(text.contains("MAIL FROM:<no-reply@example.com>"), "{text}");
         assert!(text.contains("RCPT TO:<ada@example.com>"), "{text}");
         assert!(text.contains("Subject: Hello there") && text.contains("the body text"), "{text}");
         // STARTTLS is required in that mode: a server that does not offer it is refused.
-        let strict = SmtpMailer::new("127.0.0.1", Some(port), SmtpTls::Starttls, None, "no-reply@example.com", Duration::from_secs(5)).expect("mailer");
+        let strict = SmtpMailer::new("127.0.0.1", Some(port), SmtpTls::Starttls, None, "no-reply@example.com", Duration::from_secs(20)).expect("mailer");
         assert!(strict.send(&Mail::new("ada@example.com", "x", "y")).await.is_err());
         // A bad recipient is an error, never a panic; a display-name form is never re-parsed into
         // another mailbox (review S1).
@@ -211,7 +213,7 @@ mod smtp {
         let request =
             common::post_json(routes::auth::REGISTER, serde_json::json!({"email": "ada@example.com", "password": "correct horse battery"}).to_string());
         assert_eq!(common::call(&prepared.router(), request).await.0, http::StatusCode::OK);
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         // The body's long link line arrives quoted-printable encoded; check subject and recipient.
         while !(transcript.lock().expect("lock").contains("confirm your email address")
             && transcript.lock().expect("lock").contains("RCPT TO:<ada@example.com>"))

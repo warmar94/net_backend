@@ -52,3 +52,38 @@ change or a key dependency bump).
 - Feature `bevy_net_backend`: `WsRequest` / `WsPushMessage` for the chat messages and
   `Credentials` for `AccessToken`.
 - Example `print_frames`.
+- `http_call`: the `HttpCall` trait (route = method + path template + auth, `PayloadKind` = JSON
+  body / query / nothing, `Response` type, `path()`, `path_params()`, `from_parts()`), `PathParams`
+  (fill a template; ids and names checked, `bad_request`), `NoPayload`, `is_path_safe`,
+  `placeholders`; re-exported at the root. Every route of `routes::ALL` has exactly one
+  `HttpCall` type: the body / query types themselves (`LoginRequest`, `BatchPut`, `UserListQuery`,
+  …) and new call types for routes with path parameters or without a payload (`GetServerInfo`,
+  `auth::{ResendVerification, GetAccount, UnlinkIdentity}`, `storage::{ListObjects, GetObject,
+  WriteObject, RemoveObject}`, `chat::{ListRooms, ListMessages, ListDirects, DeleteMessage}`,
+  `admin::{GetUser, BanUser, UnbanUser, RevokeSessions, UnlinkUserIdentity, GrantRole,
+  RevokeRole}`).
+- Chat presence: the request `chat.members` (`ListMembers` → `RoomMembers` / `RoomMember`,
+  `MAX_LISTED_MEMBERS`) and the push `chat.presence` (`Presence`, `PresenceEvent`), the defaults
+  `DEFAULT_PRESENCE_MAX_MEMBERS` / `DEFAULT_PRESENCE_PER_SECOND`; kinds `CHAT_MEMBERS`,
+  `CHAT_PRESENCE`; the feature `bevy_net_backend` implements the client traits for them.
+- Message deletion: `routes::chat::MESSAGE` (`DELETE /v1/chat/rooms/{room}/messages/{message}`),
+  `DeleteMessage`, `routes::chat_message_path`.
+- A user's storage for operators: `routes::admin::USER_STORAGE` / `USER_OBJECT`,
+  `admin::{ListUserObjects, GetUserObject, WriteUserObject, RemoveUserObject, AdminPutObject}`,
+  `routes::admin_storage_path` / `admin_object_path`; `auth::is_valid_provider`.
+- `http_call::query_pairs`: a `Query` payload as name / value pairs (absent fields left out, never
+  `null`).
+- `text::{is_tag, is_variation_selector, is_combining_mark, MAX_COMBINING_RUN}`.
+
+### Changed
+
+- `is_path_safe` admits only RFC 3986 path characters that need no escaping (letters, digits,
+  `- . _ ~ ! $ & ' ( ) * + , ; = : @`); `"`, `<`, `>`, `\`, `^`, the backtick, `{`, `|`, `}` are no
+  longer path-safe.
+- Text rules: the Hangul fillers (U+115F, U+1160, U+3164, U+FFA0), the braille blank (U+2800) and
+  the combining grapheme joiner (U+034F) count as invisible; names refuse tag characters; a chat
+  text must show something (not only spaces, joiners, tags, variation selectors or combining marks)
+  and may stack at most 8 combining marks.
+- Docs: the chat send rate is a token bucket (a burst of 5, then one every 2 s); `chat.members` on a
+  DM room lists only the caller; a DM's push and the history show the `nonce` to the sender only;
+  the storage `ETag` comes with GET and PUT answers (not DELETE).

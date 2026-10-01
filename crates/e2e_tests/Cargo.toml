@@ -11,7 +11,11 @@ repository.workspace = true
 publish = false
 
 [dev-dependencies]
-net_backend_server = { path = "../net_backend_server", default-features = false, features = ["sqlite"] }
+net_backend_server = { path = "../net_backend_server", default-features = false, features = ["sqlite", "storage", "chat"] }
+# The protocol's own client integration: its WebSocket types ARE the client's typed requests and
+# pushes (`WsRequest` / `WsPushMessage`). Only this unpublished test crate enables the feature; the
+# server's own builds (`-p net_backend_server`) never see it.
+net_backend_protocol = { path = "../net_backend_protocol", features = ["bevy_net_backend"] }
 # The published client, by version (never a path): what games really use.
 bevy_net_backend = { version = "0.1.0", features = ["ws"] }
 # A headless app: MinimalPlugins, no window. Exactly 0.19.0 (one Bevy in the lockfile).

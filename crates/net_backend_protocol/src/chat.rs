@@ -10,6 +10,11 @@
 //! | `chat.history` | [`ChatHistory`] → [`Page`]`<`[`ChatMessage`]`>` (newest first) |
 //! | push `chat.message` | [`ChatMessage`], to every member of the room, the sender included |
 //! | push `chat.deleted` | [`MessageDeleted`] (moderation) |
+//! | `chat.members` | [`ListMembers`] → [`RoomMembers`] (who is online) |
+//! | push `chat.presence` | [`Presence`] (a user came online in a room or left; best effort) |
+//!
+//! HTTP ([`HttpCall`](crate::HttpCall) types): [`ListRooms`], [`ListMessages`], [`OpenDirect`], [`ListDirects`],
+//! [`DeleteMessage`].
 //!
 //! **Public and group rooms:** membership lasts as long as the WebSocket connection: after a
 //! reconnect, join again.
@@ -23,6 +28,13 @@
 //! after the server's hooks and reaches the sender's other devices). On the sending socket the
 //! `SendAck` answer is sent BEFORE that push; games dedupe by `message_id` (and may tag a send with
 //! a [`SendMessage::nonce`], echoed in the push, to match a send whose answer was lost).
+//!
+//! **Presence:** a room's members get `chat.presence` when a user's first connection joins the
+//! room and when its last one leaves (leave or disconnect), with the room's online `count`. It is
+//! best effort: rooms with more online users than the server's presence cap
+//! ([`DEFAULT_PRESENCE_MAX_MEMBERS`]) get none, and a burst beyond the per-room rate
+//! ([`DEFAULT_PRESENCE_PER_SECOND`]) is not pushed; `chat.members` always answers the current list.
+//! Presence is per server instance.
 //!
 //! **Text rules** ([`SendMessage::validate`], [`crate::text`]): not blank, at most
 //! [`DEFAULT_MAX_TEXT_CHARS`], line breaks and tabs allowed, other control characters and
@@ -44,9 +56,9 @@ use crate::time::UnixMillis;
 
 /// The default longest message, in characters (Unicode scalar values).
 pub const DEFAULT_MAX_TEXT_CHARS: usize = 500;
-/// The default rate limit: at most this many messages per user …
+/// The default rate limit, a token bucket: a burst of this many messages per user …
 pub const DEFAULT_RATE_MESSAGES: u32 = 5;
-/// … within this many seconds.
+/// … refilled over this many seconds (one message every `10 / 5 = 2` s after a burst).
 pub const DEFAULT_RATE_WINDOW_SECS: u32 = 10;
 /// The default history retention, in days.
 pub const DEFAULT_HISTORY_RETENTION_DAYS: u32 = 30;
@@ -353,7 +365,8 @@ pub struct ChatMessage {
     pub text: String,
     /// When it was stored.
     pub sent_at: UnixMillis,
-    /// The sender's [`SendMessage::nonce`], if it set one.
+    /// The sender's [`SendMessage::nonce`], if it set one (a public or group room's push carries it
+    /// to every member; a DM's push and the history show it to the sender only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nonce: Option<String>,
 }
@@ -416,6 +429,323 @@ impl OpenDirect {
         Self { user }
     }
 }
+
+// ---- presence -----------------------------------------------------------------------------------
+
+/// The default: rooms with more online users than this get no `chat.presence` pushes (one join
+/// would be a push to every member); [`ListMembers`] still answers.
+pub const DEFAULT_PRESENCE_MAX_MEMBERS: u32 = 100;
+/// The default: at most this many `chat.presence` pushes per room and second; the rest of a burst
+/// is not pushed (a client that needs the exact list asks with [`ListMembers`]).
+pub const DEFAULT_PRESENCE_PER_SECOND: u32 = 10;
+/// The most members one [`RoomMembers`] answer lists ([`RoomMembers::truncated`] beyond).
+pub const MAX_LISTED_MEMBERS: u32 = 200;
+
+/// Who is online in a room the caller joined: `chat.members` → [`RoomMembers`]. For a DM room the
+/// answer lists only the caller (a DM never reveals whether the peer is online).
+///
+/// JSON: `{"room":12}`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ListMembers {
+    /// The room.
+    pub room: RoomId,
+}
+
+impl ListMembers {
+    /// The online members of `room`.
+    pub fn new(room: RoomId) -> Self {
+        Self { room }
+    }
+}
+
+impl WsCall for ListMembers {
+    type Response = RoomMembers;
+    const KIND: &'static str = kinds::CHAT_MEMBERS;
+}
+
+/// One online member.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct RoomMember {
+    /// The user.
+    pub user: UserId,
+    /// The display name, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl RoomMember {
+    /// A member.
+    pub fn new(user: UserId) -> Self {
+        Self { user, name: None }
+    }
+
+    /// The same member with a name.
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+}
+
+/// The answer to [`ListMembers`]: the users online in the room (each once, however many
+/// connections they have), on this server instance.
+///
+/// JSON: `{"room":12,"members":[{"user":42,"name":"Ada"}],"count":1}` (+ `"truncated":true`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct RoomMembers {
+    /// The room.
+    pub room: RoomId,
+    /// Up to [`MAX_LISTED_MEMBERS`] members.
+    pub members: Vec<RoomMember>,
+    /// How many users are online in the room.
+    pub count: u32,
+    /// Whether `members` is cut at [`MAX_LISTED_MEMBERS`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+}
+
+impl RoomMembers {
+    /// An answer.
+    pub fn new(room: RoomId, members: Vec<RoomMember>, count: u32) -> Self {
+        Self { room, members, count, truncated: false }
+    }
+
+    /// The same answer marked as cut.
+    pub fn truncated(mut self) -> Self {
+        self.truncated = true;
+        self
+    }
+}
+
+/// What happened in a [`Presence`] push.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum PresenceEvent {
+    /// The user's first connection joined the room.
+    Joined,
+    /// The user's last connection left the room (leave, disconnect).
+    Left,
+    /// An event from a newer server this version does not know (never sent by a server).
+    #[serde(other)]
+    Unknown,
+}
+
+/// A user came online in a room or went: the `chat.presence` push, to the room's members
+/// (best effort: not in rooms over the server's presence cap, not beyond its per-room rate; see
+/// [`DEFAULT_PRESENCE_MAX_MEMBERS`]).
+///
+/// JSON: `{"room":12,"user":42,"event":"joined","name":"Ada","count":7}`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct Presence {
+    /// The room.
+    pub room: RoomId,
+    /// The user.
+    pub user: UserId,
+    /// Joined or left.
+    pub event: PresenceEvent,
+    /// The user's display name, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// How many users are online in the room now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u32>,
+}
+
+impl Presence {
+    /// A presence change.
+    pub fn new(room: RoomId, user: UserId, event: PresenceEvent) -> Self {
+        Self { room, user, event, name: None, count: None }
+    }
+
+    /// The same change with the user's name.
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// The same change with the room's online count.
+    pub fn with_count(mut self, count: u32) -> Self {
+        self.count = Some(count);
+        self
+    }
+}
+
+impl ServerPush for Presence {
+    const KIND: &'static str = kinds::CHAT_PRESENCE;
+}
+
+// ---- typed HTTP calls (see `http_call`) ---------------------------------------------------------
+
+/// The typed HTTP calls of this module (in their own scope: their imports stay out of the
+/// module's doc-link scope).
+mod calls {
+    use super::*;
+
+    use crate::http_call::{payload_call, HttpCall, NoPayload, PathParams, PayloadKind, NO_PAYLOAD};
+    use crate::routes::{self, HttpMethod, Route};
+
+    payload_call!(OpenDirect, Post, routes::chat::DM, true, Json, RoomInfo);
+
+    /// The public rooms: `GET /v1/chat/rooms?cursor=…&limit=…` → [`Page`]`<`[`RoomInfo`]`>`.
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub struct ListRooms {
+        /// Which page.
+        pub page: PageRequest,
+    }
+
+    impl ListRooms {
+        /// The first page.
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// The same call for this page.
+        pub fn with_page(mut self, page: PageRequest) -> Self {
+            self.page = page;
+            self
+        }
+    }
+
+    impl HttpCall for ListRooms {
+        type Payload = PageRequest;
+        type Response = Page<RoomInfo>;
+        const ROUTE: Route = Route::new(HttpMethod::Get, routes::chat::ROOMS, true);
+        const PAYLOAD: PayloadKind = PayloadKind::Query;
+
+        fn payload(&self) -> &PageRequest {
+            &self.page
+        }
+
+        fn from_parts(_params: &PathParams, page: PageRequest) -> Result<Self, ApiError> {
+            Ok(Self::new().with_page(page))
+        }
+    }
+
+    /// The caller's direct-message rooms: `GET /v1/chat/dms?cursor=…&limit=…` →
+    /// [`Page`]`<`[`RoomInfo`]`>` (with `peer`, newest activity first).
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub struct ListDirects {
+        /// Which page.
+        pub page: PageRequest,
+    }
+
+    impl ListDirects {
+        /// The first page.
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// The same call for this page.
+        pub fn with_page(mut self, page: PageRequest) -> Self {
+            self.page = page;
+            self
+        }
+    }
+
+    impl HttpCall for ListDirects {
+        type Payload = PageRequest;
+        type Response = Page<RoomInfo>;
+        const ROUTE: Route = Route::new(HttpMethod::Get, routes::chat::DMS, true);
+        const PAYLOAD: PayloadKind = PayloadKind::Query;
+
+        fn payload(&self) -> &PageRequest {
+            &self.page
+        }
+
+        fn from_parts(_params: &PathParams, page: PageRequest) -> Result<Self, ApiError> {
+            Ok(Self::new().with_page(page))
+        }
+    }
+
+    /// A page of a room's history over HTTP: `GET /v1/chat/rooms/{room}/messages?cursor=…&limit=…` →
+    /// [`Page`]`<`[`ChatMessage`]`>`, newest first (the WebSocket twin is [`ChatHistory`]).
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub struct ListMessages {
+        /// The room.
+        pub room: RoomId,
+        /// Which page.
+        pub page: PageRequest,
+    }
+
+    impl ListMessages {
+        /// The newest page of `room`.
+        pub fn new(room: RoomId) -> Self {
+            Self { room, page: PageRequest::first() }
+        }
+
+        /// The same call for this page.
+        pub fn with_page(mut self, page: PageRequest) -> Self {
+            self.page = page;
+            self
+        }
+    }
+
+    impl HttpCall for ListMessages {
+        type Payload = PageRequest;
+        type Response = Page<ChatMessage>;
+        const ROUTE: Route = Route::new(HttpMethod::Get, routes::chat::HISTORY, true);
+        const PAYLOAD: PayloadKind = PayloadKind::Query;
+
+        fn payload(&self) -> &PageRequest {
+            &self.page
+        }
+
+        fn path_params(&self) -> PathParams {
+            PathParams::new().with("room", self.room)
+        }
+
+        fn from_parts(params: &PathParams, page: PageRequest) -> Result<Self, ApiError> {
+            Ok(Self::new(params.id("room")?).with_page(page))
+        }
+    }
+
+    /// Delete one message: `DELETE /v1/chat/rooms/{room}/messages/{message}` → [`Ack`]. Allowed for
+    /// its sender (unless the server turned that off) and for moderators; the room's members get a
+    /// `chat.deleted` push ([`MessageDeleted`]) and the message leaves the history.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub struct DeleteMessage {
+        /// The room.
+        pub room: RoomId,
+        /// The message.
+        pub message: MessageId,
+    }
+
+    impl DeleteMessage {
+        /// Delete `message` in `room`.
+        pub fn new(room: RoomId, message: MessageId) -> Self {
+            Self { room, message }
+        }
+    }
+
+    impl HttpCall for DeleteMessage {
+        type Payload = NoPayload;
+        type Response = Ack;
+        const ROUTE: Route = Route::new(HttpMethod::Delete, routes::chat::MESSAGE, true);
+        const PAYLOAD: PayloadKind = PayloadKind::Empty;
+
+        fn payload(&self) -> &NoPayload {
+            &NO_PAYLOAD
+        }
+
+        fn path_params(&self) -> PathParams {
+            PathParams::new().with("room", self.room).with("message", self.message)
+        }
+
+        fn from_parts(params: &PathParams, _payload: NoPayload) -> Result<Self, ApiError> {
+            Ok(Self::new(params.id("room")?, params.id("message")?))
+        }
+    }
+}
+
+pub use calls::{DeleteMessage, ListDirects, ListMessages, ListRooms};
 
 #[cfg(test)]
 mod tests {

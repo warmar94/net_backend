@@ -76,21 +76,40 @@ pub enum Target {
     All,
 }
 
-/// An encoded frame and where it goes: what a [`Broadcaster`] publishes. Serializes as
-/// `{"target":…,"frame":"<the JSON text>"}` for a pub/sub transport.
+/// A change of the hub's state that a [`Delivery`] carries to every instance instead of a frame
+/// (applied to the sockets its target names).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Control {
+    /// The target's sockets leave this room (e.g. a member removed from a group: on every
+    /// instance, not only the one that removed it).
+    LeaveRoom(Arc<str>),
+}
+
+/// An encoded frame and where it goes, or a [`Control`] change: what a [`Broadcaster`] publishes.
+/// Serializes as `{"target":…,"frame":"<the JSON text>"}` (plus `"control":…` for a control
+/// delivery, whose frame is empty) for a pub/sub transport.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct Delivery {
     /// Who receives it.
     pub target: Target,
-    /// The frame's JSON text (encoded once, shared by every socket).
+    /// The frame's JSON text (encoded once, shared by every socket); empty for a control delivery.
     pub frame: Utf8Bytes,
+    /// A change of the hub's state instead of a frame ([`Delivery::control`]); `None` for a frame.
+    pub control: Option<Control>,
 }
 
 impl Delivery {
     /// A delivery of `frame` to `target`.
     pub fn new(target: Target, frame: impl Into<Utf8Bytes>) -> Self {
-        Self { target, frame: frame.into() }
+        Self { target, frame: frame.into(), control: None }
+    }
+
+    /// A control delivery: `control` applied to the sockets `target` names, on every instance.
+    pub fn control(target: Target, control: Control) -> Self {
+        Self { target, frame: Utf8Bytes::from_static(""), control: Some(control) }
     }
 }
 
@@ -98,35 +117,44 @@ impl Delivery {
 struct DeliveryOut<'a> {
     target: &'a Target,
     frame: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    control: Option<&'a Control>,
 }
 
 #[derive(Deserialize)]
 struct DeliveryIn {
     target: Target,
     frame: String,
+    #[serde(default)]
+    control: Option<Control>,
 }
 
 impl Serialize for Delivery {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        DeliveryOut { target: &self.target, frame: self.frame.as_str() }.serialize(serializer)
+        DeliveryOut { target: &self.target, frame: self.frame.as_str(), control: self.control.as_ref() }.serialize(serializer)
     }
 }
 
 impl<'de> Deserialize<'de> for Delivery {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let raw = DeliveryIn::deserialize(deserializer)?;
-        Ok(Delivery::new(raw.target, raw.frame))
+        let mut delivery = Delivery::new(raw.target, raw.frame);
+        delivery.control = raw.control;
+        Ok(delivery)
     }
 }
 
 /// The seam for running several server instances: pushes to users, rooms and everyone go through
-/// it ([`Target::Connection`] pushes stay in this process: connection ids are per instance).
+/// it ([`Target::Connection`] pushes stay in this process: connection ids are per instance), and
+/// so do [`Control`] deliveries (e.g. "these sockets leave this room", made by
+/// [`Hub::remove_from_room`]).
 ///
 /// The default [`LocalBroadcaster`] delivers in this process. A pub/sub implementation (e.g.
-/// Redis / Valkey) publishes each [`Delivery`] (it is serde-serializable) to every instance and,
-/// on each instance, hands what arrives to the [`LocalDelivery`] it got in
-/// [`start`](Broadcaster::start). Everything else is per instance: rooms, `is_online`,
-/// `connections_of`, `close` / `close_user`, the connection caps.
+/// Redis / Valkey) publishes each [`Delivery`] AS A WHOLE (it is serde-serializable, `control`
+/// included) to every instance and, on each instance, hands what arrives to the [`LocalDelivery`]
+/// it got in [`start`](Broadcaster::start); it must never drop or rewrite the `control` field.
+/// Everything else is per instance: rooms, `is_online`, `connections_of`, `close` / `close_user`,
+/// the connection caps.
 ///
 /// Methods added later always come with a default implementation.
 pub trait Broadcaster: Send + Sync + 'static {
@@ -164,7 +192,8 @@ impl fmt::Debug for LocalDelivery {
 impl LocalDelivery {
     /// Queue the frame on every local socket the target names; returns how many got it. A socket
     /// whose outbox is full is closed with 1013 instead; a frame over `ws.max_message_bytes` is
-    /// dropped (logged).
+    /// dropped (logged). A control delivery is applied to those sockets instead (the count: how
+    /// many it changed).
     pub fn deliver(&self, delivery: &Delivery) -> usize {
         match self.0.upgrade() {
             Some(inner) => Hub(inner).deliver_local(delivery),
@@ -343,8 +372,13 @@ struct Registry {
     recent: VecDeque<(Instant, Revocation)>,
 }
 
+/// Told when the hub took a socket out of a room on a [`Control::LeaveRoom`] (the chat module's
+/// presence), after the registry lock is released.
+pub(crate) type RoomLeft = Arc<dyn Fn(&Hub, ConnectionId, UserId, &str) + Send + Sync>;
+
 pub(crate) struct Inner {
     config: WsConfig,
+    room_left: RwLock<Vec<RoomLeft>>,
     registry: RwLock<Registry>,
     next_id: AtomicU64,
     /// Reserved slots: accepted handshakes + open sockets.
@@ -457,6 +491,7 @@ impl Hub {
             (config.handshakes_per_ip_per_minute > 0).then(|| KeyedBuckets::new(config.handshakes_per_ip_per_minute, Duration::from_secs(60), 100_000));
         Hub(Arc::new(Inner {
             config,
+            room_left: RwLock::new(Vec::new()),
             registry: RwLock::new(Registry::default()),
             next_id: AtomicU64::new(1),
             live: AtomicUsize::new(0),
@@ -564,6 +599,9 @@ impl Hub {
     }
 
     fn deliver_local(&self, delivery: &Delivery) -> usize {
+        if let Some(control) = &delivery.control {
+            return self.apply_control(&delivery.target, control);
+        }
         if self.check_size(&delivery.frame).is_err() {
             return 0;
         }
@@ -600,6 +638,50 @@ impl Hub {
             }
         }
         sent
+    }
+
+    /// Apply a control delivery to the local sockets `target` names; how many it changed.
+    fn apply_control(&self, target: &Target, control: &Control) -> usize {
+        match control {
+            Control::LeaveRoom(room) => {
+                let ids: Vec<ConnectionId> = {
+                    let registry = self.read();
+                    match target {
+                        Target::Connection(id) => vec![*id],
+                        Target::User(user) => registry.users.get(user).cloned().unwrap_or_default(),
+                        Target::Room(name) => registry.rooms.get(name).map(|m| m.iter().copied().collect()).unwrap_or_default(),
+                        Target::All => registry.conns.keys().copied().collect(),
+                    }
+                };
+                let mut left = Vec::new();
+                for id in ids {
+                    if self.leave(id, room) {
+                        if let Some(user) = self.read().conns.get(&id).and_then(|c| c.user) {
+                            left.push((id, user));
+                        }
+                    }
+                }
+                let listeners: Vec<RoomLeft> = self.0.room_left.read().unwrap_or_else(|p| p.into_inner()).clone();
+                for (id, user) in &left {
+                    for listener in &listeners {
+                        listener(self, *id, *user, room);
+                    }
+                }
+                left.len()
+            }
+        }
+    }
+
+    /// Be told when a [`Control::LeaveRoom`] took a socket out of a room.
+    #[cfg_attr(not(feature = "chat"), allow(dead_code))]
+    pub(crate) fn on_room_left(&self, listener: RoomLeft) {
+        self.0.room_left.write().unwrap_or_else(|p| p.into_inner()).push(listener);
+    }
+
+    /// Take every socket of `user` out of `room` on EVERY instance (a [`Control::LeaveRoom`]
+    /// delivery through the [`Broadcaster`]); here at once with the default broadcaster.
+    pub fn remove_from_room(&self, user: UserId, room: &str) -> Result<(), PushError> {
+        self.publish(Delivery::control(Target::User(user), Control::LeaveRoom(Arc::from(room))))
     }
 
     // ---- rooms ----------------------------------------------------------------------------------
@@ -1047,5 +1129,11 @@ mod tests {
         let back: Delivery = serde_json::from_str(&json).unwrap_or_else(|_| Delivery::new(Target::All, ""));
         assert_eq!(back.target, delivery.target);
         assert_eq!(back.frame.as_str(), delivery.frame.as_str());
+        assert_eq!(back.control, None);
+        let leave = Delivery::control(Target::User(UserId(7)), Control::LeaveRoom(Arc::from("chat:3")));
+        let json = serde_json::to_string(&leave).unwrap_or_default();
+        assert_eq!(json, r#"{"target":{"User":7},"frame":"","control":{"leave_room":"chat:3"}}"#);
+        let back: Delivery = serde_json::from_str(&json).unwrap_or_else(|_| Delivery::new(Target::All, ""));
+        assert_eq!(back.control, leave.control);
     }
 }

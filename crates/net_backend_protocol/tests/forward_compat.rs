@@ -67,6 +67,10 @@ fn optional_fields_may_be_absent() {
 fn unknown_values_are_kept_or_mapped() {
     let room: RoomInfo = decode(r#"{"id":1,"kind":"guild_hall"}"#);
     assert_eq!(room.kind, RoomKind::Unknown);
+    let presence: net_backend_protocol::chat::Presence = decode(r#"{"room":1,"user":2,"event":"away","mood":"happy"}"#);
+    assert_eq!(presence.event, net_backend_protocol::chat::PresenceEvent::Unknown);
+    let members: net_backend_protocol::chat::RoomMembers = decode(r#"{"room":1,"members":[{"user":2,"status":"x"}],"count":1}"#);
+    assert!(!members.truncated && members.members[0].name.is_none());
     let object: StorageObject = decode(r#"{"collection":"c","key":"k","owner":1,"value":1,"version":1,"read":"friends","write":"moderators","updated_at":0}"#);
     assert_eq!(object.write, WriteAccess::Unknown);
     let error: ApiError = decode(r#"{"code":"guild_full","message":"m"}"#);

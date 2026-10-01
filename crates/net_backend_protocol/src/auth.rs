@@ -666,6 +666,127 @@ impl ResetPasswordRequest {
     }
 }
 
+// ---- typed HTTP calls (see `http_call`) ---------------------------------------------------------
+
+/// The typed HTTP calls of this module (in their own scope: their imports stay out of the
+/// module's doc-link scope).
+mod calls {
+    use super::*;
+
+    use crate::envelope::Ack;
+    use crate::http_call::{payload_call, HttpCall, NoPayload, PathParams, PayloadKind, NO_PAYLOAD};
+    use crate::routes::{self, HttpMethod, Route};
+
+    payload_call!(RegisterRequest, Post, routes::auth::REGISTER, false, Json, AuthSession);
+    payload_call!(LoginRequest, Post, routes::auth::LOGIN, false, Json, AuthSession);
+    payload_call!(SteamLoginRequest, Post, routes::auth::STEAM, false, Json, AuthSession);
+    payload_call!(RefreshRequest, Post, routes::auth::REFRESH, false, Json, TokenPair);
+    payload_call!(LogoutRequest, Post, routes::auth::LOGOUT, false, Json, Ack);
+    payload_call!(VerifyEmailRequest, Post, routes::auth::VERIFY_EMAIL, false, Json, Ack);
+    payload_call!(ForgotPasswordRequest, Post, routes::auth::FORGOT_PASSWORD, false, Json, Ack);
+    payload_call!(ResetPasswordRequest, Post, routes::auth::RESET_PASSWORD, false, Json, Ack);
+    payload_call!(UpdateAccountRequest, Patch, routes::account::ME, true, Json, Account);
+    payload_call!(ChangePasswordRequest, Post, routes::account::PASSWORD, true, Json, Ack);
+
+    /// Send the verification mail again: `POST /v1/auth/email/resend` (no body) → [`Ack`].
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub struct ResendVerification {}
+
+    impl ResendVerification {
+        /// The call.
+        pub const fn new() -> Self {
+            Self {}
+        }
+    }
+
+    impl HttpCall for ResendVerification {
+        type Payload = NoPayload;
+        type Response = Ack;
+        const ROUTE: Route = Route::new(HttpMethod::Post, routes::auth::RESEND_VERIFICATION, true);
+        const PAYLOAD: PayloadKind = PayloadKind::Empty;
+
+        fn payload(&self) -> &NoPayload {
+            &NO_PAYLOAD
+        }
+
+        fn from_parts(_params: &PathParams, _payload: NoPayload) -> Result<Self, ApiError> {
+            Ok(Self::new())
+        }
+    }
+
+    /// The caller's account: `GET /v1/account` → [`Account`].
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub struct GetAccount {}
+
+    impl GetAccount {
+        /// The call.
+        pub const fn new() -> Self {
+            Self {}
+        }
+    }
+
+    impl HttpCall for GetAccount {
+        type Payload = NoPayload;
+        type Response = Account;
+        const ROUTE: Route = Route::new(HttpMethod::Get, routes::account::ME, true);
+        const PAYLOAD: PayloadKind = PayloadKind::Empty;
+
+        fn payload(&self) -> &NoPayload {
+            &NO_PAYLOAD
+        }
+
+        fn from_parts(_params: &PathParams, _payload: NoPayload) -> Result<Self, ApiError> {
+            Ok(Self::new())
+        }
+    }
+
+    /// Whether `provider` is a plausible login provider name: `[a-z][a-z0-9_]*`, at most 32 bytes.
+    pub fn is_valid_provider(provider: &str) -> bool {
+        provider.len() <= 32
+            && provider.bytes().next().is_some_and(|b| b.is_ascii_lowercase())
+            && provider.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    }
+
+    /// Unlink a login provider from the caller's account: `DELETE /v1/account/identities/{provider}`
+    /// → [`Ack`] (needs a recent login).
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub struct UnlinkIdentity {
+        /// The provider (`steam`).
+        pub provider: String,
+    }
+
+    impl UnlinkIdentity {
+        /// Unlink `provider`.
+        pub fn new(provider: impl Into<String>) -> Self {
+            Self { provider: provider.into() }
+        }
+    }
+
+    impl HttpCall for UnlinkIdentity {
+        type Payload = NoPayload;
+        type Response = Ack;
+        const ROUTE: Route = Route::new(HttpMethod::Delete, routes::account::IDENTITY, true);
+        const PAYLOAD: PayloadKind = PayloadKind::Empty;
+
+        fn payload(&self) -> &NoPayload {
+            &NO_PAYLOAD
+        }
+
+        fn path_params(&self) -> PathParams {
+            PathParams::new().with("provider", &self.provider)
+        }
+
+        fn from_parts(params: &PathParams, _payload: NoPayload) -> Result<Self, ApiError> {
+            Ok(Self::new(params.checked("provider", is_valid_provider, "is not a provider name")?))
+        }
+    }
+}
+
+pub use calls::{is_valid_provider, GetAccount, ResendVerification, UnlinkIdentity};
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -29,6 +29,11 @@ steam = ["dep:hyper-rustls", "dep:rustls", "hyper-util/client-legacy", "hyper-ut
 # The SMTP mailer (lettre, rustls with ring, webpki roots). Without it mail goes to the log mailer
 # or an app-provided `Mailer`.
 smtp = ["dep:lettre"]
+# The storage module (per-user JSON objects / saves: `/v1/storage`). No extra dependency; off by
+# default like every module (a server registers only what it uses).
+storage = []
+# The chat module (rooms, DMs, history, presence over the WebSocket hub). No extra dependency.
+chat = []
 
 [dependencies]
 # The shared message types (error body, routes, version, ids, timestamps).

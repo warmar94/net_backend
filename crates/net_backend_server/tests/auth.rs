@@ -141,7 +141,8 @@ impl Fx {
 
     /// Wait for the `n`-th mail to `to` and return its one-time token.
     async fn mail_token(&self, to: &str, n: usize) -> String {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // Generous: the mail queue runs in its own task, CI runners are slow.
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let mails = self.mail.sent_to(to);
             if mails.len() >= n {
@@ -824,6 +825,12 @@ async fn secrets_never_reach_logs_or_debug() {
     common::call(&router, request(routes::auth::REFRESH, json!({"refresh_token": refresh}), None)).await;
     common::call(&router, request(routes::auth::FORGOT_PASSWORD, json!({"email": "log@example.com"}), None)).await;
     common::call(&router, request(routes::account::PASSWORD, json!({"current_password": PASSWORD, "new_password": "NEW-PASSWORD-abc"}), Some(&access))).await;
+    // The mail queue logs from its own task: wait for it (bounded), then a moment for the rest.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !String::from_utf8_lossy(&buffer.0.lock().expect("lock")).contains("mail (log mailer; body hidden") {
+        assert!(Instant::now() < deadline, "the log mailer never ran");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let logs = String::from_utf8_lossy(&buffer.0.lock().expect("lock")).into_owned();
@@ -874,8 +881,12 @@ async fn openapi_lists_auth_routes() {
     ] {
         assert!(spec["paths"][path].is_object(), "{path} missing");
     }
-    // Every route the protocol defines for accounts is served (method + path).
-    for route in routes::ALL.iter().filter(|r| r.path.starts_with("/v1/auth") || r.path.starts_with("/v1/account") || r.path.starts_with("/v1/admin")) {
+    // Every route the protocol defines for accounts is served (method + path); a user's storage
+    // under /v1/admin belongs to the storage module.
+    let accounts = |r: &&routes::Route| {
+        (r.path.starts_with("/v1/auth") || r.path.starts_with("/v1/account") || r.path.starts_with("/v1/admin")) && !r.path.contains("/storage")
+    };
+    for route in routes::ALL.iter().filter(accounts) {
         let method = route.method.as_str().to_ascii_lowercase();
         assert!(spec["paths"][route.path][method.as_str()].is_object(), "{} {}", route.method, route.path);
     }
@@ -977,7 +988,7 @@ async fn fix_round(url: &str) {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["account"]["identities"][0]["subject"], "76561190000000011");
     // The owner is told.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while !fx.mail.sent_to("fixlinker@example.com").iter().any(|m| m.subject.contains("Steam account linked")) {
         assert!(Instant::now() < deadline, "no link notification");
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1161,17 +1172,35 @@ async fn revocations_from_other_processes_reach_subscribers() {
     let user = UserId(session["account"]["id"].as_i64().expect("id"));
     let mut revocations = running.state().get::<AuthService>().expect("service").subscribe_revocations();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let serving = tokio::spawn(running.serve_with_shutdown(listener, async move {
         let _ = stopped.await;
     }));
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The modules (and the revocation poll, whose cursor starts there) have started once the
+    // server answers a request: it accepts connections only after every module's start.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let answered = async {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.ok()?;
+            stream.write_all(b"GET /readyz HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n").await.ok()?;
+            let mut head = [0u8; 12];
+            stream.read_exact(&mut head).await.ok()?;
+            head.starts_with(b"HTTP/1.1").then_some(())
+        };
+        if tokio::time::timeout(Duration::from_secs(5), answered).await.ok().flatten().is_some() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the server never answered");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     // The "other process".
     let other = build(0).build().await.expect("build other");
     let service = other.state().get::<AuthService>().expect("service");
     let revoked = service.revoke_sessions(other.state(), net_backend_server::auth::Revocation::new(user, RevokedSessions::All, RevocationReason::Admin)).await;
     assert_eq!(revoked.ok(), Some(1));
-    let got = tokio::time::timeout(Duration::from_secs(5), revocations.recv()).await.expect("within 5 s").expect("a revocation");
+    let got = tokio::time::timeout(Duration::from_secs(30), revocations.recv()).await.expect("within 30 s").expect("a revocation");
     assert_eq!(got.user_id, user);
     assert!(matches!(got.sessions, RevokedSessions::One(_)) && got.reason == RevocationReason::Admin);
     assert_eq!(got.close_code(), CloseCode::UNAUTHORIZED);
