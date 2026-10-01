@@ -44,9 +44,9 @@ The server does not care which client connects; the JSON on the wire is the cont
 
 | Your client is… | Use |
 |---|---|
-| a **Rust** app (tool, bot, CLI, other engine) | [`net_backend_client`](crates/net_backend_client/README.md) for the connection (HTTP, WebSocket, SSH / SFTP) + `net_backend_protocol` for the message types. |
-| a **Bevy** game | [`bevy_net_backend`](https://crates.io/crates/bevy_net_backend) for the connection (HTTP, WebSocket, SSH / SFTP) + `net_backend_protocol` for the message types. |
-| **other** | `net_backend_protocol` + any HTTP / WebSocket library (for example reqwest, ureq, tokio-tungstenite). |
+| a **Rust** app (tool, bot, CLI, other engine) | [`net_backend_client`](crates/net_backend_client/README.md) for the connection (HTTP, WebSocket, SSH / SFTP) + [`net_backend_protocol`](crates/net_backend_protocol/README.md) for the message types. |
+| a **Bevy** game | [`bevy_net_backend`](https://github.com/warmar94/bevy_net_backend) for the connection (HTTP, WebSocket, SSH / SFTP) + [`net_backend_protocol`](crates/net_backend_protocol/README.md) for the message types. |
+| **other** | [`net_backend_protocol`](crates/net_backend_protocol/README.md) + any HTTP / WebSocket library (for example reqwest, ureq, tokio-tungstenite). |
 | **not Rust** (C#, GDScript, JavaScript, …) | The API directly: the server's OpenAPI document describes every HTTP route and can generate typed clients; its AsyncAPI document (`/v1/asyncapi.json`) and README describe every WebSocket frame. |
 
 ## Repository layout

@@ -12,7 +12,7 @@ built on the shared message types of
 [`net_backend_protocol`](https://github.com/warmar94/net_backend/tree/main/crates/net_backend_protocol).
 
 For Rust apps that do not use Bevy: other engines, tools, bots and command-line programs. Bevy
-games use [`bevy_net_backend`](https://crates.io/crates/bevy_net_backend), which offers the same
+games use [`bevy_net_backend`](https://github.com/warmar94/bevy_net_backend), which offers the same
 features as Bevy plugins.
 
 ## Features
@@ -33,8 +33,8 @@ features as Bevy plugins.
 
 | Your client is… | Use |
 |---|---|
-| a **Rust** app | this crate + `net_backend_protocol` |
-| a **Bevy** game | [`bevy_net_backend`](https://crates.io/crates/bevy_net_backend) + `net_backend_protocol` |
+| a **Rust** app | this crate + [`net_backend_protocol`](https://github.com/warmar94/net_backend/tree/main/crates/net_backend_protocol) |
+| a **Bevy** game | [`bevy_net_backend`](https://github.com/warmar94/bevy_net_backend) + [`net_backend_protocol`](https://github.com/warmar94/net_backend/tree/main/crates/net_backend_protocol) |
 | **other** | the server's HTTP / WebSocket API directly (OpenAPI + WebSocket reference) |
 
 ## License

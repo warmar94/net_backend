@@ -22,7 +22,7 @@ This crate defines **what** is said; a client library decides **how** it is sent
 | Your client is… | Use |
 |---|---|
 | a **Rust** app | this crate + [`net_backend_client`](https://github.com/warmar94/net_backend/tree/main/crates/net_backend_client) for the connection. |
-| a **Bevy** game | this crate + [`bevy_net_backend`](https://crates.io/crates/bevy_net_backend) for the connection (with the optional `bevy_net_backend` feature, the types plug straight into its WebSocket requests). |
+| a **Bevy** game | this crate + [`bevy_net_backend`](https://github.com/warmar94/bevy_net_backend) for the connection (with the optional `bevy_net_backend` feature, the types plug straight into its WebSocket requests). |
 | **other** Rust code | this crate + any HTTP / WebSocket library (for example reqwest, ureq, tokio-tungstenite). |
 | **not Rust** | not this crate: use the server's API documentation (OpenAPI for HTTP, AsyncAPI for the WebSocket) and send the same JSON. |
 
@@ -72,7 +72,7 @@ This crate defines **what** is said; a client library decides **how** it is sent
 | Feature | Default | What |
 |---|---|---|
 | (none) | yes | serde + serde_json only. |
-| `bevy_net_backend` | no | Implements the client crate [`bevy_net_backend`](https://crates.io/crates/bevy_net_backend)'s `WsRequest` / `WsPushMessage` for this crate's WebSocket messages and its `Credentials` for `AccessToken`. Brings that crate and its dependencies; a server never enables it. |
+| `bevy_net_backend` | no | Implements the client crate [`bevy_net_backend`](https://github.com/warmar94/bevy_net_backend)'s `WsRequest` / `WsPushMessage` for this crate's WebSocket messages and its `Credentials` for `AccessToken`. Brings that crate and its dependencies; a server never enables it. |
 
 ## Install
 

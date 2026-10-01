@@ -10,7 +10,7 @@ A Rust framework for building **game backend servers**: async (tokio + axum) and
 plain HTTP + WebSocket + JSON, so any client can use it. Rust clients share the message types through
 [`net_backend_protocol`](https://github.com/warmar94/net_backend/tree/main/crates/net_backend_protocol); the ready-made clients are
 [`net_backend_client`](https://github.com/warmar94/net_backend/tree/main/crates/net_backend_client) for Rust and
-[`bevy_net_backend`](https://crates.io/crates/bevy_net_backend) for Bevy games.
+[`bevy_net_backend`](https://github.com/warmar94/bevy_net_backend) for Bevy games.
 
 It is a **library you build your own server with**, not a finished server application. It gives you
 solid building blocks with sensible defaults and leaves the game rules to you.
@@ -38,8 +38,8 @@ The server does not care which client connects; the JSON on the wire is the cont
 | Your client is… | Use |
 |---|---|
 | a **Rust** app (tool, bot, CLI, other engine) | [`net_backend_client`](https://github.com/warmar94/net_backend/tree/main/crates/net_backend_client) for the connection (HTTP, WebSocket, SSH / SFTP) + [`net_backend_protocol`](https://github.com/warmar94/net_backend/tree/main/crates/net_backend_protocol) for the message types. |
-| a **Bevy** game | [`bevy_net_backend`](https://crates.io/crates/bevy_net_backend) for the connection (HTTP, WebSocket, SSH / SFTP) + `net_backend_protocol` for the message types. |
-| **other** | `net_backend_protocol` + any HTTP / WebSocket library (for example reqwest, ureq, tokio-tungstenite). |
+| a **Bevy** game | [`bevy_net_backend`](https://github.com/warmar94/bevy_net_backend) for the connection (HTTP, WebSocket, SSH / SFTP) + [`net_backend_protocol`](https://github.com/warmar94/net_backend/tree/main/crates/net_backend_protocol) for the message types. |
+| **other** | [`net_backend_protocol`](https://github.com/warmar94/net_backend/tree/main/crates/net_backend_protocol) + any HTTP / WebSocket library (for example reqwest, ureq, tokio-tungstenite). |
 | **not Rust** (C#, GDScript, JavaScript, …) | The API directly: the OpenAPI document at `/v1/openapi.json` describes every HTTP route and can generate typed clients; the AsyncAPI document at `/v1/asyncapi.json` and the [WebSocket](#websocket) section describe every WebSocket frame. |
 
 ## Contents

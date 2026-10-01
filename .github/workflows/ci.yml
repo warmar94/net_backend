@@ -81,7 +81,30 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build -p net_backend_server --locked --all-targets ${{ matrix.features }}
       - run: cargo clippy -p net_backend_server --locked --all-targets ${{ matrix.features }} -- -D warnings
-      - run: cargo test -p net_backend_server --locked ${{ matrix.features }}
+      # Diagnostic (CI hang 2026-10-02): if a test binary of the ws suite runs over 2 minutes (it normally takes
+      # ~10 s), print every thread's stack once, so the log shows where it is stuck. The watchdog still aborts it.
+      - run: command -v gdb >/dev/null || sudo apt-get install -y -qq gdb >/dev/null
+      - run: |
+          (
+            done_pids=""
+            while sleep 15; do
+              for pid in $(pgrep -f 'target/debug/deps/ws-[0-9a-f]+' || true); do
+                case " $done_pids " in *" $pid "*) continue ;; esac
+                age=$(ps -o etimes= -p "$pid" | tr -d ' ')
+                if [ -n "$age" ] && [ "$age" -gt 120 ]; then
+                  echo "::group::stacks of the ws test binary (pid $pid, running ${age}s)"
+                  sudo gdb -p "$pid" -batch -ex 'set pagination off' -ex 'thread apply all bt' 2>&1 | grep -v '^\[New LWP' | head -n 1500
+                  echo "::endgroup::"
+                  done_pids="$done_pids $pid"
+                fi
+              done
+            done
+          ) &
+          watcher=$!
+          status=0
+          cargo test -p net_backend_server --locked ${{ matrix.features }} || status=$?
+          kill "$watcher" 2>/dev/null || true
+          exit "$status"
       - run: cargo doc -p net_backend_server --locked --no-deps ${{ matrix.features }}
       # Without any backend the crate must still compile (starting a server then fails clearly).
       - if: matrix.features == '--all-features'
