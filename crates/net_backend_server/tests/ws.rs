@@ -331,8 +331,11 @@ async fn send(ws: &mut Ws, value: Value) {
 
 /// The next data or close frame (pings / pongs skipped).
 async fn next(ws: &mut Ws) -> Option<Message> {
+    // One deadline for the whole wait: skipped pings must not restart it (CI hang, 2026-10-02: the
+    // server's heartbeat pings kept a wait for a frame that never came alive forever).
+    let deadline = tokio::time::Instant::now() + WAIT;
     loop {
-        match tokio::time::timeout(WAIT, ws.next()).await.expect("a frame in time") {
+        match tokio::time::timeout_at(deadline, ws.next()).await.expect("a frame in time") {
             Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
             Some(Ok(message)) => return Some(message),
             Some(Err(_)) | None => return None,
@@ -689,7 +692,8 @@ async fn connection_caps() {
 async fn slow_consumers_are_closed() {
     let server = start(|config| {
         config.ws.outbox_frames = 4;
-        config.ws.write_timeout_secs = 2;
+        // Long enough that the late reader below starts reading before its stalled write times out.
+        config.ws.write_timeout_secs = 5;
     })
     .await;
     let (slow, slow_token) = server.register("slow@example.com").await;
@@ -698,8 +702,11 @@ async fn slow_consumers_are_closed() {
     // Pushes reach registered sockets only: wait for the server side first (CI flake, 2026-10-01:
     // on a slow runner the 2000 pushes went out before the socket was registered).
     server.wait_registered(slow, 1).await;
-    let chunk = "y".repeat(1024);
-    for n in 0..2000 {
+    // 64 KiB each (~19 MB in all), more than the socket buffers hold, so the writer stalls and the
+    // outbox overflows on any machine (CI hang, 2026-10-02: with 1 KiB pushes a fast runner wrote
+    // everything out, nothing overflowed, and no 1013 came).
+    let chunk = "y".repeat(64 * 1024);
+    for n in 0..300 {
         server.state.ws().push_raw(Target::User(slow), "test.flood", &json!({"n": n, "pad": chunk})).expect("push");
     }
     let mut got = 0;
@@ -711,7 +718,7 @@ async fn slow_consumers_are_closed() {
         }
     };
     assert_eq!(code, Some(1013));
-    assert!(got < 2000, "{got}");
+    assert!(got < 300, "{got}");
     server.wait_connections(0).await;
     // A peer that never reads at all: the write deadline drops it.
     let (stuck, stuck_token) = server.register("stuck@example.com").await;
