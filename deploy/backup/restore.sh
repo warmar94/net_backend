@@ -137,6 +137,8 @@ trap on_failure EXIT
 log "stopping the server"
 stop_server
 
+# Set by the URL parsing below (eval); declared here so they are always defined.
+user="" password="" host="" port="" database=""
 case "$scheme" in
 mysql | mariadb)
 	if [ "$mode" = docker ]; then
