@@ -52,7 +52,7 @@ pub use http_call::{HttpCall, NoPayload, PathParams, PayloadKind};
 pub use ids::{MessageId, RoomId, UserId};
 pub use page::{Cursor, Page, PageRequest};
 pub use time::UnixMillis;
-pub use version::{ServerInfo, PROTOCOL_HEADER, PROTOCOL_VERSION};
+pub use version::{GetServerInfo, ServerInfo, PROTOCOL_HEADER, PROTOCOL_VERSION};
 
 /// The README's Rust blocks, compiled as doctests.
 #[cfg(doctest)]

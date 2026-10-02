@@ -403,6 +403,10 @@ impl RefreshRequest {
 /// Log out: `POST /v1/auth/logout` (with the access token, or with `refresh_token` in the body)
 /// → [`Ack`](crate::Ack). Revokes this session's access and refresh tokens, or every session of
 /// the account with `everywhere`; open WebSockets of revoked sessions are closed with 4001.
+///
+/// Its route has `auth: false` because either credential works. A client that attaches the Bearer
+/// token only when [`Route::auth`](crate::routes::Route::auth) is set must still send it here, or fill
+/// `refresh_token`: with neither, logout answers 401.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct LogoutRequest {
