@@ -12,8 +12,6 @@ keywords = ["gamedev", "client", "backend", "websocket", "ssh"]
 categories = ["game-development", "network-programming"]
 # Not part of the published package.
 exclude = ["NOTES.md", "docs/", "/target"]
-# Not published yet: the owner removes this line at release prep (published after net_backend_server).
-publish = false
 
 [features]
 # HTTP(S), the session (login, refresh, logout) and the blocking interface are always compiled.

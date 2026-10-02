@@ -1,6 +1,8 @@
 # net_backend_server
 
 <p>
+  <a href="https://crates.io/crates/net_backend_server"><img alt="crates.io" src="https://img.shields.io/crates/v/net_backend_server.svg"></a>
+  <a href="https://docs.rs/net_backend_server"><img alt="docs.rs" src="https://img.shields.io/docsrs/net_backend_server"></a>
   <a href="#license"><img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg"></a>
   <a href="https://github.com/warmar94/net_backend/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/warmar94/net_backend/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="Rust 1.95+" src="https://img.shields.io/badge/rust-1.95%2B-orange">

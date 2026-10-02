@@ -59,8 +59,8 @@ pub const STEAM_TICKET_MAX_HEX: usize = 8192;
 // Steam's ticket buffer is 2560 bytes = 5120 hex characters.
 const _: () = assert!(STEAM_TICKET_MAX_HEX >= 2 * 2560);
 
-/// Login providers named in [`LinkedIdentity::provider`]. New providers (OAuth, planned for a
-/// later version) add constants here; the field is a string so old clients still decode them.
+/// Login providers named in [`LinkedIdentity::provider`]. New providers (OAuth in a next version)
+/// add constants here; the field is a string so old clients still decode them.
 pub mod provider {
     /// Steam (a Web API ticket checked by the server; the subject is the SteamID64 as a string).
     pub const STEAM: &str = "steam";

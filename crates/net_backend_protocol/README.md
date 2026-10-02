@@ -1,6 +1,8 @@
 # net_backend_protocol
 
 <p>
+  <a href="https://crates.io/crates/net_backend_protocol"><img alt="crates.io" src="https://img.shields.io/crates/v/net_backend_protocol.svg"></a>
+  <a href="https://docs.rs/net_backend_protocol"><img alt="docs.rs" src="https://img.shields.io/docsrs/net_backend_protocol"></a>
   <a href="#license"><img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg"></a>
   <a href="https://github.com/warmar94/net_backend/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/warmar94/net_backend/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="Rust 1.95+" src="https://img.shields.io/badge/rust-1.95%2B-orange">
@@ -161,7 +163,7 @@ assert_eq!(<SendMessage as WsCall>::KIND, "chat.send");
 ## The WebSocket envelope
 
 JSON objects in text frames, compatible with the default envelope (`JsonEnvelope`) of the client
-crate `bevy_net_backend` 0.1:
+crate `bevy_net_backend` 0.1.0:
 
 | Direction | Frame | JSON |
 |---|---|---|
