@@ -4,8 +4,11 @@
 //! request inside it; transfers are capped
 //! ([`SshTarget::with_max_transfer_bytes`](super::SshTarget::with_max_transfer_bytes)). Downloads
 //! keep 16 reads of 64 KiB in flight (at most 1 MiB asked for or waiting to be written, whatever
-//! the file size) and write them in file order; uploads keep 16 writes of 32 KiB in flight.
-//! Transfers report their progress ([`SftpTask`]). The remote file handle is closed after every
+//! the file size) and write them in file order; uploads keep 16 writes of 32 KiB in flight. A
+//! download whose remote file ends before the size the server reported when it was opened fails
+//! with [`Error::Ssh`] ("… changed size during the download", with the expected and the received
+//! byte counts), and a download to a file then leaves no file; a file that reports a size of 0, or
+//! none, is read to its end. Transfers report their progress ([`SftpTask`]). The remote file handle is closed after every
 //! transfer, also one that was cancelled or timed out. Local file I/O runs on tokio's blocking
 //! pool. Remote paths are the server's (relative paths start in the login directory).
 
@@ -471,7 +474,8 @@ impl SshSession {
     }
 
     /// Read the remote file `remote` into memory (at most the transfer limit, else
-    /// `BodyTooLarge`), with progress.
+    /// `BodyTooLarge`), with progress. A file that ends before the size the server reported when it
+    /// was opened is an [`Error::Ssh`] ("… changed size during the download").
     pub fn start_download(&self, remote: &str) -> SftpTask<Vec<u8>> {
         if let Err(error) = check_remote(remote) {
             return SftpTask::failed(error);
@@ -490,7 +494,9 @@ impl SshSession {
     /// Copy the remote file `remote` to the local file `local`, with progress: written to a part
     /// file next to it (`<name>.<process>-<n>.part`), renamed over `local` only when the whole
     /// file arrived; the part file is removed when the download fails, times out or is cancelled.
-    /// The result is the bytes written.
+    /// A remote file that ends before the size the server reported when it was opened is an
+    /// [`Error::Ssh`] ("… changed size during the download") and leaves no file. The result is the
+    /// bytes written.
     pub fn start_download_file(&self, remote: &str, local: impl AsRef<Path>) -> SftpTask<u64> {
         if let Err(error) = check_remote(remote) {
             return SftpTask::failed(error);
@@ -851,9 +857,16 @@ async fn read_pipelined<R: ReadAt>(
         }
     }
     // Every read is answered. Bytes the server sent beyond the end it reported (the file grew
-    // meanwhile) are dropped; everything before the end must have been written.
+    // meanwhile) are dropped; everything before the end must have been written. A file that ends
+    // before the size the server reported when it was opened was cut short meanwhile (a size of 0,
+    // or none, is read to its end: some files report no real size).
     match end {
-        Some(end) if end == written => Ok((written, peak)),
+        Some(end) if end == written => match total {
+            Some(total) if total > 0 && written < total => Err(Error::Ssh(format!(
+                "SFTP: the remote file changed size during the download (expected {total} bytes, its size when it was opened; received {written})"
+            ))),
+            _ => Ok((written, peak)),
+        },
         Some(_) => Err(Error::Ssh("SFTP: the remote file changed size during the download".into())),
         None => Err(Error::Ssh("SFTP: the download ended without reaching the end of the file".into())),
     }
@@ -1198,6 +1211,25 @@ mod tests {
             assert!(report.progress.windows(2).all(|w| w[0].0 <= w[1].0), "{:?}", report.progress);
             assert!(report.progress.iter().all(|(done, total)| *done <= 3_000_000 && *total == Some(3_000_000)));
             assert_eq!(report.progress.last().map(|p| p.0), Some(3_000_000));
+        }
+
+        #[test]
+        fn a_file_shorter_than_its_size_at_open_is_an_error_and_size_0_or_none_reads_to_the_end() {
+            let file = FakeFile::new(content(300_000));
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap_or_else(|e| panic!("{e}"));
+            for (total, ok) in [(Some(500_000), false), (Some(300_001), false), (Some(300_000), true), (Some(0), true), (None, true), (Some(100), true)] {
+                let mut sink = Sink::Memory(Vec::new());
+                let result = runtime.block_on(read_pipelined(&file, u64::MAX - 1, total, &mut Collect::default(), &mut sink, READ_WINDOW_BYTES));
+                if ok {
+                    assert_eq!(result.map(|(w, _)| w).ok(), Some(300_000), "reported size {total:?}");
+                } else {
+                    let expected = format!("expected {} bytes, its size when it was opened; received 300000", total.unwrap_or(0));
+                    assert!(
+                        matches!(&result, Err(Error::Ssh(why)) if why.contains("changed size during the download") && why.contains(&expected)),
+                        "{result:?}"
+                    );
+                }
+            }
         }
 
         #[test]

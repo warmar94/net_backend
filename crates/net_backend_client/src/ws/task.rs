@@ -144,7 +144,7 @@ impl Task {
                                 reconnected = true;
                                 continue;
                             }
-                            Some(Err(error)) if link::is_permanent(&error) => return self.finish(Some(error)),
+                            Some(Err(error)) if self.is_final(&error) => return self.finish(Some(error)),
                             Some(Err(error)) => error,
                             None => return self.finish(None),
                         }
@@ -177,13 +177,19 @@ impl Task {
                             reconnected = true;
                             break;
                         }
-                        Some(Err(error)) if link::is_permanent(&error) => return self.finish(Some(error)),
+                        Some(Err(error)) if reconnect.is_final(&error) => return self.finish(Some(error)),
                         Some(Err(error)) => last = error,
                         None => return self.finish(None),
                     }
                 }
             }
         }
+    }
+
+    /// Whether a failed attempt after a lost link ends the connection (the reconnect policy's rule;
+    /// without a policy, only a permanent answer, and a TLS error, as the default policy).
+    fn is_final(&self, error: &Error) -> bool {
+        self.settings.reconnect.as_ref().map_or_else(|| super::Reconnect::default().is_final(error), |r| r.is_final(error))
     }
 
     /// One connection attempt while still queueing requests and honouring their deadlines. `None`

@@ -72,6 +72,7 @@ pub(crate) mod connection;
 pub mod events;
 mod handlers;
 mod hub;
+mod tap;
 
 pub use handlers::{KindDoc, WsCtx, WsHandlers};
 pub use hub::{Broadcaster, ConnectionId, ConnectionInfo, Control, Delivery, HubStats, JoinError, LocalBroadcaster, LocalDelivery, PushError, Target};

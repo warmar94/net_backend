@@ -29,7 +29,8 @@
 //!   protocol) and a second 4001 end the connection ([`WsEvent::Closed`]).
 //! - Every other loss (1000, 1001, 1006, 1008, 1009, 1011, 1013, network, heartbeat) reconnects
 //!   with exponential backoff and full jitter ([`Reconnect`]); a 429 / 503 handshake waits at least
-//!   its `Retry-After`.
+//!   its `Retry-After`. A TLS or certificate error on a reconnect attempt ends the connection,
+//!   unless [`Reconnect::with_tls_retry`] is on.
 //! - **After every reconnect** ([`WsEvent::Connected`] with `reconnected: true`) join your chat
 //!   rooms again and reload what you may have missed: membership ends with each connection, and
 //!   pushes sent while the link was down are gone. The client does not do this for you (it does not
@@ -73,7 +74,8 @@ pub enum WsAuthMode {
 
 /// Automatic reconnects: exponential backoff with full jitter. The delay before attempt `n` is a
 /// random value in `0..=min(cap, base · 2^(n-1))`; the counter resets once a connection stayed up
-/// for `stable_after`. Defaults: base 500 ms, cap 30 s, no attempt limit, stable after 10 s.
+/// for `stable_after`. Defaults: base 500 ms, cap 30 s, no attempt limit, stable after 10 s, a TLS
+/// error is final ([`Reconnect::with_tls_retry`]).
 #[derive(Clone, Debug)]
 pub struct Reconnect {
     base: Duration,
@@ -81,11 +83,19 @@ pub struct Reconnect {
     max_attempts: Option<u32>,
     stable_after: Duration,
     jitter: bool,
+    tls_retry: bool,
 }
 
 impl Default for Reconnect {
     fn default() -> Self {
-        Self { base: Duration::from_millis(500), cap: Duration::from_secs(30), max_attempts: None, stable_after: Duration::from_secs(10), jitter: true }
+        Self {
+            base: Duration::from_millis(500),
+            cap: Duration::from_secs(30),
+            max_attempts: None,
+            stable_after: Duration::from_secs(10),
+            jitter: true,
+            tls_retry: false,
+        }
     }
 }
 
@@ -114,6 +124,14 @@ impl Reconnect {
         self
     }
 
+    /// Also reconnect after a TLS error (default `false`): by default a TLS or certificate error on
+    /// a reconnect attempt is final, like a refused token, and the connection ends with
+    /// [`WsEvent::Closed`] carrying the [`Error::Tls`].
+    pub fn with_tls_retry(mut self, retry: bool) -> Self {
+        self.tls_retry = retry;
+        self
+    }
+
     /// Random jitter on (default) or off (exact delays, for tests).
     pub fn with_jitter(mut self, jitter: bool) -> Self {
         self.jitter = jitter;
@@ -133,6 +151,12 @@ impl Reconnect {
         }
         let nanos = u64::try_from(bound.as_nanos()).unwrap_or(u64::MAX);
         Duration::from_nanos(random % nanos.saturating_add(1))
+    }
+
+    /// Whether a failed reconnect attempt ends the connection: a permanent answer, or a TLS error
+    /// without [`Reconnect::with_tls_retry`].
+    pub(crate) fn is_final(&self, error: &Error) -> bool {
+        link::is_permanent(error) || (matches!(error, Error::Tls(_)) && !self.tls_retry)
     }
 
     pub(crate) fn may_retry(&self, attempt: u32) -> bool {
@@ -593,5 +617,21 @@ mod tests {
         assert!(!Reconnect::default().with_max_attempts(Some(2)).may_retry(3));
         let settings = WsSettings::default().with_heartbeat(Duration::from_secs(20), Duration::from_secs(1));
         assert_eq!(settings.dead_after, Duration::from_secs(20), "dead_after is at least the interval");
+    }
+
+    #[test]
+    fn a_tls_error_on_a_reconnect_is_final_unless_opted_in() {
+        let tls = Error::Tls("invalid peer certificate: UnknownIssuer".into());
+        let network = Error::network("reset", None);
+        let banned = Error::Closed { code: net_backend_protocol::CloseCode::BANNED, reason: String::new() };
+        let default = Reconnect::default();
+        assert!(default.is_final(&tls), "a TLS error ends the connection by default");
+        assert!(!default.is_final(&network));
+        assert!(default.is_final(&banned));
+        let retry = Reconnect::default().with_tls_retry(true);
+        assert!(!retry.is_final(&tls), "with_tls_retry(true) retries a TLS error");
+        assert!(!retry.is_final(&network));
+        assert!(retry.is_final(&banned), "permanent answers stay final with with_tls_retry(true)");
+        assert!(Reconnect::default().with_tls_retry(true).with_tls_retry(false).is_final(&tls));
     }
 }

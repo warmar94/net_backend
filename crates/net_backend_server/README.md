@@ -638,6 +638,14 @@ than `ws.request_timeout_secs`), `internal` (never with details), plus whatever 
   another instance).
 - Requests sent before authenticating are answered `unauthorized`; pushes reach authenticated
   sockets only.
+- **Logs:** tungstenite (the WebSocket protocol under the hub) logs every frame and message it
+  receives at TRACE through the `log` crate, with the content. An `auth` message never reaches it:
+  the server takes each one out of the socket's bytes before tungstenite reads them (tungstenite
+  receives and logs a stand-in text), so no access token is in those records. Requests and chat
+  text are; `tungstenite=debug` in `RUST_LOG` / `[log] level` leaves them out where `log` records
+  reach the `tracing` output (`init_logging` forwards them when `tracing-subscriber`'s `tracing-log`
+  feature is on in the build, as in its default features). The handshake's header and `?token=`
+  are read through hyper and axum, which log neither.
 
 ### Close codes
 
@@ -1346,7 +1354,9 @@ The WebSocket suite runs a loopback server with a WebSocket client: both ways to
 auth deadline, every refusal, version mismatches, token expiry, logout / ban / another process's
 ban closing sockets, malformed frames, handler panics and timeouts, rooms and their caps,
 connection caps, slow consumers, heartbeats and dead peers, the rate and size limits, hooks and
-shutdown. A separate unpublished crate in the repository drives the server with the published
+shutdown. A log-capture test records every `log` record of the server's threads and every
+`tracing` event at TRACE while sockets authenticate by first message (in one frame and in several)
+and by the header, and finds no access token, also not hex-encoded. A separate unpublished crate in the repository drives the server with the published
 `bevy_net_backend` client in a headless app (Bearer and first-message auth with the
 acknowledgement, requests, pushes, reconnecting after 1001, staying away after 4003 / 4010 / 401,
 heartbeats both ways; storage over HTTP with the protocol's `HttpCall` types; chat with the

@@ -326,6 +326,7 @@ loop {
 | 4001 (revoked) | ONE refresh, then one new connection at once; a failed refresh or a second 4001 ends it |
 | 4003 (banned), 4009 (replaced: another device or window took over), 4010 (unsupported protocol), any other 4000–4099 | closed for good, no reconnect (`Error::Closed { code, .. }`) |
 | handshake 401 after its one refresh, 403 | closed for good (`Error::Api`) |
+| a TLS or certificate error on a reconnect attempt | closed for good (`Error::Tls`); `Reconnect::with_tls_retry(true)` retries it with the backoff instead |
 
 Your app rejoins its chat rooms after a reconnect (it knows which rooms still matter): do it on
 `WsEvent::Connected { reconnected: true }`, as above.
@@ -386,7 +387,10 @@ ssh.close().await;
 - **Transfers:** a download keeps 16 reads of 64 KiB in flight (at most 1 MiB asked for or waiting
   to be written, whatever the file size) and writes them in file order; an upload keeps 16 writes
   of 32 KiB in flight. A file the server reports over the transfer limit is refused before any
-  data is read. Each SFTP request waits at most the operation timeout (`with_sftp_timeout`, at
+  data is read. A remote file that ends before the size the server reported when it was opened
+  is an error (`Error::Ssh`, "… changed size during the download", with the expected and the
+  received byte counts; no local file is left); a file that reports a size of 0, or none, is read
+  to its end. Each SFTP request waits at most the operation timeout (`with_sftp_timeout`, at
   least 1 s).
 - **Progress:** `start_upload`, `start_upload_file`, `start_download`, `start_download_file` return
   an `SftpTask`: `next_progress()` / `try_progress()` (bytes done and the size; at most about 10
@@ -527,7 +531,7 @@ The crate installs no logger and no filter; that stays with your program.
 | WebSocket connect (TCP + TLS + handshake + `auth.ok`) | 10 s | `WsSettings::with_connect_timeout` |
 | WebSocket request timeout | 10 s | `WsSettings::with_request_timeout` |
 | heartbeat | ping 15 s, lost after 45 s silent | `WsSettings::with_heartbeat` |
-| reconnect backoff | 500 ms doubling to 30 s, full jitter, no attempt limit, reset after 10 s | `WsSettings::with_reconnect` / `without_reconnect` |
+| reconnect backoff | 500 ms doubling to 30 s, full jitter, no attempt limit, reset after 10 s; a TLS error is final | `WsSettings::with_reconnect` / `without_reconnect`, `Reconnect::with_tls_retry` |
 | WebSocket message size | 1 MiB (the server's) | `WsSettings::with_max_message_bytes` |
 | buffered pushes per stream / events per stream | 256 / 64 | `with_push_buffer` / `with_event_buffer` |
 | requests waiting or running per connection | 256 | `WsSettings::with_max_pending` |
@@ -584,7 +588,8 @@ Terrapin refusal and its opt-out, SSH reconnects (a lost command never re-run, w
 a refused login and the attempt limit final), and SFTP (a 256 MiB download byte for byte, sizes
 from 0 bytes up with and without short reads, progress, a cancel, a timeout and a server error
 midway with the remote handle closed and no file left, a connection lost midway answered
-`Disconnected`). A log-capture test runs the session, the WebSocket and SSH with every level on,
+`Disconnected`, a file cut short midway or shorter than its reported size answered with an error
+and no file left). A log-capture test runs the session, the WebSocket and SSH with every level on,
 records every `tracing` event and every `log` record of the client's side (tungstenite's and
 russh's TRACE lines included), and finds no password, token or passphrase in any of them, also
 not hex-encoded (`net_backend_protocol`'s tests check that its secret types leave nothing behind in

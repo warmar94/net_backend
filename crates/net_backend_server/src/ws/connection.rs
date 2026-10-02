@@ -1,6 +1,8 @@
 //! The `/v1/ws` endpoint: the handshake checks, then one task per socket (reads, answers,
 //! pushes from its outbox, heartbeats, the auth deadline, closes). A request handler runs while
-//! the task keeps writing pushes and serving closes.
+//! the task keeps writing pushes and serving closes. The upgrade is answered here (not by axum's
+//! `WebSocketUpgrade`) so that the socket's bytes reach tungstenite through [`AuthTap`]: `auth`
+//! messages never pass through tungstenite, which logs what it receives at TRACE.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
@@ -8,22 +10,31 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::ws::{CloseFrame, Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
-use axum::extract::{FromRequestParts, Query, Request, State};
+use axum::body::{Body, Bytes};
+use axum::extract::ws::Utf8Bytes;
+use axum::extract::{Query, Request, State};
 use axum::response::{IntoResponse, Response};
 use futures_util::future::BoxFuture;
-use http::header::{AUTHORIZATION, ORIGIN, RETRY_AFTER, UPGRADE};
+use futures_util::{SinkExt, StreamExt};
+use http::header::{AUTHORIZATION, CONNECTION, ORIGIN, RETRY_AFTER, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION, UPGRADE};
 use http::request::Parts;
-use http::{HeaderMap, HeaderValue, StatusCode, Uri};
+use http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, Version};
+use hyper::upgrade::{OnUpgrade, Upgraded};
+use hyper_util::rt::TokioIo;
 use net_backend_protocol::{
     codes, routes, ApiError, CloseCode, WsAuth, WsAuthOk, WsClientFrame, WsRequestFrame, WsResponseFrame, WsServerFrame, PROTOCOL_HEADER, PROTOCOL_VERSION,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
+use tokio_tungstenite::WebSocketStream;
+use tungstenite::protocol::frame::coding::CloseCode as WireCloseCode;
+use tungstenite::protocol::{CloseFrame, Role, WebSocketConfig};
+use tungstenite::{Message, Utf8Bytes as WireText};
 
 use super::events::{AfterWsConnect, AfterWsDisconnect, BeforeWsConnect, BeforeWsFrame};
 use super::handlers::WsCtx;
 use super::hub::{ConnHandle, ConnectionId, Hub, Refusal, Registered, HANDLING};
+use super::tap::{AuthTap, Diverted, MARKER};
 use crate::auth::{AuthContext, AuthFailure};
 use crate::error::AppError;
 use crate::hooks::{guarded, HookCtx, Outcome};
@@ -46,6 +57,34 @@ const MAX_CLOSE_REASON: usize = 123;
 
 /// `Retry-After` for a full or closing hub and the per-address cap, in seconds.
 const BUSY_RETRY_SECS: u64 = 5;
+
+/// The socket of one connection.
+type Socket = WebSocketStream<AuthTap<TokioIo<Upgraded>>>;
+
+/// Whether the request is a WebSocket upgrade (HTTP/1.1, the same checks as axum's
+/// `WebSocketUpgrade`): its `Sec-WebSocket-Key`.
+fn upgrade_key(parts: &Parts) -> Option<HeaderValue> {
+    let header = |name| parts.headers.get(name).map(HeaderValue::as_bytes);
+    let connection_upgrade = header(CONNECTION).and_then(|v| std::str::from_utf8(v).ok()).is_some_and(|v| v.to_ascii_lowercase().contains("upgrade"));
+    let ok = parts.version <= Version::HTTP_11
+        && parts.method == Method::GET
+        && connection_upgrade
+        && header(UPGRADE).is_some_and(|v| v.eq_ignore_ascii_case(b"websocket"))
+        && header(SEC_WEBSOCKET_VERSION).is_some_and(|v| v == b"13")
+        && parts.extensions.get::<OnUpgrade>().is_some();
+    if ok {
+        parts.headers.get(SEC_WEBSOCKET_KEY).cloned()
+    } else {
+        None
+    }
+}
+
+/// The plain-GET answer: 426 with `Upgrade: websocket`.
+fn upgrade_required() -> Response {
+    let mut response = AppError::with_status(StatusCode::UPGRADE_REQUIRED, codes::BAD_REQUEST, "this endpoint only accepts WebSocket upgrades").into_response();
+    response.headers_mut().insert(UPGRADE, HeaderValue::from_static("websocket"));
+    response
+}
 
 fn count(hub: &Hub, name: &'static str, label: &'static str, value: impl Into<String>) {
     if hub.metrics() {
@@ -191,21 +230,16 @@ pub(crate) async fn endpoint(State(state): State<AppState>, request: Request) ->
     let hub = state.ws().clone();
     let (mut parts, _body) = request.into_parts();
     let version_ok = version_supported(&parts.headers);
-    let upgrade = match WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
-        Ok(upgrade) => upgrade,
+    let key = match upgrade_key(&parts) {
+        Some(key) => key,
         // Never 400 here: a version refusal before an upgrade is 403 (final for the client).
-        Err(_) if !version_ok => {
+        None if !version_ok => {
             count(&hub, "nbs_ws_handshakes_refused_total", "reason", "version");
             return AppError::with_status(StatusCode::FORBIDDEN, codes::UNSUPPORTED_PROTOCOL, "this protocol version is not supported")
                 .with_details(version_details())
                 .into_response();
         }
-        Err(_) => {
-            let mut response =
-                AppError::with_status(StatusCode::UPGRADE_REQUIRED, codes::BAD_REQUEST, "this endpoint only accepts WebSocket upgrades").into_response();
-            response.headers_mut().insert(UPGRADE, HeaderValue::from_static("websocket"));
-            return response;
-        }
+        None => return upgrade_required(),
     };
     if hub.is_closing() {
         count(&hub, "nbs_ws_handshakes_refused_total", "reason", "shutting_down");
@@ -263,20 +297,39 @@ pub(crate) async fn endpoint(State(state): State<AppState>, request: Request) ->
             return rate_limited_response(BUSY_RETRY_SECS * 1000);
         }
     };
+    let Some(on_upgrade) = parts.extensions.remove::<OnUpgrade>() else { return upgrade_required() };
     let config = hub.config().clone();
     let max = config.max_message_bytes;
-    upgrade
+    let ws_config = WebSocketConfig::default()
         .read_buffer_size(config.read_buffer_bytes)
         .write_buffer_size(0)
         .max_write_buffer_size(max.saturating_add(WRITE_HEADROOM))
-        .max_message_size(max)
-        .max_frame_size(max)
-        .on_failed_upgrade(|error| tracing::debug!(%error, "WebSocket upgrade failed"))
-        .on_upgrade(move |socket| async move {
-            let (registered, handle) = hub.register(slot, ip, state.now());
-            let connection = Connection::new(state, hub, socket, registered, handle, ip, origin, request_id);
-            connection.run(start).await;
-        })
+        .max_message_size(Some(max))
+        .max_frame_size(Some(max));
+    tokio::spawn(async move {
+        let upgraded = match on_upgrade.await {
+            Ok(upgraded) => upgraded,
+            Err(error) => {
+                tracing::debug!(%error, "WebSocket upgrade failed");
+                return;
+            }
+        };
+        let diverted = Diverted::default();
+        let tap = AuthTap::new(TokioIo::new(upgraded), max, diverted.clone());
+        let socket = WebSocketStream::from_raw_socket(tap, Role::Server, Some(ws_config)).await;
+        let (registered, handle) = hub.register(slot, ip, state.now());
+        let connection = Connection::new(state, hub, socket, diverted, registered, handle, ip, origin, request_id);
+        connection.run(start).await;
+    });
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+    let headers = response.headers_mut();
+    headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
+    headers.insert(UPGRADE, HeaderValue::from_static("websocket"));
+    if let Ok(accept) = HeaderValue::from_str(&tungstenite::handshake::derive_accept_key(key.as_bytes())) {
+        headers.insert(SEC_WEBSOCKET_ACCEPT, accept);
+    }
+    response
 }
 
 /// A token bucket for the incoming frames of one socket.
@@ -343,7 +396,7 @@ fn client_error(error: AppError, kind: &str) -> ApiError {
 }
 
 /// Whether `text` is an `auth` frame (no `id`), however broken its data.
-fn is_auth_frame(text: &str) -> bool {
+pub(super) fn is_auth_frame(text: &str) -> bool {
     serde_json::from_str::<Value>(text)
         .ok()
         .and_then(|v| v.as_object().map(|o| !o.contains_key("id") && o.get("type").and_then(Value::as_str) == Some(net_backend_protocol::kinds::AUTH)))
@@ -351,17 +404,13 @@ fn is_auth_frame(text: &str) -> bool {
 }
 
 /// Whether a read error is a message over the size limit.
-fn is_too_big(error: &axum::Error) -> bool {
-    let typed = std::error::Error::source(error)
-        .and_then(|source| source.downcast_ref::<tungstenite::Error>())
-        .is_some_and(|e| matches!(e, tungstenite::Error::Capacity(_)));
-    // Fallback if axum's tungstenite ever differs from ours: its error text.
-    typed || error.to_string().starts_with("Space limit exceeded")
+fn is_too_big(error: &tungstenite::Error) -> bool {
+    matches!(error, tungstenite::Error::Capacity(_))
 }
 
-fn close_reason(reason: Cow<'static, str>) -> Utf8Bytes {
+fn close_reason(reason: Cow<'static, str>) -> WireText {
     match reason {
-        Cow::Borrowed(text) if text.len() <= MAX_CLOSE_REASON => Utf8Bytes::from_static(text),
+        Cow::Borrowed(text) if text.len() <= MAX_CLOSE_REASON => WireText::from_static(text),
         other => {
             let mut text = other.into_owned();
             if text.len() > MAX_CLOSE_REASON {
@@ -371,7 +420,7 @@ fn close_reason(reason: Cow<'static, str>) -> Utf8Bytes {
                 }
                 text.truncate(end);
             }
-            Utf8Bytes::from(text)
+            WireText::from(text)
         }
     }
 }
@@ -380,7 +429,9 @@ struct Connection {
     state: AppState,
     hub: Hub,
     id: ConnectionId,
-    socket: WebSocket,
+    socket: Socket,
+    /// The `auth` messages the tap took out of the socket's stream ([`MARKER`] stands for each).
+    diverted: Diverted,
     handle: ConnHandle,
     registered: Option<Registered>,
     auth: Option<AuthContext>,
@@ -404,7 +455,8 @@ impl Connection {
     fn new(
         state: AppState,
         hub: Hub,
-        socket: WebSocket,
+        socket: Socket,
+        diverted: Diverted,
         registered: Registered,
         handle: ConnHandle,
         ip: Option<IpAddr>,
@@ -419,6 +471,7 @@ impl Connection {
             state,
             hub,
             socket,
+            diverted,
             handle,
             registered: Some(registered),
             auth: None,
@@ -536,7 +589,7 @@ impl Connection {
                     // The socket was not read meanwhile: give the peer a fresh idle window.
                     self.last_seen = Instant::now();
                 }
-                message = self.socket.recv(), if !running => match message {
+                message = self.socket.next(), if !running => match message {
                     None => return,
                     Some(Err(error)) => {
                         if is_too_big(&error) {
@@ -606,7 +659,18 @@ impl Connection {
         }
     }
 
+    /// Send a frame from the outbox.
     async fn send_text(&mut self, text: Utf8Bytes) -> bool {
+        match WireText::try_from(Bytes::from(text)) {
+            Ok(text) => self.send_wire(text).await,
+            Err(_) => {
+                tracing::error!("an outgoing WebSocket frame is not UTF-8");
+                true
+            }
+        }
+    }
+
+    async fn send_wire(&mut self, text: WireText) -> bool {
         if self.hub.metrics() {
             metrics::counter!("nbs_ws_frames_out_total").increment(1);
         }
@@ -621,7 +685,7 @@ impl Connection {
                 return Flow::Go;
             }
         };
-        if self.send_text(Utf8Bytes::from(text)).await {
+        if self.send_wire(WireText::from(text)).await {
             Flow::Go
         } else {
             Flow::Stop
@@ -636,7 +700,7 @@ impl Connection {
         let code = super::hub::sendable(code);
         self.sent_close = Some(code);
         count(&self.hub, "nbs_ws_closes_total", "code", code.to_string());
-        let frame = CloseFrame { code: code.get(), reason: close_reason(reason) };
+        let frame = CloseFrame { code: WireCloseCode::from(code.get()), reason: close_reason(reason) };
         if !self.send(Message::Close(Some(frame))).await {
             return;
         }
@@ -646,7 +710,7 @@ impl Connection {
             tokio::time::sleep(LINGER_AFTER_ERROR).await;
         } else {
             let socket = &mut self.socket;
-            let _ = tokio::time::timeout(CLOSE_WAIT, async { while let Some(Ok(_)) = socket.recv().await {} }).await;
+            let _ = tokio::time::timeout(CLOSE_WAIT, async { while let Some(Ok(_)) = socket.next().await {} }).await;
         }
     }
 
@@ -668,8 +732,9 @@ impl Connection {
                 Err(None) => Flow::Stop,
             },
             Message::Pong(_) => Flow::Go,
-            // tungstenite answers the close; the next read ends the stream.
-            Message::Close(_) => Flow::Go,
+            // tungstenite answers the close; the next read ends the stream. (A raw frame is never
+            // read.)
+            Message::Close(_) | Message::Frame(_) => Flow::Go,
         }
     }
 
@@ -694,7 +759,15 @@ impl Connection {
         }
     }
 
-    async fn on_text(&mut self, text: Utf8Bytes) -> Flow {
+    async fn on_text(&mut self, wire: WireText) -> Flow {
+        // An `auth` message never passed through tungstenite: the tap took it out (`tap.rs`).
+        let diverted;
+        let text = if wire.as_str() == MARKER {
+            diverted = self.diverted.pop().unwrap_or_default();
+            diverted.as_str()
+        } else {
+            wire.as_str()
+        };
         if self.hub.metrics() {
             metrics::counter!("nbs_ws_frames_in_total").increment(1);
         }
@@ -702,21 +775,21 @@ impl Connection {
             Ok(()) => {}
             Err(None) => return Flow::Stop,
             // An `auth` is still answered (exactly one answer per `auth`); it was charged.
-            Err(Some(_)) if is_auth_frame(text.as_str()) => {}
+            Err(Some(_)) if is_auth_frame(text) => {}
             Err(Some(retry_after_ms)) => {
-                return match WsClientFrame::request_id(text.as_str()) {
+                return match WsClientFrame::request_id(text) {
                     Some(id) => self.answer(id, "", Err(AppError::rate_limited(retry_after_ms).api_error().clone())).await,
                     None => Flow::Go,
                 };
             }
         }
-        match WsClientFrame::parse(text.as_str()) {
+        match WsClientFrame::parse(text) {
             Ok(WsClientFrame::Auth(auth)) => self.on_auth(auth).await,
             Ok(WsClientFrame::Request(request)) => self.on_request(request).await,
             Ok(_) => Flow::Go,
             Err(error) => match error.answer() {
                 Some(answer) => self.send_frame(&answer).await,
-                None if is_auth_frame(text.as_str()) => {
+                None if is_auth_frame(text) => {
                     self.auth_failed(ApiError::new(codes::BAD_REQUEST, "the auth message is malformed"), CloseCode::UNAUTHORIZED).await
                 }
                 None => {
@@ -860,7 +933,7 @@ impl Connection {
             let error = WsResponseFrame::<Value>::error(id, ApiError::new(codes::PAYLOAD_TOO_LARGE, "the answer is too large"));
             return self.send_frame(&error).await;
         }
-        if self.send_text(Utf8Bytes::from(text)).await {
+        if self.send_wire(WireText::from(text)).await {
             Flow::Go
         } else {
             Flow::Stop

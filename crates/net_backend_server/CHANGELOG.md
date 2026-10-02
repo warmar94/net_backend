@@ -31,6 +31,8 @@ change or a key dependency bump).
 - The README and the API documentation describe what the crate has and does.
 - `log.format = "pretty"` writes colours only when the output is a terminal (`docker logs`, journald and
   files get plain text).
+- `/v1/ws` answers the WebSocket upgrade itself (the same checks and answers as before) and reads the
+  socket through a layer that takes every `auth` message out before tungstenite reads it.
 
 ### Fixed
 
@@ -53,6 +55,13 @@ change or a key dependency bump).
   that failed, the restore says that nothing was replaced and starts the server again; in Docker mode a
   `db` service that is not running is reported as such, Compose's progress lines stay out of the
   restore log, and `migrate` runs once (through `docker compose up`).
+
+### Security
+
+- The access token of a first-message `auth` no longer appears in tungstenite's TRACE `log` records
+  (`Received message …`, `received frame …`), which hold every frame and message the server receives:
+  tungstenite receives a stand-in text in place of each `auth` message. The README's WebSocket
+  section ("Logs") says what tungstenite still logs.
 
 ### Deployment files: what changes for a 0.1.0 Docker install
 

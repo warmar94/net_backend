@@ -601,6 +601,65 @@ mod transfers {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_file_cut_short_during_the_download_is_an_error_and_leaves_no_file() {
+        // 8 MiB at 15 ms per read on a server that answers one read at a time: about 2 s.
+        let setup = Setup::with(None, MockOptions { sftp_read_delay: Some(Duration::from_millis(15)), ..MockOptions::default() });
+        setup.mock.put_file_owned("cut.bin", content(8 * MIB));
+        let ssh = SshSession::connect(setup.target()).await.expect("connect");
+        let local = setup.dir.join("cut.bin");
+        let mut task = ssh.start_download_file("cut.bin", &local);
+        let first = tokio::time::timeout(WAIT, task.next_progress()).await.expect("progress").expect("a report");
+        assert!(first.done > 0 && first.done < 8 * MIB as u64, "{first:?}");
+        // The server's file is truncated midway (as `truncate -s` would).
+        setup.mock.put_file_owned("cut.bin", content(4 * MIB));
+        let error = tokio::time::timeout(WAIT, task.finish()).await.expect("result").expect_err("cut short");
+        assert!(
+            matches!(&error, Error::Ssh(why) if why.contains("changed size during the download") && why.contains(&format!("expected {} bytes", 8 * MIB)) && why.contains("received ")),
+            "{error:?}"
+        );
+        assert!(!local.exists(), "no final file");
+        until("the part file removed", || part_files(&setup.dir) == 0).await;
+        until("the handle closed", || setup.mock.stats().sftp_handles.load(Ordering::SeqCst) == 0).await;
+        // Into memory too.
+        setup.mock.put_file_owned("cut.bin", content(8 * MIB));
+        let mut task = ssh.start_download("cut.bin");
+        tokio::time::timeout(WAIT, task.next_progress()).await.expect("progress").expect("a report");
+        setup.mock.put_file_owned("cut.bin", content(MIB));
+        let error = tokio::time::timeout(WAIT, task.finish()).await.expect("result").expect_err("cut short");
+        assert!(matches!(&error, Error::Ssh(why) if why.contains("changed size during the download")), "{error:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_file_shorter_than_its_reported_size_is_an_error_and_size_0_or_none_reads_to_the_end() {
+        const SIZE: usize = 3 * MIB + 5;
+        // The server reports a larger size than the file has: the end comes too early.
+        let setup = Setup::with(None, MockOptions { sftp_fstat_size: Some(Some(5 * MIB as u64)), ..MockOptions::default() });
+        setup.mock.put_file_owned("short.bin", content(SIZE));
+        let ssh = SshSession::connect(setup.target()).await.expect("connect");
+        let local = setup.dir.join("short.bin");
+        let error = ssh.download_file("short.bin", &local).await.expect_err("shorter than reported");
+        let counts = format!("expected {} bytes, its size when it was opened; received {SIZE}", 5 * MIB);
+        assert!(matches!(&error, Error::Ssh(why) if why.contains("changed size during the download") && why.contains(&counts)), "{error:?}");
+        assert!(!local.exists(), "no final file");
+        until("the part file removed", || part_files(&setup.dir) == 0).await;
+        let error = ssh.download("short.bin").await.expect_err("shorter than reported");
+        assert!(matches!(&error, Error::Ssh(why) if why.contains(&counts)), "{error:?}");
+        until("every handle closed", || setup.mock.stats().sftp_handles.load(Ordering::SeqCst) == 0).await;
+        // A reported size of 0, or none (as some special files do): read to the end.
+        for reported in [Some(0), None] {
+            let setup = Setup::with(None, MockOptions { sftp_fstat_size: Some(reported), ..MockOptions::default() });
+            setup.mock.put_file_owned("special.bin", content(SIZE));
+            let ssh = SshSession::connect(setup.target()).await.expect("connect");
+            let data = ssh.download("special.bin").await.unwrap_or_else(|e| panic!("reported {reported:?}: {e}"));
+            assert!(same_as_content(data.as_slice(), SIZE), "reported {reported:?}: whole file in memory");
+            let local = setup.dir.join("special.bin");
+            assert_eq!(ssh.download_file("special.bin", &local).await.unwrap_or_else(|e| panic!("reported {reported:?}: {e}")), SIZE as u64);
+            assert!(same_as_content(std::fs::File::open(&local).expect("local"), SIZE), "reported {reported:?}: whole file on disk");
+            assert_eq!(part_files(&setup.dir), 0);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_server_error_midway_stops_the_download_and_closes_the_handle() {
         let setup = Setup::with(None, MockOptions { sftp_fail_reads_at: Some(3 * MIB as u64), ..MockOptions::default() });
         setup.mock.put_file_owned("broken.bin", content(8 * MIB));

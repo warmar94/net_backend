@@ -2654,6 +2654,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "lettre",
+ "log",
  "metrics",
  "metrics-exporter-prometheus",
  "net_backend_protocol",

@@ -105,6 +105,8 @@ pub struct MockOptions {
     pub sftp_fail_reads_at: Option<u64>,
     /// Every SFTP read waits this long first (a slow server).
     pub sftp_read_delay: Option<Duration>,
+    /// `fstat` reports this size instead of the real one (`Some(None)`: no size at all).
+    pub sftp_fstat_size: Option<Option<u64>>,
 }
 
 /// A running mock SSH server; stops when dropped.
@@ -166,7 +168,12 @@ impl MockSshServer {
             #[cfg(feature = "sftp")]
             files: Arc::clone(&files),
             #[cfg(feature = "sftp")]
-            sftp: sftp::Behaviour { short_reads: options.sftp_short_reads, fail_reads_at: options.sftp_fail_reads_at, read_delay: options.sftp_read_delay },
+            sftp: sftp::Behaviour {
+                short_reads: options.sftp_short_reads,
+                fail_reads_at: options.sftp_fail_reads_at,
+                read_delay: options.sftp_read_delay,
+                fstat_size: options.sftp_fstat_size,
+            },
             kick: Arc::clone(&kick),
             refuse_logins: Arc::clone(&refuse_logins),
             accepting: Arc::clone(&accepting),
@@ -700,6 +707,7 @@ mod sftp {
         pub short_reads: bool,
         pub fail_reads_at: Option<u64>,
         pub read_delay: Option<std::time::Duration>,
+        pub fstat_size: Option<Option<u64>>,
     }
 
     pub struct Session {
@@ -835,7 +843,11 @@ mod sftp {
             let Some(Open::File(path)) = self.handles.get(&handle) else { return Err(StatusCode::Failure) };
             let fs = self.fs.lock().unwrap_or_else(PoisonError::into_inner);
             let size = fs.files.get(path).map(Vec::len).ok_or(StatusCode::NoSuchFile)?;
-            Ok(Attrs { id, attrs: file_attrs(size) })
+            let mut attrs = file_attrs(size);
+            if let Some(reported) = self.behaviour.fstat_size {
+                attrs.size = reported;
+            }
+            Ok(Attrs { id, attrs })
         }
 
         async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {

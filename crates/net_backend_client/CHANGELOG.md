@@ -43,6 +43,13 @@ change or a key dependency bump).
 - SFTP: the remote file handle is closed after a cancelled, timed-out or failed transfer too, and
   a download's part file is removed after a cancel or timeout as well. Each SFTP request waits at
   most the operation timeout (`with_sftp_timeout`, at least 1 s).
+- WebSocket: a TLS or certificate error (`Error::Tls`) on a reconnect attempt now ends the
+  connection (`WsEvent::Closed` with the error); 0.1.0 kept retrying it with the backoff.
+  `Reconnect::with_tls_retry(true)` (new, default `false`) restores the retries.
+- SFTP: a download whose remote file ends before the size the server reported when it was opened
+  now fails with `Error::Ssh` ("… changed size during the download", with the expected and the
+  received byte counts) and leaves no local file; 0.1.0 returned the shorter data as a success. A
+  file that reports a size of 0, or none, is still read to its end.
 - `net_backend_protocol` 0.1.1 or newer.
 
 ### Security
