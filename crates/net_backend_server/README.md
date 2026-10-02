@@ -3,6 +3,7 @@
 <p>
   <a href="https://crates.io/crates/net_backend_server"><img alt="crates.io" src="https://img.shields.io/crates/v/net_backend_server.svg"></a>
   <a href="https://docs.rs/net_backend_server"><img alt="docs.rs" src="https://img.shields.io/docsrs/net_backend_server"></a>
+  <a href="https://net-backend.com"><img alt="Website: net-backend.com" src="https://img.shields.io/badge/website-net--backend.com-informational"></a>
   <a href="#license"><img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg"></a>
   <a href="https://github.com/warmar94/net_backend/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/warmar94/net_backend/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="Rust 1.95+" src="https://img.shields.io/badge/rust-1.95%2B-orange">
@@ -1339,3 +1340,5 @@ together with the protocol and the client. Issues and pull requests are welcome.
 `cargo fmt --all`, `cargo clippy -p net_backend_server --all-targets --all-features -- -D warnings`
 and `cargo test -p net_backend_server --no-default-features --features sqlite,storage,chat` before sending a
 change; changes to database code should also pass the MySQL / PostgreSQL suite.
+
+Website: [net-backend.com](https://net-backend.com) · Contact: [info@net-backend.com](mailto:info@net-backend.com)

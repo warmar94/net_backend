@@ -3,6 +3,7 @@
 <p>
   <a href="https://crates.io/crates/net_backend_client"><img alt="crates.io" src="https://img.shields.io/crates/v/net_backend_client.svg"></a>
   <a href="https://docs.rs/net_backend_client"><img alt="docs.rs" src="https://img.shields.io/docsrs/net_backend_client"></a>
+  <a href="https://net-backend.com"><img alt="Website: net-backend.com" src="https://img.shields.io/badge/website-net--backend.com-informational"></a>
   <a href="#license"><img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg"></a>
   <a href="https://github.com/warmar94/net_backend/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/warmar94/net_backend/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="Rust 1.95+" src="https://img.shields.io/badge/rust-1.95%2B-orange">
@@ -486,3 +487,5 @@ Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your 
 Issues and pull requests are welcome. Unless you explicitly state otherwise, any contribution
 intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license,
 shall be dual licensed as above, without any additional terms or conditions.
+
+Website: [net-backend.com](https://net-backend.com) · Contact: [info@net-backend.com](mailto:info@net-backend.com)

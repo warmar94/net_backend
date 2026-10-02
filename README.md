@@ -1,12 +1,15 @@
 # net_backend
 
 <p>
+  <a href="https://net-backend.com"><img alt="Website: net-backend.com" src="https://img.shields.io/badge/website-net--backend.com-informational"></a>
   <a href="#license"><img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg"></a>
   <a href="https://github.com/warmar94/net_backend/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/warmar94/net_backend/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="Rust 1.95+" src="https://img.shields.io/badge/rust-1.95%2B-orange">
 </p>
 
 **Build your own game backend in Rust: server, protocol and client.**
+
+Website: [net-backend.com](https://net-backend.com) · Contact: [info@net-backend.com](mailto:info@net-backend.com)
 
 `net_backend` is a family of Rust crates for game backends: a framework you build your own server
 with, the shared message types both sides speak, and a small Rust client. The server speaks
@@ -88,3 +91,5 @@ Issues and pull requests are welcome. Please run `cargo fmt --all`, `cargo clipp
 opening a pull request. Unless you explicitly state otherwise, any contribution intentionally
 submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual
 licensed as above, without any additional terms or conditions.
+
+Website: [net-backend.com](https://net-backend.com) · Contact: [info@net-backend.com](mailto:info@net-backend.com)
