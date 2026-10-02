@@ -178,8 +178,6 @@ impl<S: Send + Sync> FromRequestParts<S> for MaybeAuth {
 }
 
 /// Decides who is calling, from the request head (headers, URI). Never reads the body.
-///
-/// Methods added later always come with a default implementation.
 pub trait Authenticator: Send + Sync + 'static {
     /// `Ok(Some(..))`: authenticated; `Ok(None)`: not this authenticator's credentials (anonymous
     /// unless a later one knows them); `Err(..)`: invalid credentials of this authenticator (the

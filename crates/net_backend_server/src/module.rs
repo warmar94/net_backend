@@ -10,8 +10,8 @@
 //! are assembled. Command-line commands ([`commands`](Module::commands)) are collected before the
 //! command line is parsed.
 //!
-//! **Compatibility promise:** methods added to [`Module`] later (e.g. permissions) always come
-//! with a default implementation, so a module written today keeps compiling.
+//! **Defaults:** only [`name`](Module::name) is required; every other method has a default
+//! implementation.
 
 use std::sync::Arc;
 
@@ -36,9 +36,9 @@ pub const RESERVED_MODULE_NAMES: &[&str] = &["app", "core", "nbs"];
 /// The longest module name, in bytes.
 pub const MAX_MODULE_NAME_BYTES: usize = 32;
 
-/// A pluggable part of the server (chat, storage, leaderboards, a game's own subsystem).
+/// A pluggable part of the server (chat, storage, a game's own subsystem).
 ///
-/// Only [`name`](Module::name) is required. Methods added later always have a default
+/// Only [`name`](Module::name) is required; every other method has a default
 /// implementation.
 ///
 /// ```

@@ -4,7 +4,7 @@ A load generator for servers built with
 [`net_backend_server`](https://github.com/warmar94/net_backend/tree/main/crates/net_backend_server) (the
 reference server, or your own with the `Auth`, `Storage` and `Chat` modules). It speaks the protocol over
 HTTP(S) and WS(S) with the protocol crate's own types, so a run measures the whole path: TLS, the reverse
-proxy, the server and the database. Not published; build it from the repository:
+proxy, the server and the database. Build it from the repository:
 
 ```text
 cargo build --release --locked -p load_test        # target/release/load_test

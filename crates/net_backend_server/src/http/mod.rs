@@ -11,8 +11,8 @@
 //!
 //! Core routes: `GET /healthz`, `GET /readyz`, `GET /v1/info`, `GET /v1/openapi.json`
 //! (`openapi.enabled`), `GET /v1/docs` (`openapi.ui`), and the
-//! reserved `GET /v1/ws` (403 until the WebSocket hub arrives in the next sub-phase; never 400,
-//! which the client would retry forever). `GET /metrics` (`metrics.enabled`) is served on its own
+//! WebSocket hub `GET /v1/ws` (403 with `ws.enabled = false`; never 400, which the client would
+//! retry forever). `GET /metrics` (`metrics.enabled`) is served on its own
 //! listener (`metrics.bind`), never on the API port.
 
 pub mod call;

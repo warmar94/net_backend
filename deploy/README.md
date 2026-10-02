@@ -235,7 +235,7 @@ module's own section, so a typo under `[modules.chat]` fails here, not at the ne
   migration re-checks its tracking row).
 - `migrate status` lists every migration (`applied`, `pending`, `MODIFIED`, `missing`).
   **MySQL commits DDL statement by statement:** a failing MySQL migration names exactly which of its
-  statements already took effect and how to recover. There is no "down" migration: to go back, restore the
+  statements already took effect and how to recover. Migrations run forward: to go back, restore the
   backup taken before the deploy.
 - **Owning a module's tables:** `sudo net-backend-cli migrations publish chat` copies the module's SQL into
   `/etc/net-backend/migrations/chat/<dialect>/`; from then on those files are used. Edit them only before
@@ -324,8 +324,7 @@ The limits to set together:
   (`ws.max_connections_per_ip`; IPv6 counted by /64), 60 WebSocket handshakes per address per minute.
 
 **Per-instance state:** one server process holds the WebSocket rooms, chat presence, and every rate limit
-and login counter in memory. Run one instance per database; several instances need a shared pub/sub
-`Broadcaster` and accept that rooms, presence and rates stay per instance.
+and login counter in memory; the deployment runs one instance per database.
 
 **Load testing your machine** with [`load_test`](https://github.com/warmar94/net_backend/tree/main/crates/load_test)
 (from a second machine, or from the same one for a first look): it creates accounts, opens sockets, runs

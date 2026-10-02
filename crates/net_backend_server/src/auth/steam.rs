@@ -71,8 +71,6 @@ pub enum SteamError {
 }
 
 /// Checks a Steam Web API ticket.
-///
-/// Methods added later always come with a default implementation.
 pub trait SteamVerifier: Send + Sync + 'static {
     /// Check `ticket_hex` (validated hex) for `identity`.
     fn verify<'a>(&'a self, ticket_hex: &'a str, identity: &'a str) -> BoxFuture<'a, Result<SteamIdentity, SteamError>>;

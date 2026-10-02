@@ -22,7 +22,7 @@ Your client (Rust)                          Your server (Rust binary)
 │        │                    │             │        │                      │
 │ HTTP + WebSocket client ────┼─ HTTP / WS ▶│ net_backend_server            │
 │  · Rust: net_backend_client │             │  core: auth, sessions, WS hub │
-│  · Bevy: bevy_net_backend   │             │  modules: chat, leaderboards… │
+│  · Bevy: bevy_net_backend   │             │  modules: storage, chat       │
 │  · Other: any HTTP/WS lib   │             └───────────────────────────────┘
 └─────────────────────────────┘                                ▲
            ▲                                                   │
@@ -36,7 +36,7 @@ Not Rust? Use the HTTP / WebSocket API directly (see API.md).
 | Crate | What | Version |
 |---|---|---|
 | [`net_backend_server`](crates/net_backend_server/README.md) | The game-backend framework: tokio + axum, modules with hooks, accounts and sessions, a WebSocket hub, storage (saves) and chat, MySQL / PostgreSQL / SQLite, migrations, OpenAPI + AsyncAPI. A library you build your own server binary with. | 0.1.0 · [crates.io](https://crates.io/crates/net_backend_server) · [docs](https://docs.rs/net_backend_server) |
-| [`net_backend_protocol`](crates/net_backend_protocol/README.md) | The shared message types: plain Rust + serde, no networking, no async runtime, no engine. Used by the server and by Rust clients. | 0.1.0 · [crates.io](https://crates.io/crates/net_backend_protocol) · [docs](https://docs.rs/net_backend_protocol) |
+| [`net_backend_protocol`](crates/net_backend_protocol/README.md) | The shared message types: plain Rust + serde data types and pure helpers. Used by the server and by Rust clients. | 0.1.0 · [crates.io](https://crates.io/crates/net_backend_protocol) · [docs](https://docs.rs/net_backend_protocol) |
 | [`net_backend_client`](crates/net_backend_client/README.md) | A small Rust client for apps that do not use Bevy, built on the protocol. | 0.1.0 · [crates.io](https://crates.io/crates/net_backend_client) · [docs](https://docs.rs/net_backend_client) |
 
 Each crate has its own version, changelog and README (the full manual).

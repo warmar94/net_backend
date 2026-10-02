@@ -11,8 +11,7 @@
 //! built-in command. Arguments arrive unparsed; [`CommandArgs::parse`] covers the usual shape
 //! (positionals, `--flag`, `--name value` / `--name=value`) and refuses unknown options.
 //!
-//! **Compatibility promise:** methods added to [`AppCommand`] later always come with a default
-//! implementation.
+//! **Defaults:** `name`, `about` and `run` are required; `usage` has a default implementation.
 //!
 //! ```
 //! use net_backend_server::command::{AppCommand, CommandArgs, CommandCtx};

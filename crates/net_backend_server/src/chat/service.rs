@@ -442,7 +442,7 @@ impl ChatService {
 
     /// Who is online in `room` (the caller must have joined it on this connection). A DM room
     /// lists only the caller: the peer's online state is never revealed through a DM (anyone may
-    /// open a DM with anyone; "is my friend online" belongs to a friends module).
+    /// open a DM with anyone).
     pub(crate) async fn members(&self, state: &AppState, connection: Option<ConnectionId>, user: UserId, room: RoomId) -> Result<RoomMembers, AppError> {
         let row = self.room_row(state, room).await?;
         if row.kind == KIND_DM {

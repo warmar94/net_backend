@@ -63,8 +63,6 @@ pub const AUTH_TIMEOUT_SECS: u64 = 5;
 /// A WebSocket request kind with its answer type: implemented by every request of this crate
 /// (e.g. [`SendMessage`](crate::chat::SendMessage) → [`SendAck`](crate::chat::SendAck)), so a
 /// server can route by [`KIND`](WsCall::KIND) and a client knows what comes back.
-///
-/// Methods added later always come with a default implementation.
 pub trait WsCall: Serialize + DeserializeOwned {
     /// The answer's `data`.
     type Response: Serialize + DeserializeOwned;
@@ -74,8 +72,6 @@ pub trait WsCall: Serialize + DeserializeOwned {
 
 /// A server push kind: implemented by every push of this crate (e.g.
 /// [`ChatMessage`](crate::chat::ChatMessage) for `chat.message`).
-///
-/// Methods added later always come with a default implementation.
 pub trait ServerPush: Serialize + DeserializeOwned {
     /// The `type` on the wire (one of [`kinds`]).
     const KIND: &'static str;

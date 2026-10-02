@@ -84,9 +84,6 @@ impl RateDecision {
 
 /// Decides whether a request may proceed. Must be fast and non-blocking (a token bucket in
 /// memory, e.g. [`MemoryRateLimiter`]).
-///
-/// Methods added later always come with a default implementation (an asynchronous check, if one
-/// is ever added, will default to calling [`check`](RateLimiter::check)).
 pub trait RateLimiter: Send + Sync + 'static {
     /// Check (and count) one request at one stage.
     fn check(&self, key: &RateLimitKey) -> RateDecision;

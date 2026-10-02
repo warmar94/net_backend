@@ -31,7 +31,6 @@ features as Bevy plugins.
 - [SSH and SFTP (`ssh`, `sftp`)](#ssh-and-sftp-ssh-sftp)
 - [How it works](#how-it-works)
 - [Defaults and limits](#defaults-and-limits)
-- [What it does not do](#what-it-does-not-do)
 - [Clients](#clients)
 - [Compatibility](#compatibility)
 - [Testing](#testing)
@@ -70,7 +69,7 @@ features as Bevy plugins.
 | `ssh-rsa` | also accept old RSA host keys and RSA key files (opt-in) |
 
 - One async core on tokio, plus a blocking interface for game loops and simple programs.
-- TLS with rustls + ring; no OpenSSL, no aws-lc.
+- TLS with rustls + ring.
 - A small footprint: HTTP and the WebSocket use the same crates as the server (hyper, rustls with
   ring, tungstenite), so an app that also runs the server adds no new crate for them.
 
@@ -83,9 +82,9 @@ opt-in.
 [dependencies]
 net_backend_client = { version = "0.1.0" }
 # or with the WebSocket:
-net_backend_client = { version = "0.1.0", features = ["ws"] }
+# net_backend_client = { version = "0.1.0", features = ["ws"] }
 # an admin tool with SSH and SFTP:
-net_backend_client = { version = "0.1.0", features = ["ws", "sftp"] }
+# net_backend_client = { version = "0.1.0", features = ["ws", "sftp"] }
 ```
 
 The protocol's types are re-exported as `net_backend_client::protocol`, so the versions always
@@ -312,8 +311,8 @@ loop {
 | 4003 (banned), 4009 (replaced: another device or window took over), 4010 (unsupported protocol), any other 4000–4099 | closed for good, no reconnect (`Error::Closed { code, .. }`) |
 | handshake 401 after its one refresh, 403 | closed for good (`Error::Api`) |
 
-The client does not rejoin chat rooms for you after a reconnect (it cannot know which rooms still
-matter): do it on `WsEvent::Connected { reconnected: true }`, as above.
+Your app rejoins its chat rooms after a reconnect (it knows which rooms still matter): do it on
+`WsEvent::Connected { reconnected: true }`, as above.
 
 From a game loop (blocking interface): `blocking_client.connect_ws(settings)` blocks until
 connected; then `ws.request(..)` returns a `Reply` (`try_take()`), and streams have `try_next()`.
@@ -369,7 +368,7 @@ ssh.close().await;
   complete), `list_dir`, `create_dir`, `remove_file`, `remove_dir`, `rename`. Names in a listing
   come from the server: use `entry.safe_file_name()` before turning one into a local path.
 - **Blocking:** `net_backend_client::blocking::SshSession` has the same methods, blocking.
-- A lost SSH connection is not reconnected: connect again.
+- After a lost SSH connection, connect again.
 
 ## How it works
 
@@ -380,14 +379,16 @@ ssh.close().await;
 - **One deadline per call:** waiting for a token refresh, connecting, sending and reading the
   whole answer together (15 s by default).
 - Every HTTP request carries `x-net-backend-protocol: 1` (the WebSocket handshake too); the access
-  token goes in `Authorization: Bearer`, never in a URL. Redirects are never followed. The client
-  never asks for compression, so nothing is decompressed.
+  token goes in `Authorization: Bearer`, never in a URL. Redirects are never followed. Answers come
+  uncompressed (the client asks for no compression).
 - **The blocking interface** runs the same core on one private thread (`net-backend-client`) with
   a current-thread runtime.
 - **The WebSocket** is owned by one background task per connection: it is the only thing that
   answers requests, so every request gets exactly one answer even when the link dies.
 - Nothing panics on bad input or from the wrong place: an async call outside tokio answers `InvalidRequest`;
   blocking calls work from any thread but the client's own.
+- One async `Client` belongs to one tokio runtime (its pooled connections belong to the runtime
+  that opened them).
 
 ## Defaults and limits
 
@@ -411,18 +412,6 @@ ssh.close().await;
 | SSH keepalive | every 15 s, lost after 3 unanswered | `with_keepalive` |
 | SFTP operation time / transfer size | 5 min / 256 MiB | `with_sftp_timeout` / `with_max_transfer_bytes` |
 
-## What it does not do
-
-- No HTTP or system proxy support, no HTTP/2, no WASM / browser target.
-- Only Mozilla's root certificates (webpki-roots), not the operating system's store.
-- WebSocket requests are never resent after a lost link (they may have run): your app decides.
-- Chat rooms are not rejoined automatically after a reconnect (see above).
-- Tokens are handed to your app to store (`token_updates()`); there is no built-in token file.
-- SSH: no automatic reconnect, no SFTP progress reports, no host certificates, no
-  `ProxyJump` / `ProxyCommand`.
-- Use one async `Client` within one tokio runtime (its pooled connections belong to the runtime
-  that opened them).
-
 ## Clients
 
 | Your client is… | Use |
@@ -435,7 +424,7 @@ ssh.close().await;
 
 | `net_backend_client` | `net_backend_protocol` | `net_backend_server` | Rust | tokio |
 |---|---|---|---|---|
-| 0.1.0 | 0.1.0 (protocol version 1) | 0.1.x | 1.95+ | 1.x |
+| 0.1.0 | 0.1.0 (protocol version 1) | 0.1.0 | 1.95+ | 1.x |
 
 ## Testing
 

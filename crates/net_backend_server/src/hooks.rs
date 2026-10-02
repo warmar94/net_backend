@@ -62,8 +62,6 @@ use crate::http::RequestId;
 use crate::state::AppState;
 
 /// An event that hooks can observe. `NAME` names it in logs (`"chat.before_send"`).
-///
-/// Methods added later always come with a default implementation.
 pub trait Event: Send + Sync + 'static {
     /// The event's name for logs.
     const NAME: &'static str;

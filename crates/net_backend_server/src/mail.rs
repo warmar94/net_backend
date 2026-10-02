@@ -52,8 +52,6 @@ pub fn mask_address(address: &str) -> String {
 pub struct MailError(pub String);
 
 /// Sends mail. Implement it for an HTTP mail API (Postmark, SES, …) if SMTP does not fit.
-///
-/// Methods added later always come with a default implementation.
 pub trait Mailer: Send + Sync + 'static {
     /// Send one mail.
     fn send<'a>(&'a self, mail: &'a Mail) -> BoxFuture<'a, Result<(), MailError>>;

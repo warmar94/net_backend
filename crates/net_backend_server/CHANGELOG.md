@@ -82,7 +82,7 @@ change or a key dependency bump).
   (8 KiB read buffer, no write buffering; ~15 KiB heap per idle socket measured), hooks
   (`ws::events`: `BeforeWsConnect`, `AfterWsConnect`, `AfterWsDisconnect`, `BeforeWsFrame`), close
   1001 for every socket on shutdown within the grace period, metrics (`nbs_ws_*`), the `Broadcaster`
-  seam (`LocalBroadcaster`) for several instances later.
+  seam (`LocalBroadcaster`) for several instances.
 - WebSocket hub hardening (review and live-test round): request handlers run while the socket keeps writing
   pushes (only a handler's pushes to its own socket wait for its answer); pushes over `ws.max_message_bytes` are
   refused (`PushError::TooLarge`); a revocation or ban landing while a socket authenticates is applied; a temporary
@@ -184,7 +184,7 @@ change or a key dependency bump).
   `migrate`, `migration_status`, `serve`, `serve_with_shutdown`), `run` / `run_with_args` /
   `run_with_output` (the command line).
 - The `Module` trait (name, migrations per dialect, routes, OpenAPI parts, hooks, `start`,
-  `shutdown`; later methods always get defaults), module name rules, deterministic registration
+  `shutdown`; every method but the name has a default), module name rules, deterministic registration
   order.
 - Hooks: typed `before` (continue, modify, reject) and `after` hooks per `Event` type, start and
   shutdown hooks, a time limit per call (503 `hook_timeout`), contained panics.

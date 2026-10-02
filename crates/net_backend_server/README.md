@@ -25,7 +25,7 @@ Your client (Rust)                          Your server (Rust binary)
 │        │                    │             │        │                      │
 │ HTTP + WebSocket client ────┼─ HTTP / WS ▶│ net_backend_server            │
 │  · Rust: net_backend_client │             │  core: auth, sessions, WS hub │
-│  · Bevy: bevy_net_backend   │             │  modules: chat, leaderboards… │
+│  · Bevy: bevy_net_backend   │             │  modules: storage, chat       │
 │  · Other: any HTTP/WS lib   │             └───────────────────────────────┘
 └─────────────────────────────┘                                ▲
            ▲                                                   │
@@ -48,7 +48,7 @@ The server does not care which client connects; the JSON on the wire is the cont
 ## Contents
 
 - [Clients](#clients)
-- [What works today](#what-works-today)
+- [What it includes](#what-it-includes)
 - [Features](#features)
 - [Install](#install)
 - [Quick start](#quick-start)
@@ -67,15 +67,14 @@ The server does not care which client connects; the JSON on the wire is the cont
 - [OpenAPI, health and metrics](#openapi-health-and-metrics)
 - [Graceful shutdown](#graceful-shutdown)
 - [Deployment](#deployment)
-- [Roadmap](#roadmap)
-- [Limits](#limits)
+- [How it works](#how-it-works)
 - [Compatibility](#compatibility)
 - [Testing](#testing)
 - [FAQ](#faq)
 - [License](#license)
 - [Contributing](#contributing)
 
-## What works today
+## What it includes
 
 | Part | What |
 |---|---|
@@ -110,18 +109,28 @@ The server does not care which client connects; the JSON on the wire is the cont
 
 The backends are additive: any combination compiles, and the server uses the one its
 `database.url` names. At least one is needed to run a server; without any, starting fails with a
-clear message. No OpenSSL, no aws-lc. Modules are features and off by default: a server compiles
+clear message. TLS is rustls with ring throughout. Modules are features and off by default: a server compiles
 only what it registers (`features = ["mysql", "storage", "chat"]`).
 
 ## Install
 
-Not on crates.io yet. Once published:
+Pick ONE of the first two lines (the database), then add tokio and serde:
+
+```text
+cargo add net_backend_server                                                  # MySQL (the default)
+cargo add net_backend_server --no-default-features --features sqlite          # or SQLite (postgres: --features postgres)
+cargo add tokio --features rt-multi-thread,macros
+cargo add serde --features derive                                             # for your own request types
+```
+
+The same in `Cargo.toml`:
 
 ```toml
 [dependencies]
 net_backend_server = { version = "0.1.0" }                                   # MySQL
 # net_backend_server = { version = "0.1.0", default-features = false, features = ["sqlite"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+serde = { version = "1", features = ["derive"] }
 ```
 
 The framework re-exports `axum`, `sea_query`, `sqlx`, `utoipa`, `utoipa_axum` and the protocol
@@ -162,8 +171,16 @@ async fn main() -> Result<(), net_backend_server::Error> {
 ```
 
 ```text
-NBS__DATABASE__URL=sqlite::memory: cargo run       # with the `sqlite` feature
+NBS__DATABASE__URL=sqlite::memory: cargo run       # with the `sqlite` feature (Linux / macOS shells)
 curl http://127.0.0.1:8080/v1/info                 # {"protocol":1,"min_protocol":1,"modules":[]}
+```
+
+On Windows (PowerShell):
+
+```text
+$env:NBS__DATABASE__URL = "sqlite::memory:"
+cargo run
+curl.exe http://127.0.0.1:8080/v1/info
 ```
 
 A complete headless example: [`examples/minimal.rs`](examples/minimal.rs).
@@ -263,7 +280,7 @@ section with `config.module_config::<T>("auth")`; module config structs should u
 ## Modules and hooks
 
 A module bundles routes, migrations, hooks and OpenAPI parts under a name, like a service
-provider. Only `name` is required; methods added to the trait later always come with a default.
+provider. Only `name` is required; every other method has a default.
 
 ```rust,no_run
 use net_backend_server::axum::routing::get;
@@ -524,19 +541,19 @@ code 4003 for a ban, else 4001).
 ### Security notes
 
 - Registration answers 409 `email_taken` for a known address: a deliberate trade-off of the
-  protocol (a game needs a clear sign-up answer), bounded by the registration rate limit; an
-  enumeration-safe registration mode arrives in 0.2. The password is hashed either way, but a
-  successful registration does more database work than a refused one, so the timing differs too.
+  protocol (a game needs a clear sign-up answer), bounded by the registration rate limit. The
+  password is hashed either way, but a successful registration does more database work than a
+  refused one, so the timing differs too.
   Login, password reset and the failed-login limits do not reveal whether an address has an
   account.
 - The rate limits, the failed-login counters, the known networks and the used Steam tickets live
-  in memory (bounded): they reset when the server restarts and are not shared between several
-  server processes. Under heavy key churn the oldest entries are dropped first.
+  in memory (bounded), per server process: they reset when the server restarts. Under heavy key
+  churn the oldest entries are dropped first.
 - Bearer tokens only (no cookies), so CSRF does not apply. Tokens never appear in logs (the
   request log has the path without the query string), in `Debug` output or in error answers.
 - The email address is not proven until it is verified; `login_requires_verified_email` enforces
-  it. Email addresses are compared in NFC and lower-cased (internationalised domains are not
-  converted to punycode, so `bücher.de` and `xn--bcher-kva.de` count as different addresses).
+  it. Email addresses are compared in NFC and lower-cased, with internationalised domains as
+  written (`bücher.de` and `xn--bcher-kva.de` count as different addresses).
 - Every setting is in `[modules.auth]` (see `AuthConfig`); secrets also come as `*_file`.
 
 ## WebSocket
@@ -618,8 +635,8 @@ than `ws.request_timeout_secs`), `internal` (never with details), plus whatever 
 | 4009 | replaced: the user opened more than `ws.max_connections_per_user` sockets (the oldest of the same session goes first, then the oldest overall) | no |
 | 4010 | the client's protocol version is not supported | no |
 
-The client crate never reconnects after 4000–4099; the server uses that range only for "do not
-come back".
+`net_backend_client` and `bevy_net_backend` never reconnect after 4000–4099; the server uses that
+range only for "do not come back".
 
 ### Handlers
 
@@ -749,7 +766,7 @@ pushes that handler makes to its own socket wait for its answer (up to `outbox_f
   that authenticates with cookies must check it), `AfterWsConnect` (in its own task),
   `AfterWsDisconnect` (with the rooms it left; not for sockets dropped when the shutdown grace ran
   out), `BeforeWsFrame` (change a request's `data` or refuse it; its `kind` is read-only).
-- **Presence** (who is in a room) is not the hub's job: the [chat](#chat) module builds it on these hooks.
+- **Presence** (who is in a room) comes from the [chat](#chat) module, built on these hooks.
 - **Several instances:** pushes to users, rooms and everyone go through a `Broadcaster`
   (`.broadcaster(..)`); the default `LocalBroadcaster` delivers in this process. A pub/sub
   implementation publishes each `Delivery` (serde-serializable) AS A WHOLE to every instance, which
@@ -876,8 +893,8 @@ async fn start(config: Config) -> Result<(), net_backend_server::Error> {
   for their owner (403); the server keeps writing them (`StorageService::put`).
 - **Server-owned collections:** `server_collections` (default `["server"]`; an entry `x` covers
   `x` and `x.*`) are written only by server code and admins: the owner reads objects there but can
-  never create, change or delete one (403), so a player cannot pre-create a key the server will
-  own (`wallet/gold`: add `"wallet"`). New objects there are server-locked.
+  never create, change or delete one (403), so a player cannot pre-create a key meant for the
+  server (`wallet/gold`: add `"wallet"`). New objects there are server-locked.
 - **Limits:** `max_object_bytes` (256 KiB of JSON per value; at most 4 MiB), `max_objects_per_user`
   (1000) and `max_bytes_per_user` (4 MiB of values; a write that does not grow an object always
   passes) — both 403 `quota_exceeded`, exact under concurrent writes, binding the owner's writes
@@ -1016,16 +1033,15 @@ async fn top(db: &Db) -> Result<Vec<Score>, DbError> {
   MySQL tables use `utf8mb4` with the binary collation `utf8mb4_bin`, so comparisons and unique
   indexes are case-sensitive as on PostgreSQL and SQLite (`Sword` ≠ `sword`); the one remaining
   difference is that MySQL ignores trailing spaces in comparisons — normalise values in code (trim,
-  lower-case emails). No native timestamp, JSON or enum types in framework tables.
+  lower-case emails). Framework tables use only these portable types.
 - `SUM()` over a `BIGINT` is `DECIMAL` / `NUMERIC` on MySQL and PostgreSQL: cast it
   (`CAST(SUM(x) AS SIGNED)` / `::BIGINT`) before decoding into `i64`.
 - **TLS to a remote database:** sqlx's default is "prefer TLS, do not verify". Use
   `ssl-mode=VERIFY_IDENTITY` (MySQL) / `sslmode=verify-full` (PostgreSQL) in the URL for a
-  database on another machine; the system's root certificates are not used (webpki roots).
+  database on another machine; certificates are checked against the webpki roots.
 - **One database, plain sqlx:** an app with one backend can use its pool directly (`db.mysql()`,
-  `db.postgres()`, `db.sqlite()`), including sqlx's compile-checked `query!` macros. The framework
-  itself cannot use them (three dialects in one crate); every framework query runs in CI against
-  all three databases instead.
+  `db.postgres()`, `db.sqlite()`), including sqlx's compile-checked `query!` macros. The framework's
+  own queries cover three dialects in one crate and run in CI against all three databases.
 - SQLite: `sqlite::memory:` keeps exactly one connection (each connection would be its own empty
   database); file databases use WAL mode (switched once at connect, so several processes can open a new file
   at the same time) and a 5 s busy timeout. SQLite allows one writer at a
@@ -1054,8 +1070,8 @@ Plain SQL per dialect, in files you can read and change.
   leading comment lines: `-- nbs:no-transaction` runs a migration without a transaction (e.g.
   PostgreSQL's `CREATE INDEX CONCURRENTLY`); `-- nbs:single-statement` sends a MySQL file as one
   statement (a trigger, procedure or event with a `BEGIN … END` body); inside a file,
-  `-- nbs:statement-begin` / `-- nbs:statement-end` lines mark one such block. `DELIMITER` is a
-  client command and is not supported.
+  `-- nbs:statement-begin` / `-- nbs:statement-end` lines mark one such block (they take the place
+  of the client command `DELIMITER`).
 - **Concurrent runs** (two servers starting with `migrate_on_start`, a deploy racing a start):
   MySQL takes `GET_LOCK` with a name per database, PostgreSQL an advisory lock (per database);
   both wait at most `database.migrate_lock_timeout_secs` (60 s), then fail with a message naming
@@ -1126,8 +1142,8 @@ machine).
   credentials) and request id; the answer logged at `info`.
 - **Timeouts:** `http.request_timeout_secs` (default 30), then 503 `unavailable`.
 - **Panics** in handlers answer 500 `internal` without details; the server keeps running.
-- **CORS** is off unless `cors.allowed_origins` is set. **Compression** is not built in (put it
-  in the reverse proxy if wanted).
+- **CORS** is off unless `cors.allowed_origins` is set. **Compression**, when wanted, is done by
+  the reverse proxy.
 - **Authentication:** authenticators (the app's, then the modules', e.g. the `Auth` module's
   Bearer check) decide who is calling; handlers take `AuthContext` (401 without one, or the
   authenticator's own error such as `token_expired`), `Option<AuthContext>` (a refused credential
@@ -1224,41 +1240,22 @@ measured on a 2 vCPU machine, the limits to raise together (open files, `ws.max_
 cargo build --release --locked -p net_backend_server --example server --no-default-features --features mysql,storage,chat,smtp
 ```
 
-## Roadmap
+## How it works
 
-0.1.0 contains:
-
-| Part | What |
-|---|---|
-| core | the builder, modules, databases, migrations, HTTP, OpenAPI, command line |
-| accounts | the `Auth` module, rate limits, trusted proxies, app commands |
-| WebSocket | the hub: the client's envelope, handlers, pushes, rooms, bounded outboxes, close codes, revocation closes, AsyncAPI |
-| modules | storage (saves) and chat (with presence); typed routes from the protocol's `HttpCall` |
-| deployment | Docker Compose or systemd, Caddy, backups, a measured load test |
-
-Next versions: OAuth providers, notifications, friends, leaderboards, groups, lobbies, an
-optional SeaORM layer, multi-instance pub/sub, payment connectors.
-
-## Limits
-
-- No OAuth providers yet (Steam and email only).
-- WebSocket rooms, users and connections are per instance; only pushes can travel between
-  instances (through a `Broadcaster`; the built-in one is in process). No permessage-deflate.
-  Sockets waiting for their first-message `auth` count against `ws.max_connections` for up to
-  `ws.auth_timeout_secs`.
+- Logins: email + password and Steam.
+- Each server process holds its own WebSocket rooms, users and connections; pushes travel through the
+  `Broadcaster` (the built-in one delivers in this process). Sockets waiting for their
+  first-message `auth` count against `ws.max_connections` for up to `ws.auth_timeout_secs`.
 - Rate limits, the failed-login counters, chat presence and the chat send rate are in memory, per
   process.
-- Storage values are JSON (binary data as a string in JSON); no file storage yet. No public
-  (other users') storage objects.
-- Chat: no read receipts, typing indicators or message editing; presence is per room and per
-  instance; no online status for DM peers (a friends module will offer it); no client-created
-  rooms (server code creates rooms and groups).
+- Storage values are JSON (binary data as a string in JSON); every object belongs to one user and
+  is read through that user's routes, server code or the admin routes.
+- Chat: presence is per room and per instance; server code creates public rooms and groups,
+  players open DM rooms.
 - Revocations from other processes reach this process's subscribers by a database poll
-  (`revocation_poll_secs`, 5 s), not instantly.
-- No compile-checked SQL inside the framework (three dialects); the CI matrix runs every query on
-  all three databases.
-- One process; multi-instance deployments arrive with the pub/sub seam.
-- No response compression and no TLS in the process: terminate TLS in the reverse proxy.
+  (`revocation_poll_secs`, 5 s).
+- The framework's queries run in CI on all three databases.
+- TLS is terminated by the reverse proxy (Caddy), which also compresses answers when configured to.
 - Capacity depends on the machine: the [deployment guide](https://github.com/warmar94/net_backend/tree/main/deploy#capacity-limits-and-load-testing) lists the numbers measured on a 2 vCPU machine and the `load_test` tool measures yours.
 
 ## Compatibility
@@ -1321,8 +1318,8 @@ the external-database job, the end-to-end client job, the dependency rules and t
 **Why not `sqlx::AnyPool`?** It supports few types, and its `?` placeholders break on PostgreSQL.
 One enum over the three real pools plus sea-query keeps every type and every dialect correct.
 
-**Can I use SeaORM / Diesel?** Your own code can use anything on top of the same database. An
-optional SeaORM layer reusing the framework's pool arrives in a later version; Diesel is not supported.
+**Can I use SeaORM / Diesel?** Your own code can use any database library on top of the same
+database.
 
 **Why plain SQL migrations?** So you can read, review and change them, per database, and own a
 module's tables once you publish them.

@@ -9,7 +9,7 @@ change or a key dependency bump).
 
 ### Added
 
-- `envelope`: the WebSocket frames compatible with `bevy_net_backend` 0.1's `JsonEnvelope`:
+- `envelope`: the WebSocket frames compatible with `bevy_net_backend` 0.1.0's `JsonEnvelope`:
   `WsRequestFrame`, `WsResponseFrame`, `WsPushFrame` (typed or untyped payloads; `checked` refuses
   the reserved auth kinds), first-message `WsAuth` and `WsAuthOk`, the decoders `WsServerFrame` /
   `WsClientFrame` (the client's classification rules; a malformed request keeps its id in

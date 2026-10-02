@@ -14,8 +14,8 @@ plain Rust + serde, usable from any Rust client.
 
 The server and its clients import the same types, so both sides agree on every request, answer
 and push message, and on the exact JSON they become. A mismatch is a compile error instead of a
-runtime surprise. The crate contains only data types and pure helpers: **no networking, no async
-runtime, no game engine.** The JSON on the wire is the real contract: clients in other languages
+runtime surprise. The crate contains only data types and pure helpers (serde + serde_json); a
+client library or the server sends them. The JSON on the wire is the real contract: clients in other languages
 speak it directly; this crate is the convenience for Rust and the single source of truth.
 
 ## How clients use this
@@ -27,7 +27,7 @@ This crate defines **what** is said; a client library decides **how** it is sent
 | a **Rust** app | this crate + [`net_backend_client`](https://github.com/warmar94/net_backend/tree/main/crates/net_backend_client) for the connection. |
 | a **Bevy** game | this crate + [`bevy_net_backend`](https://github.com/warmar94/bevy_net_backend) for the connection (with the optional `bevy_net_backend` feature, the types plug straight into its WebSocket requests). |
 | **other** Rust code | this crate + any HTTP / WebSocket library (for example reqwest, ureq, tokio-tungstenite). |
-| **not Rust** | not this crate: use the server's API documentation (OpenAPI for HTTP, AsyncAPI for the WebSocket) and send the same JSON. |
+| **not Rust** | the HTTP / WebSocket API directly: [API.md](https://github.com/warmar94/net_backend/blob/main/API.md) (plus the server's OpenAPI and AsyncAPI documents), with the same JSON. |
 
 ## Contents
 
@@ -48,7 +48,6 @@ This crate defines **what** is said; a client library decides **how** it is sent
 - [Versioning and compatibility](#versioning-and-compatibility)
 - [Optional integration with bevy_net_backend](#optional-integration-with-bevy_net_backend)
 - [API design rules](#api-design-rules)
-- [Limits and what it does not do](#limits-and-what-it-does-not-do)
 - [Testing](#testing)
 - [FAQ](#faq)
 - [License](#license)
@@ -212,7 +211,7 @@ crate `bevy_net_backend` 0.1.0:
 | 4010 | `UNSUPPORTED_PROTOCOL` | the client's protocol version is not supported |
 
 **WebSocket kinds** (`kinds`): `auth`, `auth.ok`, `auth.failed`, `chat.join`, `chat.leave`,
-`chat.send`, `chat.history`, pushes `chat.message` and `chat.deleted`.
+`chat.send`, `chat.history`, `chat.members`, pushes `chat.message`, `chat.deleted` and `chat.presence`.
 
 ## HTTP routes
 
@@ -479,9 +478,8 @@ moderator) pushes `chat.deleted` and removes it from the history.
 
 ## Versioning and compatibility
 
-- **Routes:** `/v1` is stable. A route or kind is never renamed or removed within `/v1`; new ones
-  may be added. A breaking change would get `/v2`.
-- **Protocol version:** `PROTOCOL_VERSION` (1) grows when messages are added within `/v1`. A
+- **Routes:** `/v1` is stable: within `/v1` routes and kinds keep their names and stay.
+- **Protocol version:** `PROTOCOL_VERSION` (1) identifies the set of messages within `/v1`. A
   client names the version it speaks in the `x-net-backend-protocol` header (`PROTOCOL_HEADER`,
   on HTTP requests and the WebSocket handshake) or in the `protocol` field of the first-message
   `auth`; none means 1. The server answers with its own version in the same header and in
@@ -490,7 +488,7 @@ moderator) pushes `chat.deleted` and removes it from the history.
   retry it forever) but upgrade and close 4010 (`version::WS_REFUSAL_CLOSE`, no reconnect), or 403
   before the upgrade.
 - **Forward compatibility:** unknown fields are ignored when decoding (no type uses
-  `deny_unknown_fields`), so a newer server may add fields; optional fields may be absent; an
+  `deny_unknown_fields`), so extra fields are fine; optional fields may be absent; an
   unknown enum value (a room kind, a write rule) decodes as `Unknown`; unknown error codes and
   provider names are kept as text; a push kind a client does not know is still a push.
 
@@ -516,31 +514,20 @@ ws.request("main", &JoinRoom::new("world"));
 // `BackendError::Rejected`, whose payload decodes as `ApiError` (`rejection.json::<ApiError>()`).
 ```
 
-The feature follows the client's minor version: a new client minor release means a new release
-of this crate.
+The feature uses `bevy_net_backend` 0.1.0.
 
 ## API design rules
 
 - Types a client or server only **reads** (answers, pushes, errors) are `#[non_exhaustive]` with
-  public fields, so fields can be added later without a breaking change.
+  public fields, so adding a field is not a breaking change.
 - Types you **build** (requests) are `#[non_exhaustive]` too and have constructors plus `with_*`
-  builders: `SendMessage::new(room, text)`, `PutObject::new(value).if_version(v)`. New optional
-  fields arrive as new builders, so code written today keeps compiling.
+  builders: `SendMessage::new(room, text)`, `PutObject::new(value).if_version(v)`. Optional
+  fields are set through builders, so adding one is not a breaking change.
 - Nothing that may hold a float (any JSON `Value`) implements `Eq`.
 - Every serde attribute is explicit; JSON field names are `snake_case`.
 - Secrets (`Password`, `AccessToken`, `RefreshToken`, `Secret`) print `<redacted>` in `Debug`,
   have no `Display` and no `PartialEq` (compare secrets in constant time on the server).
 - `validate()` methods carry the shape rules both sides share; the server is still the authority.
-
-## Limits and what it does not do
-
-- No networking, no async runtime, no engine: a client library or a server sends the JSON.
-- No OpenAPI schema generation yet (the server documents its API).
-- OAuth logins, notifications, friends, leaderboards, groups and lobbies are not in this version;
-  they arrive with the server modules that implement them, as additions.
-- Storage values are JSON; binary saves are encoded by the game.
-- The `validate()` helpers check shapes only; quotas, rate limits and permissions are the
-  server's.
 
 ## Testing
 

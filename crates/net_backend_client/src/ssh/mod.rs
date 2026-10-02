@@ -160,8 +160,7 @@ impl SshPromptRequest {
 }
 
 /// Answers keyboard-interactive prompts ([`SshAuth::keyboard_interactive`]). Never block. Return
-/// one answer per prompt, or `None` to give up. Methods added later always come with a default
-/// implementation.
+/// one answer per prompt, or `None` to give up.
 pub trait SshPromptResponder: Send + Sync + 'static {
     /// Answer one round.
     fn respond(&self, request: &SshPromptRequest) -> Option<Vec<Secret>>;

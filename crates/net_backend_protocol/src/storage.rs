@@ -1,8 +1,8 @@
 //! Storage: save slots and other per-user key-value objects. Routes: [`routes::storage`](crate::routes::storage).
 //!
 //! An object lives at `(owner, collection, key)` and holds one JSON value (a save game, settings,
-//! an inventory snapshot). Every route addresses the CALLER's own objects; in 0.1.0 nobody reads
-//! another user's objects (a later version may add public objects with an owner in the path).
+//! an inventory snapshot). Every route addresses the CALLER's own objects; another user's objects
+//! are reached only through the admin routes.
 //!
 //! **Versions.** Every write bumps the object's [`ObjectVersion`] (1 for a new object). The default
 //! is **last write wins**. A write that names the version it expects ([`PutObject::if_version`])

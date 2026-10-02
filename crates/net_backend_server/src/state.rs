@@ -23,8 +23,6 @@ use crate::shutdown::Shutdown;
 use crate::ws::Hub;
 
 /// The source of "now". The server reads time only through this, so tests can control it.
-///
-/// Methods added later always come with a default implementation.
 pub trait Clock: Send + Sync + 'static {
     /// The current time.
     fn now(&self) -> UnixMillis;

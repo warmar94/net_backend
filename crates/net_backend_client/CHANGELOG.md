@@ -26,5 +26,5 @@ change or a key dependency bump).
   machine's OpenSSH: strict known_hosts checking or pinned fingerprints, the Terrapin refusal and
   its opt-out, key files, the agent, password and keyboard-interactive logins, a release-build
   guard; commands (collected or streamed) and SFTP file operations.
-- TLS with rustls + ring (no OpenSSL, no aws-lc), Mozilla's root certificates.
+- TLS with rustls + ring, Mozilla's root certificates.
 - Examples: `quickstart`, `blocking_loop`, `chat` (`ws`), `admin_ssh` (`sftp`).

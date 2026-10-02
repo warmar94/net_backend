@@ -18,7 +18,7 @@ usermod -aG sudo admin
 install -d -m 0700 -o admin -g admin /home/admin/.ssh
 nano /home/admin/.ssh/authorized_keys                 # paste the PUBLIC key (id_ed25519.pub), one line
 chown admin:admin /home/admin/.ssh/authorized_keys && chmod 0600 /home/admin/.ssh/authorized_keys
-passwd admin                                          # a password for sudo only (SSH will not accept it)
+passwd admin                                          # a password for sudo only (SSH refuses passwords)
 ```
 
 From a second terminal: `ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes admin@api.example.com`, then

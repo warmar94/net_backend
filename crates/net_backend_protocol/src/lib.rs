@@ -1,8 +1,8 @@
 //! Shared message types for `net_backend_server`: plain Rust + serde, usable from any Rust client.
 //!
 //! The server and its clients use the same types, so both sides agree on every request, answer
-//! and push, and on the JSON they become. The crate contains only data types and pure helpers:
-//! no networking, no async runtime, no game engine.
+//! and push, and on the JSON they become. The crate contains only data types and pure helpers;
+//! a client library or the server sends them.
 //!
 //! - [`envelope`]: the WebSocket frames (request, answer, push, first-message auth), close codes,
 //!   the [`WsCall`] / [`ServerPush`] traits.

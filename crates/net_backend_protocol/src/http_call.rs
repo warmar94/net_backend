@@ -79,8 +79,6 @@ impl<'de> Deserialize<'de> for NoPayload {
 pub static NO_PAYLOAD: NoPayload = NoPayload {};
 
 /// A typed HTTP request: its route, payload and answer.
-///
-/// Methods added later always come with a default implementation.
 pub trait HttpCall: Sized {
     /// What is sent: the JSON body, the query parameters, or [`NoPayload`].
     type Payload: Serialize + DeserializeOwned;

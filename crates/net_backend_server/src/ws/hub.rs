@@ -156,7 +156,7 @@ impl<'de> Deserialize<'de> for Delivery {
 /// Everything else is per instance: rooms, `is_online`, `connections_of`, `close` / `close_user`,
 /// the connection caps.
 ///
-/// Methods added later always come with a default implementation.
+/// Only [`publish`](Broadcaster::publish) is required; [`start`](Broadcaster::start) has a default.
 pub trait Broadcaster: Send + Sync + 'static {
     /// Called once when the server starts serving, with the sink that delivers to this
     /// instance's sockets (keep it to deliver what other instances publish).

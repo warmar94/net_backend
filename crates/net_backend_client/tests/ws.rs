@@ -114,8 +114,11 @@ async fn close_4001_gets_one_refresh_and_one_reconnect() {
     let ws = client.connect_ws(fast()).await.expect("connect");
     let mut events = ws.events();
     let before = client.tokens().expect("tokens");
+    // The client counts as connected before the server's socket task registered it: a close sent
+    // in that window reaches nobody (CI failure, 2026-10-02). Wait for the server side first.
+    until("the socket to be registered", || server.connections_of(user) == 1).await;
     // A revoked-token close while the session is still valid: refresh, connect again at once.
-    server.close_user(user, CloseCode::UNAUTHORIZED);
+    assert_eq!(server.close_user(user, CloseCode::UNAUTHORIZED), 1);
     event(&mut events, "the reconnect after 4001", |e| matches!(e, WsEvent::Connected { reconnected: true })).await;
     assert_ne!(client.tokens().expect("tokens").access_token.expose(), before.access_token.expose(), "refreshed");
     assert_eq!(echo(&ws, "back").await.expect("echo"), user.get());

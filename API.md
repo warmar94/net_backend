@@ -54,8 +54,8 @@ Production servers run behind a reverse proxy that terminates TLS: use `https://
 
 ### Versioning
 
-- **Paths:** `/v1` is stable. Within `/v1` no route, field or WebSocket kind is renamed or
-  removed; new ones may be added. A breaking change would get `/v2`.
+- **Paths:** `/v1` is stable: within `/v1` routes, fields and WebSocket kinds keep their names
+  and stay.
 - **Protocol version:** an integer, currently `1`. A client may name the version it speaks in
   the `x-net-backend-protocol` header (HTTP requests and the WebSocket handshake) or in the
   `protocol` field of the WebSocket `auth` message. Without it the server assumes `1`. Every
@@ -327,7 +327,7 @@ A login answers an `AuthSession`: the account and a token pair.
 | access token | 1 hour (`access_expires_at`) | `Authorization: Bearer <access token>` on HTTP requests and the WebSocket handshake, or the WebSocket `auth` message |
 | refresh token | 30 days (`refresh_expires_at`; every refresh starts a new one) | `POST /v1/auth/refresh` only |
 
-- Tokens are opaque strings (today `nbsa_` / `nbsr_` plus 64 hex characters). Store and send them
+- Tokens are opaque strings (`nbsa_` / `nbsr_` plus 64 hex characters). Store and send them
   unchanged; never parse them. Use the `*_expires_at` fields, not the token text, for timing.
 - **Refresh before expiry:** when less than 60 seconds of the access token are left, refresh.
 - **Rotation:** every refresh token works **once** and is replaced by the answer's new pair.

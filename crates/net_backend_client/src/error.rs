@@ -7,7 +7,7 @@ use net_backend_protocol::{codes, ApiError, CloseCode};
 
 /// Why a call, a connection or a command did not succeed.
 ///
-/// The kinds are `#[non_exhaustive]`: later versions may add kinds. Texts are what the dependency
+/// The kinds are `#[non_exhaustive]`: match them with a `_` arm. Texts are what the dependency
 /// (hyper, rustls, tungstenite, russh, serde_json) or the server reported, never a guess.
 /// `Display` and `Debug` never show a body, a token or a header value; `Decode`'s message (which
 /// can quote the body) is only in its field.
