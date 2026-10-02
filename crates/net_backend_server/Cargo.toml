@@ -1,6 +1,6 @@
 [package]
 name = "net_backend_server"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 rust-version.workspace = true
 description = "A framework for game backend servers: tokio + axum, modules with hooks, MySQL / PostgreSQL / SQLite, migrations, OpenAPI."

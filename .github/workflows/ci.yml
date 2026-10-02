@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+# Least privilege: every job only reads the repository (no job pushes, comments or uploads releases).
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
@@ -315,39 +319,95 @@ jobs:
       - run: cargo build -p load_test --locked --all-targets
       - run: cargo clippy -p load_test --locked --all-targets -- -D warnings
 
-  # The deployment files (deploy/): shell scripts, the Compose files, both Caddyfiles, the production
-  # configuration (checked by the reference server itself) and the Docker image build.
-  deploy:
+  # The project generator (crates/net_backend, the `net-backend` command): build, clippy, unit tests, docs, then the
+  # end-to-end test: `new`, `new-server` and `new-client` under target/ (a path with a space), each project built and
+  # linted against this repository's crates (a [patch.crates-io] added by the test), both generated servers run on
+  # loopback with SQLite, `GET /v1/info` checked, the generated clients run against them (login, save, chat).
+  cli:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p net_backend --locked --all-targets
+      - run: cargo clippy -p net_backend --locked --all-targets -- -D warnings
+      - run: cargo test -p net_backend --locked
+      - run: cargo doc -p net_backend --locked --no-deps
+      # The release check against crates.io (published_crates_build_and_run) is run by hand, not here.
+      - run: cargo test -p net_backend --locked --test e2e -- --ignored --nocapture generated_projects
+
+  # The deployment files (deploy/): shell scripts, the Compose files, both Caddyfiles, the production
+  # configurations (checked by the reference server itself), the Docker image build, the trial one-liner
+  # and both Compose stacks brought up with that image (DOMAIN=localhost).
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
       - name: shellcheck
-        run: shellcheck -S warning deploy/docker/setup.sh deploy/systemd/install.sh deploy/systemd/net-backend-cli deploy/backup/*.sh
+        run: shellcheck -S warning deploy/systemd/install.sh deploy/systemd/net-backend-cli deploy/backup/*.sh
       - name: compose files
         run: |
           cd deploy/docker
-          mkdir -p secrets
-          for f in database_url db_password db_root_password; do echo test > "secrets/$f"; done
           for db in mysql postgres; do
-            DOMAIN=api.example.com ACME_EMAIL=admin@example.com docker compose -f compose.yaml -f "compose.$db.yaml" config -q
+            DOMAIN=api.example.com docker compose -f "compose.$db.yaml" config -q
+            DOMAIN=api.example.com ACME_EMAIL=admin@example.com docker compose -f "compose.$db.yaml" config -q
+            # DOMAIN is required: without it Compose refuses the file.
+            if docker compose -f "compose.$db.yaml" config -q 2>/dev/null; then echo "compose.$db.yaml accepted a missing DOMAIN" >&2; exit 1; fi
           done
-      - name: Caddyfiles (the image compose.yaml pins)
+      - name: Caddyfiles (the image the compose files pin)
         run: |
-          mkdir -p /tmp/caddy/sites
+          mkdir -p /tmp/caddy/sites /tmp/caddy-docker
           sed -e 's/API_DOMAIN/api.example.com/' -e 's/ACME_EMAIL/admin@example.com/' -e 's|/var/log/caddy/net-backend.log|/tmp/caddy-test.log|' \
             deploy/systemd/net-backend.caddy > /tmp/caddy/sites/net-backend.caddy
           cp deploy/systemd/Caddyfile /tmp/caddy/Caddyfile
           docker run --rm -v /tmp/caddy:/etc/caddy:ro caddy:2.11 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
-          docker run --rm -e DOMAIN=api.example.com -e ACME_EMAIL=admin@example.com -v "$PWD/deploy/docker/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2.11 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          # The Caddyfile inline in each compose file, with and without ACME_EMAIL.
+          for db in mysql postgres; do
+            for email in "" admin@example.com; do
+              DOMAIN=api.example.com ACME_EMAIL="$email" docker compose -f "deploy/docker/compose.$db.yaml" config --format json \
+                | jq -r '.configs.caddyfile.content' > /tmp/caddy-docker/Caddyfile
+              docker run --rm -v /tmp/caddy-docker:/etc/caddy:ro caddy:2.11 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+            done
+          done
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.96.0"
       - uses: Swatinem/rust-cache@v2
-      - name: the production configuration is valid
+      - name: the production configurations are valid (systemd's file, the compose files' inline one, the image's)
         run: |
           printf 'sqlite:%s/nbs.db' "$RUNNER_TEMP" > "$RUNNER_TEMP/database_url"
-          NBS_CONFIG=deploy/config/config.toml NBS__DATABASE__URL_FILE="$RUNNER_TEMP/database_url" cargo run -p net_backend_server --locked --example server --no-default-features --features sqlite,storage,chat -- config check --connect
-          NBS_CONFIG=deploy/config/config.toml NBS__DATABASE__URL_FILE="$RUNNER_TEMP/database_url" cargo run -p net_backend_server --locked --example server --no-default-features --features sqlite,storage,chat -- migrate
+          run() { cargo run -q -p net_backend_server --locked --example server --no-default-features --features sqlite,storage,chat -- "$@"; }
+          NBS_CONFIG=deploy/config/config.toml NBS__DATABASE__URL_FILE="$RUNNER_TEMP/database_url" run config check --connect
+          NBS_CONFIG=deploy/config/config.toml NBS__DATABASE__URL_FILE="$RUNNER_TEMP/database_url" run migrate
+          DOMAIN=api.example.com docker compose -f deploy/docker/compose.postgres.yaml config --format json | jq -r '."x-nbs-config"' > "$RUNNER_TEMP/compose.toml"
+          NBS_CONFIG="$RUNNER_TEMP/compose.toml" NBS__DATABASE__URL_FILE="$RUNNER_TEMP/database_url" run config check --connect
+          NBS_CONFIG=deploy/docker/trial.toml run config check
       - name: Docker image
         run: docker build -f deploy/docker/Dockerfile -t net-backend-server:ci .
+      - name: the trial one-liner
+        run: |
+          docker run -d --name nbs-trial -p 127.0.0.1:8080:8080 net-backend-server:ci
+          for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8080/v1/info && break; sleep 1; done
+          curl -fsS http://127.0.0.1:8080/v1/info | grep -q '"chat"' || { docker logs nbs-trial; exit 1; }
+          docker rm -f nbs-trial
+      - name: the compose stacks (DOMAIN=localhost, Caddy's local certificate)
+        run: |
+          mkdir -p "$RUNNER_TEMP/stack"
+          for db in postgres mysql; do
+            cp "deploy/docker/compose.$db.yaml" "$RUNNER_TEMP/stack/compose.yaml"
+            printf 'DOMAIN=localhost\nNBS_IMAGE=net-backend-server:ci\n' > "$RUNNER_TEMP/stack/.env"
+            (cd "$RUNNER_TEMP/stack" && docker compose up -d --wait --wait-timeout 300) || {
+              (cd "$RUNNER_TEMP/stack" && docker compose ps -a && docker compose logs); exit 1; }
+            for i in $(seq 1 30); do curl -fsSk https://localhost/v1/info && break; sleep 2; done
+            curl -fsSk https://localhost/v1/info | grep -q '"chat"'
+            (cd "$RUNNER_TEMP/stack" && docker compose exec -T server net-backend-server user:create admin@example.com --admin >/dev/null)
+            # A second `up` keeps the secrets and the data (the migrate run finds nothing pending).
+            (cd "$RUNNER_TEMP/stack" && docker compose up -d --wait --wait-timeout 300)
+            curl -fsSk https://localhost/v1/info >/dev/null
+            (cd "$RUNNER_TEMP/stack" && docker compose down -v)
+          done

@@ -14,9 +14,10 @@ plain Rust + serde, usable from any Rust client.
 
 The server and its clients import the same types, so both sides agree on every request, answer
 and push message, and on the exact JSON they become. A mismatch is a compile error instead of a
-runtime surprise. The crate contains only data types and pure helpers (serde + serde_json); a
-client library or the server sends them. The JSON on the wire is the real contract: clients in other languages
-speak it directly; this crate is the convenience for Rust and the single source of truth.
+runtime surprise. The crate contains only data types and pure helpers (serde + serde_json, and
+zeroize to wipe the secret types); a client library or the server sends them. The JSON on the
+wire is the real contract: clients in other languages speak it directly; this crate is the
+convenience for Rust and the single source of truth.
 
 ## How clients use this
 
@@ -73,17 +74,17 @@ This crate defines **what** is said; a client library decides **how** it is sent
 
 | Feature | Default | What |
 |---|---|---|
-| (none) | yes | serde + serde_json only. |
+| (none) | yes | serde, serde_json and zeroize only. |
 | `bevy_net_backend` | no | Implements the client crate [`bevy_net_backend`](https://github.com/warmar94/bevy_net_backend)'s `WsRequest` / `WsPushMessage` for this crate's WebSocket messages and its `Credentials` for `AccessToken`. Brings that crate and its dependencies; a server never enables it. |
 
 ## Install
 
 ```toml
 [dependencies]
-net_backend_protocol = { version = "0.1.0" }
+net_backend_protocol = { version = "0.1.1" }
 
 # With the optional client integration:
-# net_backend_protocol = { version = "0.1.0", features = ["bevy_net_backend"] }
+# net_backend_protocol = { version = "0.1.1", features = ["bevy_net_backend"] }
 ```
 
 Rust 1.95 or newer.
@@ -526,13 +527,16 @@ The feature uses `bevy_net_backend` 0.1.0.
 - Nothing that may hold a float (any JSON `Value`) implements `Eq`.
 - Every serde attribute is explicit; JSON field names are `snake_case`.
 - Secrets (`Password`, `AccessToken`, `RefreshToken`, `Secret`) print `<redacted>` in `Debug`,
-  have no `Display` and no `PartialEq` (compare secrets in constant time on the server).
+  have no `Display` and no `PartialEq` (compare secrets in constant time on the server). When one
+  is dropped, its whole allocation is overwritten with zeros first (the `zeroize` crate); each
+  clone is wiped on its own. Not wiped: the `String` that `into_inner` returns, copies made with
+  `expose().to_string()` or by serializing it, and the input it was decoded from.
 - `validate()` methods carry the shape rules both sides share; the server is still the authority.
 
 ## Testing
 
 ```sh
-cargo test -p net_backend_protocol                              # unit, golden JSON, round trips, redaction, forward compatibility, HttpCall table
+cargo test -p net_backend_protocol                              # unit, golden JSON, round trips, redaction, wiped secrets, forward compatibility, HttpCall table
 cargo test -p net_backend_protocol --features bevy_net_backend  # plus the frames through the client's own JsonEnvelope
 cargo run -p net_backend_protocol --example print_frames        # prints the JSON of every frame
 ```

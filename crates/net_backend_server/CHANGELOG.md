@@ -5,6 +5,71 @@ All notable changes to this crate are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) (before 1.0: a minor bump for any API
 change or a key dependency bump).
 
+## [0.1.1] - Unreleased
+
+### Added
+
+- The `healthcheck` command in every server started with `NetBackendServer::run()`: it asks the
+  running server's `/readyz` on `server.bind` (an unspecified address means loopback; `[::]` tries
+  `::1`, then `127.0.0.1`) and exits 0 on `200`, 1 otherwise, within 4 seconds in all (below the
+  5-second timeout of the Docker health checks) and without the database. Container images without a
+  shell or `curl` use it as their health check. The reference server `examples/server.rs` uses the
+  framework's command. An app command named `healthcheck` (an `AppCommand` registered by the app or a
+  module) replaces the built-in one: it runs, and the built-in is hidden from `--help`.
+- `--version` / `-V` (the framework's version) and `NetBackendServer::run_main(make)`, a whole `main`:
+  `--help` and `--version` work without a configuration file or a database, every other command loads
+  the configuration (`Config::load`) and runs the server `make` builds. The reference server uses it.
+
+### Changed
+
+- **A server with `modules.auth.revocation_poll_secs = 0` and the WebSocket hub on (`ws.enabled = true`,
+  the default) no longer starts**, and every command and `config check` refuse that configuration: set
+  it to 1 or more (the default is 5). Without the poll, a ban or revocation made by the command line or
+  another instance never closed open WebSockets. With `ws.enabled = false`, 0 is allowed.
+- `asyncapi` is in `command::BUILT_IN_COMMANDS`: an app command with that name is refused (the built-in
+  `asyncapi export` always ran instead of it).
+- The README and the API documentation describe what the crate has and does.
+- `log.format = "pretty"` writes colours only when the output is a terminal (`docker logs`, journald and
+  files get plain text).
+
+### Fixed
+
+- Revocations (logout, password change, ban, admin, refresh-token reuse) are applied to the WebSocket
+  hub before the call that made them returns, those of other processes as soon as the revocation poll
+  reads them: a socket that authenticates after a ban returned never receives `auth.ok`.
+- A ban that lands while a socket authenticates is answered `auth.failed` with the code `banned`
+  (it was `unauthorized`), matching the close code 4003.
+- MySQL: simultaneous registrations no longer deadlock on `auth_email_tokens`. A new email token
+  replaces the unused ones through a plain read and a delete by id; the ranged delete before took gap
+  locks on the user index.
+- A token checked longer ago than the hub's memory of revocations (30 s; e.g. behind a slow connect
+  hook), or before a revocation that memory had to drop (more than 4096 within 30 s), is checked again
+  before its socket is registered, so a ban that landed meanwhile is answered `banned`, never `auth.ok`.
+- MySQL: simultaneous resends of one account's verification or reset mail leave one unused token (the
+  account row is locked first); a password reset deletes the account's unused reset tokens by id.
+- Deployment files of the repository: two backups started at the same instant each keep their dump
+  under their own name, and a run that fails after taking a name leaves no empty file; a PostgreSQL
+  restore keeps psql's query results and notices out of the log (errors stay); after a PostgreSQL load
+  that failed, the restore says that nothing was replaced and starts the server again; in Docker mode a
+  `db` service that is not running is reported as such, Compose's progress lines stay out of the
+  restore log, and `migrate` runs once (through `docker compose up`).
+
+### Deployment files: what changes for a 0.1.0 Docker install
+
+- The Docker install is one Compose file per database (`deploy/docker/compose.postgres.yaml`,
+  `compose.mysql.yaml`) with the prebuilt server image; the database and server secrets are generated
+  into Docker volumes on the first start. `deploy/docker/setup.sh`, `compose.yaml`, `Caddyfile`,
+  `.env.example` and `postgres-init.sql` are removed: run `docker compose down` in the old folder
+  BEFORE updating the checkout, because the old files run that install.
+- The backup and restore scripts read the database from the running `db` service (no
+  `secrets/database_url` file); their default Compose folder (`NBS_COMPOSE_DIR`) is `/opt/net-backend`
+  (it was `/opt/net_backend/deploy/docker`).
+- `backup/install.sh --mode docker` needs `--compose-dir <the folder with compose.yaml and .env>`.
+- "Moving from a `setup.sh` install" in
+  [deploy/README.md](https://github.com/warmar94/net_backend/tree/main/deploy#path-a-docker-compose)
+  lists the steps: the new folder, the old secrets copied into the new volumes, the configuration and
+  published migrations carried over, and the backup timer re-installed.
+
 ## [0.1.0] - 2026-10-02
 
 ### Added

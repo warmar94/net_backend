@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use futures_util::future::BoxFuture;
 use futures_util::{SinkExt, StreamExt};
 use http::StatusCode;
-use net_backend_server::auth::{Auth, AuthConfig, AuthService};
+use net_backend_server::auth::{Auth, AuthConfig, AuthService, Revocation, RevocationReason, RevokedSessions};
 use net_backend_server::hooks::Decision;
 use net_backend_server::mail::MemoryMailer;
 use net_backend_server::protocol::admin::BanRequest;
@@ -563,8 +563,7 @@ async fn revocations_from_another_process_close_sockets() {
     let mut ws = connect(server.addr, Some(&token)).await;
     assert_eq!(call(&mut ws, 1, "test.echo", json!(1)).await["ok"], true);
     // The "other process" (the command line, another instance): its own server on the same file.
-    let mut other_auth = cheap_auth();
-    other_auth.revocation_poll_secs = 0;
+    let other_auth = cheap_auth();
     let mut config = Config::default();
     config.database.url = SecretString::new(&url);
     config.database.migrations_dir = common::temp_dir("ws-cross-migrations");
@@ -938,11 +937,13 @@ async fn oversized_pushes_are_refused() {
     server.stop().await;
 }
 
-/// S3: a ban landing while the socket authenticates (slow hook, no revocation poll) still closes it.
+/// S3: a ban landing while the socket authenticates (slow hook, no revocation poll) still closes it;
+/// a first-message `auth` is answered `auth.failed` `banned`, never `auth.ok` (0.1.1).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bans_during_authentication_are_applied() {
     let mut auth = cheap_auth();
-    auth.revocation_poll_secs = 0;
+    // The poll runs once at the start, then not within the test: the in-process path is tested.
+    auth.revocation_poll_secs = 3600;
     // The connect hook waits for the test (not a fixed time): no hook timeout in between.
     let server = start_with(|config| config.server.hook_timeout_ms = 120_000, "sqlite::memory:", auth).await;
     let (user, token) = server.register("race@example.com").await;
@@ -962,15 +963,91 @@ async fn bans_during_authentication_are_applied() {
     let mut ws = connect(server.addr, None).await;
     send(&mut ws, auth_frame(&other_token)).await;
     tokio::time::timeout(WAIT, server.probe.entered.notified()).await.expect("the connect hook ran");
-    server.service().ban_user(&server.state, other, BanRequest::new()).await.expect("ban");
+    let until = UnixMillis(net_backend_server::Clock::now(&*server.clock).get() + 3_600_000);
+    server.service().ban_user(&server.state, other, BanRequest::new().with_until(until)).await.expect("ban");
     server.probe.release.notify_one();
-    // The ban reaches the hub through the revocation stream (a task): when it lands before the
-    // registration the `auth` is refused, when it lands right after, the fresh socket is closed.
-    // Either way the banned player ends with 4003 (the old fixed 200 ms / 600 ms timing always
-    // took the first branch).
+    // The ban is applied to the hub before `ban_user` returns: the socket is refused with
+    // `auth.failed` `banned` (never `auth.ok`), then closed with 4003.
     let answer = recv(&mut ws).await;
-    assert!(answer["type"] == "auth.failed" || answer["type"] == "auth.ok", "{answer}");
+    assert_eq!(answer["type"], "auth.failed", "{answer}");
+    assert_eq!(answer["error"]["code"], codes::BANNED, "{answer}");
+    assert_eq!(answer["error"]["details"]["until"], until.get(), "{answer}");
     assert_eq!(close_code(&mut ws).await, Some(4003));
+    // The same for an admin revocation of every session: `unauthorized`, 4001.
+    let (third, third_token) = server.register("race3@example.com").await;
+    let mut ws = connect(server.addr, None).await;
+    send(&mut ws, auth_frame(&third_token)).await;
+    tokio::time::timeout(WAIT, server.probe.entered.notified()).await.expect("the connect hook ran");
+    let revocation = Revocation::new(third, RevokedSessions::All, RevocationReason::Admin);
+    server.service().revoke_sessions(&server.state, revocation).await.expect("revoke");
+    server.probe.release.notify_one();
+    let answer = recv(&mut ws).await;
+    assert_eq!(answer["type"], "auth.failed", "{answer}");
+    assert_eq!(answer["error"]["code"], codes::UNAUTHORIZED, "{answer}");
+    assert_eq!(close_code(&mut ws).await, Some(4001));
+    server.wait_connections(0).await;
+    server.stop().await;
+}
+
+/// 0.1.1 review S2: a token checked longer ago than the hub's revocation memory (a slow connect
+/// hook), or before a revocation the full memory evicted, is checked again before its socket is
+/// registered: a ban that landed meanwhile is never answered `auth.ok`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_token_checks_are_repeated() {
+    let mut auth = cheap_auth();
+    auth.revocation_poll_secs = 3600;
+    let server = start_with(|config| config.server.hook_timeout_ms = 120_000, "sqlite::memory:", auth).await;
+    let window = Duration::from_millis(300);
+    server.state.ws().set_revocation_window_for_tests(window);
+    let (first, first_token) = server.register("stale1@example.com").await;
+    let (header, header_token) = server.register("stale2@example.com").await;
+    let (other, _) = server.register("stale3@example.com").await;
+    let unrelated = || Revocation::new(other, RevokedSessions::All, RevocationReason::Admin);
+    server.probe.slow_connect.store(true, Ordering::SeqCst);
+
+    // First-message path: the hook outlasts the window, and a later revocation trims the ban from
+    // the hub's memory before the hook returns.
+    let mut ws = connect(server.addr, None).await;
+    send(&mut ws, auth_frame(&first_token)).await;
+    tokio::time::timeout(WAIT, server.probe.entered.notified()).await.expect("the connect hook ran");
+    server.service().ban_user(&server.state, first, BanRequest::new()).await.expect("ban");
+    tokio::time::sleep(window * 2).await;
+    server.service().revoke_sessions(&server.state, unrelated()).await.expect("revoke");
+    server.probe.release.notify_one();
+    let answer = recv(&mut ws).await;
+    assert_eq!(answer["type"], "auth.failed", "{answer}");
+    assert_eq!(answer["error"]["code"], codes::BANNED, "{answer}");
+    assert_eq!(close_code(&mut ws).await, Some(4003));
+
+    // Handshake path: the same; the handshake is refused (403 banned) before the upgrade.
+    let addr = server.addr;
+    let pending = tokio::spawn(async move { connect_with(addr, Some(&header_token), &[], "").await });
+    tokio::time::timeout(WAIT, server.probe.entered.notified()).await.expect("the connect hook ran");
+    server.service().ban_user(&server.state, header, BanRequest::new()).await.expect("ban");
+    tokio::time::sleep(window * 2).await;
+    server.service().revoke_sessions(&server.state, unrelated()).await.expect("revoke");
+    server.probe.release.notify_one();
+    match *pending.await.expect("task").expect_err("the handshake is refused") {
+        tokio_tungstenite::tungstenite::Error::Http(response) => assert_eq!(response.status().as_u16(), 403),
+        other => panic!("not an HTTP refusal: {other}"),
+    }
+
+    // The memory's cap: 4096 later revocations evict the ban inside the default window.
+    server.state.ws().set_revocation_window_for_tests(Duration::from_secs(30));
+    let (capped, capped_token) = server.register("stale4@example.com").await;
+    let mut ws = connect(server.addr, None).await;
+    send(&mut ws, auth_frame(&capped_token)).await;
+    tokio::time::timeout(WAIT, server.probe.entered.notified()).await.expect("the connect hook ran");
+    server.service().ban_user(&server.state, capped, BanRequest::new()).await.expect("ban");
+    for _ in 0..4096 {
+        server.service().revoke_sessions(&server.state, unrelated()).await.expect("revoke");
+    }
+    server.probe.release.notify_one();
+    let answer = recv(&mut ws).await;
+    assert_eq!(answer["type"], "auth.failed", "{answer}");
+    assert_eq!(answer["error"]["code"], codes::BANNED, "{answer}");
+    assert_eq!(close_code(&mut ws).await, Some(4003));
+    server.probe.slow_connect.store(false, Ordering::SeqCst);
     server.wait_connections(0).await;
     server.stop().await;
 }

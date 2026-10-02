@@ -1196,7 +1196,7 @@ async fn revocations_from_other_processes_reach_subscribers() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     // The "other process".
-    let other = build(0).build().await.expect("build other");
+    let other = build(5).build().await.expect("build other");
     let service = other.state().get::<AuthService>().expect("service");
     let revoked = service.revoke_sessions(other.state(), net_backend_server::auth::Revocation::new(user, RevokedSessions::All, RevocationReason::Admin)).await;
     assert_eq!(revoked.ok(), Some(1));
@@ -1237,4 +1237,120 @@ async fn last_admin_keeps_the_role() {
     let second = fx.register("secondboss@example.com").await;
     fx.make_admin(second.account.id).await;
     fx.service().set_user_role(fx.state(), boss.account.id, "admin", false).await.expect("two admins: one may go");
+}
+
+/// F6 (0.1.1): `revocation_poll_secs = 0` is refused while the WebSocket hub is on (a ban made by
+/// the command line or another instance would never close open sockets); without the hub it is
+/// allowed.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn revocation_poll_zero_is_refused_with_the_hub() {
+    let build = |ws: bool, poll: u64| {
+        let mut config = base_config("sqlite::memory:");
+        config.ws.enabled = ws;
+        let mut auth = AuthConfig::default();
+        cheap(&mut auth);
+        auth.revocation_poll_secs = poll;
+        NetBackendServer::new(config).module(Auth::new().with_config(auth).mailer(MemoryMailer::new())).build()
+    };
+    let refused = build(true, 0).await;
+    assert!(
+        matches!(&refused, Err(net_backend_server::Error::Config(p)) if p.iter().any(|p| p.contains("revocation_poll_secs"))),
+        "{:?}",
+        refused.as_ref().err()
+    );
+    assert!(build(false, 0).await.is_ok(), "0 is allowed without the hub");
+    assert!(build(true, 1).await.is_ok(), "1 is allowed with the hub");
+}
+
+/// F7 (0.1.1): `n` registrations at the same moment all succeed, and each leaves exactly one
+/// unused verification token (the token insert no longer follows a ranged DELETE, which took gap
+/// locks on MySQL and deadlocked simultaneous registrations; a lost token would show here).
+async fn concurrent_registrations(url: &str, n: usize) {
+    use net_backend_server::sea_query::{Expr, ExprTrait, Query};
+    let fx = fixture_with(url, |c| c.rate_limits = false, |s| s).await;
+    let start = Arc::new(tokio::sync::Barrier::new(n));
+    let mut tasks = Vec::new();
+    for i in 0..n {
+        let (router, start) = (fx.router.clone(), start.clone());
+        tasks.push(tokio::spawn(async move {
+            let body = json!({"email": format!("crowd{i}@example.com"), "password": PASSWORD}).to_string();
+            start.wait().await;
+            let (status, _, body) = common::call(&router, common::post_json(routes::auth::REGISTER, body)).await;
+            (status, body)
+        }));
+    }
+    for task in tasks {
+        let (status, body) = task.await.expect("task");
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    #[derive(sqlx::FromRow)]
+    struct N {
+        n: i64,
+    }
+    let query = Query::select()
+        .expr_as(Expr::col("id").count(), "n")
+        .from("auth_email_tokens")
+        .and_where(Expr::col("purpose").eq("verify"))
+        .and_where(Expr::col("used_at").is_null())
+        .to_owned();
+    let tokens = fx.state().db().fetch_one::<N, _>(&query).await.expect("count").n;
+    assert_eq!(tokens, i64::try_from(n).expect("n"), "one verification token per registration");
+    // A second token for the same account replaces the first (read + delete by id + insert).
+    let (status, body) = fx.post(routes::auth::LOGIN, json!({"email": "crowd0@example.com", "password": PASSWORD}), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let token = body["tokens"]["access_token"].as_str().expect("token").to_string();
+    let (status, body) = fx.post(routes::auth::RESEND_VERIFICATION, json!({}), Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let tokens = fx.state().db().fetch_one::<N, _>(&query).await.expect("count").n;
+    assert_eq!(tokens, i64::try_from(n).expect("n"), "the resent token replaced the old one");
+    // Simultaneous resends of one account still leave one unused token (the account row is
+    // locked first, so each new token sees and replaces the one before).
+    let resend = Arc::new(tokio::sync::Barrier::new(6));
+    let mut tasks = Vec::new();
+    for _ in 0..6 {
+        let (router, resend, token) = (fx.router.clone(), resend.clone(), token.clone());
+        tasks.push(tokio::spawn(async move {
+            let request = Request::post(routes::auth::RESEND_VERIFICATION)
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from("{}"))
+                .expect("request");
+            resend.wait().await;
+            common::call(&router, request).await.0
+        }));
+    }
+    for task in tasks {
+        assert_eq!(task.await.expect("task"), StatusCode::OK);
+    }
+    let tokens = fx.state().db().fetch_one::<N, _>(&query).await.expect("count").n;
+    assert_eq!(tokens, i64::try_from(n).expect("n"), "simultaneous resends leave one token per account");
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sqlite_concurrent_registrations() {
+    let dir = common::temp_dir("auth-crowd");
+    let url = format!("sqlite:{}", dir.join("crowd.db").display().to_string().replace('\\', "/"));
+    concurrent_registrations(&url, 20).await;
+}
+
+#[cfg(feature = "mysql")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "needs NBS_TEST_MYSQL_URL (a MySQL 8 server): simultaneous registrations"]
+async fn mysql_concurrent_registrations() {
+    let base = common::env_url("NBS_TEST_MYSQL_URL");
+    let (url, name) = common::fresh_database(&base).await;
+    concurrent_registrations(&url, 60).await;
+    common::drop_database(&base, &name).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "needs NBS_TEST_POSTGRES_URL (a PostgreSQL 16 server): simultaneous registrations"]
+async fn postgres_concurrent_registrations() {
+    let base = common::env_url("NBS_TEST_POSTGRES_URL");
+    let (url, name) = common::fresh_database(&base).await;
+    concurrent_registrations(&url, 60).await;
+    common::drop_database(&base, &name).await;
 }

@@ -1,17 +1,196 @@
-# The MySQL 8.4 database for compose.yaml (COMPOSE_FILE=compose.yaml:compose.mysql.yaml in .env).
-# The app's account `nbs` owns only the database `nbs` (not root).
+# net_backend_server in production with Docker Compose: MySQL 8.4, the server and Caddy (HTTPS + WSS).
+# This one file is the whole install. In an empty folder:
+#
+#   1. save this file as compose.yaml
+#   2. write a file .env with one line:   DOMAIN=api.example.com
+#   3. docker compose up -d
+#
+# On the first start a one-shot `init` service generates the database passwords into Docker volumes;
+# MySQL creates the app's account `nbs` (owning only the database `nbs`); `migrate` applies the
+# migrations; then the server starts, and Caddy gets a certificate for DOMAIN. Each further
+# `docker compose up -d` keeps the secrets and runs `migrate` again (pending migrations only). After an
+# edit of `x-nbs-config`: `docker compose up -d` (migrate checks it, then it is put in place), then
+# `docker compose restart server`.
+#
+# Settings in .env (only DOMAIN is required):
+#   DOMAIN       the public host name of the API (its DNS A / AAAA records point at this machine);
+#                `localhost` gives Caddy's own local certificate (a test on your own computer)
+#   ACME_EMAIL   where certificate expiry notices go
+#   NBS_IMAGE    the server image (default ghcr.io/warmar94/net_backend_server:0.1); your own server's
+#                image, or see `build:` under `migrate`
+#   EDGE_SUBNET, EDGE_SUBNET6, CADDY_IPV4, CADDY_IPV6   the Caddy <-> server network and Caddy's fixed
+#                addresses in it; change all four together, only if a subnet collides with a local network
+#
+# The Compose project is named after the folder (in /opt/net-backend: `net-backend`); its volumes hold the
+# database, the secrets and the certificates. The server's configuration is `x-nbs-config` below. Needs
+# Docker Engine 27 or newer (IPv6 clients reach Caddy with their own address) and Compose 2.23.1 or newer.
+
+x-hardened: &hardened
+  read_only: true
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
+
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "50m", max-file: "5" }
+
+# The server's configuration (every key: the server README's "Configuration" section). Unknown keys
+# are errors: `migrate` checks an edit before it is put in place (`docker compose up -d`), and
+# `docker compose run --rm init` + `docker compose run --rm --no-deps -e NBS_CONFIG=/etc/net-backend/config.next.toml
+# server config check --connect` checks it without restarting anything.
+# Secrets never go here: they are files (database.url_file; modules.auth.smtp_password_file and
+# steam_web_api_key_file with a volume or bind mount of your own). Compose reads ${...} in this text
+# (the Caddy addresses below); a literal $ is written $$.
+x-nbs-config: &nbs-config |
+  [server]
+  bind = "0.0.0.0:8080"
+  # In-flight requests and closing WebSockets get this long after SIGTERM (stop_grace_period: 90s).
+  shutdown_grace_secs = 20
+
+  [database]
+  url_file = "/etc/net-backend/database_url"
+  max_connections = 20
+  # The `migrate` service applies migrations before every start.
+  migrate_on_start = false
+  migrations_dir = "/etc/net-backend/migrations"
+
+  [http]
+  # Exactly Caddy's two addresses: only its X-Forwarded-For is believed (not the network's gateway,
+  # through which host processes would reach the server).
+  trusted_proxies = ["${CADDY_IPV4:-172.30.250.10}", "${CADDY_IPV6:-fd00:6e62:73::10}"]
+
+  [log]
+  level = "info"
+  format = "json"
+
+  [openapi]
+  # /v1/openapi.json and /v1/asyncapi.json for client generators; false hides them.
+  enabled = true
+  title = "Game backend API"
+
+  [ws]
+  # Tokens only in the Authorization header or the first-message `auth` (proxies log URLs).
+  query_token = false
+  # Below the open-file limit (ulimits nofile: 262144) with room for the database pool.
+  max_connections = 10000
+
+  [modules.auth]
+  app_name = "My Game"
+  # Real mail (verification, password resets):
+  # mailer = "smtp"
+  # mail_from = "My Game <no-reply@example.com>"
+  # smtp_host = "smtp.example.com"
+  # smtp_username = "no-reply@example.com"
+  # smtp_password_file = "/run/mail/smtp_password"
+  # verify_url = "https://example.com/verify?token={token}"
+  # reset_url = "https://example.com/reset?token={token}"
+  # Steam login:
+  # steam_app_id = 480
+  # steam_identity = "my-game"
+  # steam_web_api_key_file = "/run/steam/steam_web_api_key"
+
+  [modules.storage]
+  # Defaults: 256 KiB per object, 1000 objects and 4 MiB per player, 60 writes per minute per player.
+
+  [modules.chat]
+  history_retention_days = 30
+
+  [[modules.chat.rooms]]
+  key = "world"
+  name = "World"
+  max_members = 200
 
 services:
+  # Writes db_password, db_root_password (volume db_secrets) and database_url (volume server_files)
+  # when they are missing: 48 hex characters from the kernel's random source. Never prints them, never
+  # replaces them, and checks everything before it writes anything: a database that already holds data
+  # (db_data, read-only here) never gets new passwords. Writes `x-nbs-config` as config.next.toml, the
+  # candidate `migrate` checks.
+  init:
+    image: mysql:8.4
+    user: root
+    entrypoint:
+      - sh
+      - -ec
+      - |
+        umask 022
+        db=/secrets/db
+        srv=/secrets/server
+        expected() { echo "mysql://nbs:$$1@db:3306/nbs"; }
+        random() { head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
+        put() { printf '%s' "$$2" > "$$1.new" && mv "$$1.new" "$$1"; }
+        fail() { echo "init: $$*; nothing was written" >&2; exit 1; }
+        # 1. Checks: nothing is written before all of them pass.
+        initialised=no
+        if [ -d /dbdata/mysql ]; then initialised=yes; fi
+        url=""
+        if [ -s $$srv/database_url ]; then url="$$(cat $$srv/database_url)"; fi
+        if [ -n "$$url" ]; then
+          case "$$url" in
+            mysql://nbs:*@db:3306/nbs) ;;
+            *) fail "database_url (volume server_files) belongs to another database than this MySQL file" ;;
+          esac
+          if [ -s $$db/db_password ] && [ "$$url" != "$$(expected "$$(cat $$db/db_password)")" ]; then
+            fail "db_password (volume db_secrets) and database_url (volume server_files) disagree"
+          fi
+        fi
+        if [ "$$initialised" = yes ]; then
+          if [ ! -s $$db/db_password ] && [ -z "$$url" ]; then
+            fail "the database holds data, but its password is in neither db_secrets nor server_files"
+          fi
+          if [ ! -s $$db/db_root_password ]; then
+            fail "the database holds data, but db_root_password (volume db_secrets) is missing"
+          fi
+        fi
+        # 2. Writes.
+        if [ ! -s $$db/db_password ]; then
+          if [ -n "$$url" ]; then
+            pw="$${url#mysql://nbs:}"
+            put $$db/db_password "$${pw%@db:3306/nbs}"
+            echo "init: restored db_password from database_url"
+          else
+            put $$db/db_password "$$(random)"
+            echo "init: created db_password"
+          fi
+        fi
+        if [ ! -s $$db/db_root_password ]; then
+          put $$db/db_root_password "$$(random)"
+          echo "init: created db_root_password"
+        fi
+        if [ -z "$$url" ]; then
+          put $$srv/database_url "$$(expected "$$(cat $$db/db_password)")"
+          echo "init: created database_url"
+        fi
+        put $$srv/config.next.toml "$$NBS_CONFIG_TOML"
+    volumes:
+      - db_secrets:/secrets/db
+      - server_files:/secrets/server
+      - db_data:/dbdata:ro
+    environment:
+      NBS_CONFIG_TOML: *nbs-config
+    # The image's own data VOLUME, as a throwaway tmpfs (no anonymous volume left behind).
+    tmpfs: [/var/lib/mysql]
+    network_mode: none
+    restart: "no"
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    # Only to look into the database's data folder (owned by the database's own user).
+    cap_add: [DAC_READ_SEARCH]
+
+  # The app's account `nbs` owns only the database `nbs` (not root).
   db:
     image: mysql:8.4
+    depends_on:
+      init:
+        condition: service_completed_successfully
     environment:
       MYSQL_DATABASE: nbs
       MYSQL_USER: nbs
       MYSQL_PASSWORD_FILE: /run/secrets/db_password
       MYSQL_ROOT_PASSWORD_FILE: /run/secrets/db_root_password
-    secrets: [db_password, db_root_password]
     volumes:
       - db_data:/var/lib/mysql
+      - db_secrets:/run/secrets:ro
     networks: [backend]
     restart: unless-stopped
     stop_grace_period: 60s
@@ -24,25 +203,183 @@ services:
       timeout: 5s
       start_period: 60s
       retries: 10
-    logging:
-      driver: json-file
-      options: { max-size: "50m", max-file: "5" }
+    logging: *logging
 
+  # Checks the configuration candidate (config.next.toml) and applies pending migrations with it, then
+  # exits. An invalid edit of x-nbs-config stops here: nothing reaches the running server.
   migrate:
+    image: ${NBS_IMAGE:-ghcr.io/warmar94/net_backend_server:0.1}
+    # Your own server, built here from its project (the Dockerfile of deploy/docker, copied):
+    # build:
+    #   context: .
+    #   args: { CARGO_ARGS: "--bin mygame", BINARY: target/release/mygame, CONFIG: config.toml }
+    # pull_policy: build
+    command: ["migrate"]
+    environment:
+      NBS_CONFIG: /etc/net-backend/config.next.toml
     depends_on:
       db:
         condition: service_healthy
+    # config.toml, config.next.toml and database_url, written by `init` and `activate`.
+    volumes: &server-volumes
+      - server_files:/etc/net-backend:ro
+    networks: [backend]
+    restart: "no"
+    <<: *hardened
+
+  # Puts the configuration `migrate` accepted in place as config.toml (the same x-nbs-config text). A
+  # running server reads it at its next start: `docker compose restart server` after an edit.
+  activate:
+    image: mysql:8.4
+    user: root
+    entrypoint:
+      - sh
+      - -ec
+      - |
+        umask 022
+        printf '%s' "$$NBS_CONFIG_TOML" > /out/config.toml.new
+        mv /out/config.toml.new /out/config.toml
+    environment:
+      NBS_CONFIG_TOML: *nbs-config
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - server_files:/out
+    tmpfs: [/var/lib/mysql]
+    network_mode: none
+    restart: "no"
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
 
   server:
+    image: ${NBS_IMAGE:-ghcr.io/warmar94/net_backend_server:0.1}
+    # The image `migrate` pulled or built.
+    pull_policy: never
+    command: ["serve"]
     depends_on:
-      db:
+      migrate:
+        condition: service_completed_successfully
+      activate:
+        condition: service_completed_successfully
+    volumes: *server-volumes
+    networks: [backend, edge]
+    # Not published on the host: Caddy is the only way in.
+    expose: ["8080"]
+    restart: unless-stopped
+    # Covers server.shutdown_grace_secs (20 s) + up to 10 s per module shutdown (3 modules) + the
+    # pool close (5 s), with room to spare.
+    stop_grace_period: 90s
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/net-backend-server", "healthcheck"]
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    logging: *logging
+    <<: *hardened
+
+  caddy:
+    # A pinned minor version: the Caddyfile needs 2.8 or newer.
+    image: caddy:2.11
+    depends_on:
+      server:
         condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    configs:
+      - source: caddyfile
+        target: /etc/caddy/Caddyfile
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      edge:
+        ipv4_address: ${CADDY_IPV4:-172.30.250.10}
+        ipv6_address: ${CADDY_IPV6:-fd00:6e62:73::10}
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    # Caddy holds two sockets per proxied WebSocket.
+    ulimits:
+      nofile: { soft: 1048576, hard: 1048576 }
+    logging: *logging
+
+networks:
+  # The database and the server (and the migrate / backup runs). Not reachable from outside.
+  backend:
+    internal: true
+  # Caddy and the server, IPv4 + IPv6: with IPv6 on this network Docker forwards IPv6 clients to Caddy
+  # with their real address (otherwise they all arrive from the IPv4 gateway and share one address).
+  edge:
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: ${EDGE_SUBNET:-172.30.250.0/24}
+        - subnet: ${EDGE_SUBNET6:-fd00:6e62:73::/64}
 
 volumes:
   db_data:
+  db_secrets:
+  server_files:
+  caddy_data:
+  caddy_config:
 
-secrets:
-  db_password:
-    file: ./secrets/db_password
-  db_root_password:
-    file: ./secrets/db_root_password
+configs:
+  # HTTPS + WSS for DOMAIN, certificates from Let's Encrypt / ZeroSSL (ports 80 and 443 must reach
+  # this machine).
+  caddyfile:
+    content: |
+      {
+      	${ACME_EMAIL:+email ${ACME_EMAIL}}
+      	servers {
+      		timeouts {
+      			read_header 15s
+      			idle 2m
+      		}
+      	}
+      }
+
+      ${DOMAIN:?set DOMAIN in .env} {
+      	# The storage module's batch put carries up to ~4.2 MB (4 MiB of values plus JSON). A site-wide
+      	# limit applies to every route, so it must allow the largest one.
+      	request_body {
+      		max_size 5MB
+      	}
+
+      	header {
+      		Strict-Transport-Security "max-age=31536000"
+      		X-Content-Type-Options "nosniff"
+      		Referrer-Policy "no-referrer"
+      		-Server
+      	}
+
+      	# Access log without credentials: Authorization / Cookie headers removed, a `token` query
+      	# parameter deleted.
+      	log {
+      		output stdout
+      		format filter {
+      			wrap json
+      			request>headers>Authorization delete
+      			request>headers>Cookie delete
+      			request>uri query {
+      				delete token
+      			}
+      		}
+      	}
+
+      	# HTTP and WebSocket (/v1/ws) to the server, with X-Forwarded-For (trusted by the server only
+      	# from Caddy's fixed addresses).
+      	reverse_proxy server:8080 {
+      		# A configuration reload keeps open WebSockets for up to 5 minutes.
+      		stream_close_delay 5m
+      		transport http {
+      			dial_timeout 5s
+      		}
+      	}
+      }

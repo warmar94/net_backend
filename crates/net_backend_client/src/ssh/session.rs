@@ -1,8 +1,10 @@
-//! [`SshSession`]: one SSH connection (russh, ring), its commands and (feature `sftp`) its SFTP
-//! subsystem. Deadlines: connect + key exchange + host key check + authentication under ONE absolute
-//! deadline; each command / SFTP operation under its own. The socket is wrapped in a kill switch
-//! tied to the session: when the last handle (and the last running command) is gone, the socket is
-//! closed, nothing lingers.
+//! [`SshSession`]: one SSH session (russh, ring) on one connection at a time, its commands and
+//! (feature `sftp`) its SFTP subsystem. Deadlines: connect + key exchange + host key check +
+//! authentication under ONE absolute deadline; each command / SFTP operation under its own. Each
+//! connection's socket is wrapped in a kill switch: when the last handle (and the last running
+//! command) is gone, the socket is closed, nothing lingers. A supervisor task watches the
+//! connection: it reports the state and (with [`SshTarget::with_reconnect`](super::SshTarget::with_reconnect))
+//! opens a new connection after a loss.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -10,7 +12,8 @@ use std::future::Future;
 use std::io;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -22,7 +25,7 @@ use russh::keys::{Algorithm, HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicK
 use russh::{ChannelMsg, Disconnect, Preferred, Sig};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot, Notify, Semaphore};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Notify, Semaphore};
 use tokio::time::Instant;
 use zeroize::Zeroizing;
 
@@ -506,22 +509,143 @@ async fn authenticate(handle: &mut Handle<ClientHandler>, resolved: &Resolved, t
 // ---------------------------------------------------------------------------------------------
 // The session.
 
-pub(crate) struct Inner {
+/// One established connection (one TCP socket). A reconnect makes a new one; commands keep the
+/// one they started on.
+pub(crate) struct Link {
     pub(crate) handle: Handle<ClientHandler>,
-    fingerprint: String,
     lost: Arc<Lost>,
-    pub(crate) channels: Arc<Semaphore>,
-    pub(crate) target: SshTarget,
+    /// The SFTP subsystem of this connection, opened on first use.
     #[cfg(feature = "sftp")]
     pub(crate) sftp: tokio::sync::Mutex<Option<Arc<russh_sftp::client::RawSftpSession>>>,
-    /// Dropping it (the last handle and the last running command are gone) kills the socket.
+    /// Dropping it (the session and every command on this connection are gone) kills the socket.
     _kill: oneshot::Sender<()>,
 }
 
-/// One SSH connection to a server (feature `ssh`). Cheap to clone (clones share the connection).
-/// Commands run in parallel on their own channels (up to [`SshTarget::with_max_channels`]). The
-/// connection closes when [`close`](Self::close) is called, or when the last clone and the last
-/// running command are dropped. A lost connection is not reconnected: connect again.
+impl Link {
+    /// Whether this connection is gone (lost, or closed).
+    pub(crate) fn is_gone(&self) -> bool {
+        self.handle.is_closed() || self.lost.get().is_some()
+    }
+
+    /// Why it is gone.
+    pub(crate) fn reason(&self) -> String {
+        self.lost.get().unwrap_or_else(|| "the connection was lost".to_string())
+    }
+}
+
+/// Where the session is: on a connection, waiting to reconnect, connecting again, or closed.
+#[derive(Clone)]
+pub(crate) enum Conn {
+    Up(Arc<Link>),
+    Reconnecting { attempt: u32, retry_in: Duration },
+    Connecting,
+    Closed,
+}
+
+pub(crate) struct Inner {
+    fingerprint: String,
+    pub(crate) channels: Arc<Semaphore>,
+    pub(crate) target: SshTarget,
+    /// The current connection (the supervisor holds the sender).
+    conn: watch::Receiver<Conn>,
+    /// A template for event streams (the supervisor holds the sender: streams end with it).
+    events: Mutex<broadcast::Receiver<SshEvent>>,
+    /// Set by [`SshSession::close`]: the next loss is the app's close, never reconnected.
+    closed_by_app: AtomicBool,
+    close_requested: Notify,
+    /// Dropping it (the last handle and the last running command are gone) stops the supervisor.
+    _stop: oneshot::Sender<()>,
+}
+
+/// The state of an SSH session ([`SshSession::state`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SshState {
+    /// Connected and authenticated: commands run.
+    Connected,
+    /// The connection was lost and [`SshTarget::with_reconnect`] is set: the next attempt starts
+    /// after `retry_in`. New commands wait for it; none is re-run.
+    Reconnecting {
+        /// The number of the next attempt (1 for the first retry).
+        attempt: u32,
+        /// How long until it starts.
+        retry_in: Duration,
+    },
+    /// Connecting again (the attempt is running).
+    Connecting,
+    /// Closed for good (by the app, a loss without reconnect, out of attempts, or an error a
+    /// reconnect cannot fix): see the last [`SshEvent::Closed`].
+    Closed,
+}
+
+/// What happened to an SSH session ([`SshSession::events`]).
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum SshEvent {
+    /// Connected again after a loss (`reconnected` is `true`: the first connection is the one
+    /// [`SshSession::connect`] returned). Commands that waited go out now.
+    Connected {
+        /// Whether this is a reconnect.
+        reconnected: bool,
+    },
+    /// The connection was lost (or an attempt failed); the next attempt starts after `retry_in`.
+    Reconnecting {
+        /// The number of the next attempt (1 for the first retry).
+        attempt: u32,
+        /// How long until it starts.
+        retry_in: Duration,
+        /// Why the connection was lost or the attempt failed.
+        error: Error,
+    },
+    /// Closed for good: `None` = closed by the app; otherwise why (the loss, or the last
+    /// attempt's error). The last event.
+    Closed {
+        /// Why, unless the app closed it.
+        error: Option<Error>,
+    },
+}
+
+/// A stream of [`SshEvent`]s ([`SshSession::events`]).
+pub struct SshEvents {
+    receiver: broadcast::Receiver<SshEvent>,
+}
+
+impl fmt::Debug for SshEvents {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SshEvents")
+    }
+}
+
+impl SshEvents {
+    /// The next event; `None` after the session closed for good (its `Closed` event was delivered
+    /// first). A reader that fell behind skips the oldest events.
+    pub async fn next(&mut self) -> Option<SshEvent> {
+        loop {
+            match self.receiver.recv().await {
+                Ok(event) => return Some(event),
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    }
+
+    /// The next event if one is buffered (never blocks; no runtime needed).
+    pub fn try_next(&mut self) -> Option<SshEvent> {
+        loop {
+            match self.receiver.try_recv() {
+                Ok(event) => return Some(event),
+                Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(_) => return None,
+            }
+        }
+    }
+}
+
+/// One SSH session to a server (feature `ssh`). Cheap to clone (clones share it). Commands run in
+/// parallel on their own channels (up to [`SshTarget::with_max_channels`]). The session closes
+/// when [`close`](Self::close) is called, or when the last clone and the last running command are
+/// dropped. A lost connection ends the session, unless [`SshTarget::with_reconnect`] is set: then
+/// a new connection is opened (see [`SshReconnect`](super::SshReconnect)).
 #[derive(Clone)]
 pub struct SshSession {
     pub(crate) inner: Arc<Inner>,
@@ -529,61 +653,107 @@ pub struct SshSession {
 
 impl fmt::Debug for SshSession {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SshSession")
-            .field("host", &self.inner.target.host)
-            .field("fingerprint", &self.inner.fingerprint)
-            .field("closed", &self.is_closed())
-            .finish()
+        f.debug_struct("SshSession").field("host", &self.inner.target.host).field("fingerprint", &self.inner.fingerprint).field("state", &self.state()).finish()
     }
+}
+
+/// How many events each event stream buffers.
+const EVENT_BUFFER: usize = 64;
+/// How often the supervisor also looks at the connection (besides the loss notice).
+const WATCH_EVERY: Duration = Duration::from_millis(200);
+
+/// Connect once (TCP, key exchange, host key, login) under the target's connect timeout.
+async fn open_link(target: &SshTarget) -> Result<(Arc<Link>, String), Error> {
+    let deadline = deadline_after(target.connect_timeout);
+    let (kill_switch, kill) = oneshot::channel::<()>();
+    let lost = Arc::new(Lost::default());
+    let established = tokio::time::timeout_at(deadline, establish(target, kill, Arc::clone(&lost))).await;
+    let Established { handle, fingerprint } = match established {
+        Err(_) => {
+            let limit = target.connect_timeout;
+            return Err(Error::timeout(
+                format!("not connected within {limit:?} (TCP connect, key exchange, host key check and authentication together)"),
+                None,
+            ));
+        }
+        Ok(result) => result?,
+    };
+    let link = Link {
+        handle,
+        lost,
+        #[cfg(feature = "sftp")]
+        sftp: tokio::sync::Mutex::new(None),
+        _kill: kill_switch,
+    };
+    Ok((Arc::new(link), fingerprint))
 }
 
 impl SshSession {
     /// Connect, check the host key, authenticate: all under the target's connect timeout. Refused in
     /// a release build unless [`SshTarget::allow_in_release`]. Needs a tokio runtime (without one:
-    /// [`blocking::SshSession`](crate::blocking::SshSession)).
+    /// [`blocking::SshSession`](crate::blocking::SshSession)). An error here leaves nothing
+    /// running (also with [`SshTarget::with_reconnect`]: reconnects follow a lost connection).
     pub async fn connect(target: SshTarget) -> Result<Self, Error> {
-        crate::runtime::current()?;
+        let runtime = crate::runtime::current()?;
         if !target.is_allowed() {
             return Err(Error::invalid("SSH is disabled in release builds (an SSH key in a shipped program is shell access for anyone); SshTarget::allow_in_release(true) for internal admin tools"));
         }
         target.validate()?;
-        let deadline = deadline_after(target.connect_timeout);
-        let (kill_switch, kill) = oneshot::channel::<()>();
-        let lost = Arc::new(Lost::default());
-        let established = tokio::time::timeout_at(deadline, establish(&target, kill, Arc::clone(&lost))).await;
-        let Established { handle, fingerprint } = match established {
-            Err(_) => {
-                let limit = target.connect_timeout;
-                return Err(Error::timeout(
-                    format!("not connected within {limit:?} (TCP connect, key exchange, host key check and authentication together)"),
-                    None,
-                ));
-            }
-            Ok(result) => result?,
-        };
+        let (link, fingerprint) = open_link(&target).await?;
         tracing::debug!("net_backend_client: ssh connected to `{}` ({fingerprint})", target.host);
-        Ok(Self {
-            inner: Arc::new(Inner {
-                handle,
-                fingerprint,
-                lost,
-                channels: Arc::new(Semaphore::new(target.max_channels)),
-                target,
-                #[cfg(feature = "sftp")]
-                sftp: tokio::sync::Mutex::new(None),
-                _kill: kill_switch,
-            }),
-        })
+        let (conn_sender, conn) = watch::channel(Conn::Up(link));
+        let (events_sender, events) = broadcast::channel(EVENT_BUFFER);
+        let (stop, stopped) = oneshot::channel();
+        let inner = Arc::new(Inner {
+            fingerprint,
+            channels: Arc::new(Semaphore::new(target.max_channels)),
+            target,
+            conn,
+            events: Mutex::new(events),
+            closed_by_app: AtomicBool::new(false),
+            close_requested: Notify::new(),
+            _stop: stop,
+        });
+        runtime.spawn(supervise(Arc::downgrade(&inner), stopped, conn_sender, events_sender));
+        Ok(Self { inner })
     }
 
-    /// The server's host key fingerprint (`SHA256:…`), as checked.
+    /// The server's host key fingerprint (`SHA256:…`) as checked when the session connected (a
+    /// reconnect checks the host key again, by the same rules).
     pub fn fingerprint(&self) -> &str {
         &self.inner.fingerprint
     }
 
-    /// Whether the connection is gone (lost, or closed).
+    /// Whether the session is gone: closed for good, or (without reconnect) its connection was lost.
     pub fn is_closed(&self) -> bool {
-        self.inner.handle.is_closed() || self.inner.lost.get().is_some()
+        match &*self.inner.conn.borrow() {
+            Conn::Closed => true,
+            Conn::Up(link) => link.is_gone() && self.inner.target.reconnect.is_none(),
+            Conn::Reconnecting { .. } | Conn::Connecting => false,
+        }
+    }
+
+    /// The current state.
+    pub fn state(&self) -> SshState {
+        match &*self.inner.conn.borrow() {
+            Conn::Up(link) if link.is_gone() && self.inner.target.reconnect.is_none() => SshState::Closed,
+            Conn::Up(_) => SshState::Connected,
+            Conn::Reconnecting { attempt, retry_in } => SshState::Reconnecting { attempt: *attempt, retry_in: *retry_in },
+            Conn::Connecting => SshState::Connecting,
+            Conn::Closed => SshState::Closed,
+        }
+    }
+
+    /// What happens to the session (reconnecting, connected again, closed). Only events after this
+    /// call.
+    pub fn events(&self) -> SshEvents {
+        SshEvents { receiver: self.inner.events.lock().unwrap_or_else(PoisonError::into_inner).resubscribe() }
+    }
+
+    /// Wait until the session is closed for good (async).
+    pub async fn closed(&self) {
+        let mut conn = self.inner.conn.clone();
+        let _ = conn.wait_for(|c| matches!(c, Conn::Closed)).await;
     }
 
     /// Run a command and collect its whole output (stdout + stderr up to the output limit). A
@@ -623,10 +793,131 @@ impl SshSession {
         SshRun { chunks, exit, _cancel: cancel }
     }
 
-    /// Close the connection (politely, bounded); running commands end with `Disconnected`.
+    /// Close the session (politely, bounded), also while it reconnects; running commands end with
+    /// `Disconnected`. Never reconnected.
     pub async fn close(&self) {
-        let _ = tokio::time::timeout(GOODBYE, self.inner.handle.disconnect(Disconnect::ByApplication, "", "en")).await;
-        self.inner.lost.set("the session was closed by the app".into());
+        self.inner.closed_by_app.store(true, Ordering::SeqCst);
+        self.inner.close_requested.notify_one();
+        let link = match &*self.inner.conn.borrow() {
+            Conn::Up(link) => Some(Arc::clone(link)),
+            _ => None,
+        };
+        if let Some(link) = link {
+            let _ = tokio::time::timeout(GOODBYE, link.handle.disconnect(Disconnect::ByApplication, "", "en")).await;
+            link.lost.set("the session was closed by the app".into());
+        }
+        let mut conn = self.inner.conn.clone();
+        let _ = tokio::time::timeout(GOODBYE, conn.wait_for(|c| matches!(c, Conn::Closed))).await;
+    }
+}
+
+/// The connection to use now: the current one, or (while reconnecting) the next one, bounded by
+/// `deadline`; cancelled when `cancel` fires.
+pub(crate) async fn current_link(inner: &Inner, deadline: Instant, cancel: &mut oneshot::Receiver<()>) -> Race<Result<Arc<Link>, Error>> {
+    let mut conn = inner.conn.clone();
+    loop {
+        let now = match &*conn.borrow_and_update() {
+            Conn::Up(link) if !link.is_gone() => Some(Ok(Arc::clone(link))),
+            Conn::Up(link) if inner.target.reconnect.is_none() => Some(Err(Error::disconnected(link.reason(), Some(false)))),
+            Conn::Closed => Some(Err(Error::disconnected("the SSH session is closed", Some(false)))),
+            _ => None,
+        };
+        if let Some(result) = now {
+            return Race::Done(result);
+        }
+        match race(conn.changed(), deadline, cancel).await {
+            Race::Done(Ok(())) => {}
+            Race::Done(Err(_)) => return Race::Done(Err(Error::disconnected("the SSH session is closed", Some(false)))),
+            Race::TimedOut => return Race::TimedOut,
+            Race::Cancelled => return Race::Cancelled,
+        }
+    }
+}
+
+/// Errors a reconnect cannot fix (the same rules as `bevy_net_backend`).
+fn is_permanent(error: &Error) -> bool {
+    matches!(error, Error::HostKey { .. } | Error::AuthFailed(_) | Error::Ssh(_) | Error::InvalidRequest(_))
+}
+
+/// The supervisor: waits for the connection to be lost, then reconnects (if set) or closes. Ends
+/// when the session is closed for good or every handle is gone (`stop`).
+async fn supervise(inner: Weak<Inner>, mut stop: oneshot::Receiver<()>, conn: watch::Sender<Conn>, events: broadcast::Sender<SshEvent>) {
+    let finish = |error: Option<Error>| {
+        if let Some(error) = &error {
+            tracing::info!("net_backend_client: the SSH session closed for good ({error})");
+        }
+        conn.send_replace(Conn::Closed);
+        let _ = events.send(SshEvent::Closed { error });
+    };
+    let mut attempt: u32 = 0;
+    let mut up_since = Instant::now();
+    loop {
+        // 1. Wait until the current connection is gone.
+        let Conn::Up(link) = conn.borrow().clone() else { return };
+        loop {
+            let Some(session) = inner.upgrade() else { return };
+            let notified = link.lost.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if link.is_gone() {
+                break;
+            }
+            drop(session);
+            tokio::select! {
+                _ = &mut stop => return,
+                () = notified => {}
+                () = tokio::time::sleep(WATCH_EVERY) => {}
+            }
+        }
+        let Some(session) = inner.upgrade() else { return };
+        if session.closed_by_app.load(Ordering::SeqCst) {
+            return finish(None);
+        }
+        let lost = Error::disconnected(link.reason(), None);
+        drop(link);
+        let Some(policy) = session.target.reconnect.clone() else { return finish(Some(lost)) };
+        tracing::debug!("net_backend_client: ssh `{}` lost ({lost}); reconnecting", session.target.host);
+        if up_since.elapsed() >= policy.stable_after() {
+            attempt = 0;
+        }
+        // 2. Reconnect with backoff until a connection is up or the answer is final.
+        let mut last = lost;
+        loop {
+            attempt = attempt.saturating_add(1);
+            if !policy.may_retry(attempt) {
+                return finish(Some(last));
+            }
+            let delay = policy.delay(attempt, crate::tls::random_u64());
+            conn.send_replace(Conn::Reconnecting { attempt, retry_in: delay });
+            let _ = events.send(SshEvent::Reconnecting { attempt, retry_in: delay, error: last.clone() });
+            tokio::select! {
+                _ = &mut stop => return,
+                () = session.close_requested.notified() => return finish(None),
+                () = tokio::time::sleep(delay) => {}
+            }
+            conn.send_replace(Conn::Connecting);
+            let target = session.target.clone();
+            let opened = tokio::select! {
+                _ = &mut stop => return,
+                () = session.close_requested.notified() => return finish(None),
+                opened = open_link(&target) => opened,
+            };
+            match opened {
+                Ok((link, fingerprint)) => {
+                    tracing::debug!("net_backend_client: ssh reconnected to `{}` ({fingerprint})", target.host);
+                    if session.closed_by_app.load(Ordering::SeqCst) {
+                        return finish(None);
+                    }
+                    conn.send_replace(Conn::Up(link));
+                    let _ = events.send(SshEvent::Connected { reconnected: true });
+                    up_since = Instant::now();
+                    break;
+                }
+                Err(error) if is_permanent(&error) => return finish(Some(error)),
+                Err(error) => last = error,
+            }
+        }
+        drop(session);
     }
 }
 
@@ -724,8 +1015,8 @@ pub(crate) async fn race<F: Future>(future: F, deadline: Instant, cancel: &mut o
 /// Open a session channel under the request's deadline without leaking it: when the request is
 /// cancelled or times out while the server is still opening it, a small task waits (bounded) for
 /// the channel and closes it, so the server's channel slots (`MaxSessions`) are not used up.
-async fn open_channel(inner: &Arc<Inner>, deadline: Instant, cancel: &mut oneshot::Receiver<()>) -> Race<Result<russh::Channel<client::Msg>, russh::Error>> {
-    let owner = Arc::clone(inner);
+async fn open_channel(link: &Arc<Link>, deadline: Instant, cancel: &mut oneshot::Receiver<()>) -> Race<Result<russh::Channel<client::Msg>, russh::Error>> {
+    let owner = Arc::clone(link);
     let mut opening = tokio::spawn(async move { owner.handle.channel_open_session().await });
     match race(&mut opening, deadline, cancel).await {
         Race::Done(Ok(result)) => Race::Done(result),
@@ -774,22 +1065,30 @@ async fn exec(
     let finish = |result| {
         let _ = exit.send(result);
     };
-    if let Some(reason) = inner.lost.get() {
-        return finish(Err(Error::disconnected(reason, Some(false))));
-    }
-    // 1. A free channel slot, then a channel: nothing is sent to the shell yet.
+    // 1. A free channel slot, a connection (waiting while it reconnects), then a channel: nothing
+    // is sent to the shell yet.
     let _permit = match race(Arc::clone(&inner.channels).acquire_owned(), deadline, &mut cancel).await {
         Race::Done(Ok(permit)) => permit,
         Race::Done(Err(_)) => return finish(Err(Error::disconnected("the session is closing", Some(false)))),
         Race::TimedOut => return finish(Err(Error::timeout(format!("not sent: no free channel within {timeout:?}"), Some(false)))),
         Race::Cancelled => return,
     };
-    let mut channel = match open_channel(&inner, deadline, &mut cancel).await {
-        Race::Done(Ok(channel)) => channel,
-        Race::Done(Err(e)) if inner.handle.is_closed() => return finish(Err(Error::disconnected(format!("could not open a channel: {e}"), Some(false)))),
-        Race::Done(Err(e)) => return finish(Err(Error::Ssh(format!("could not open a channel: {e}")))),
-        Race::TimedOut => return finish(Err(Error::timeout(format!("not sent: the server did not open a channel within {timeout:?}"), Some(false)))),
-        Race::Cancelled => return,
+    let (link, mut channel) = loop {
+        let link = match current_link(&inner, deadline, &mut cancel).await {
+            Race::Done(Ok(link)) => link,
+            Race::Done(Err(error)) => return finish(Err(error)),
+            Race::TimedOut => return finish(Err(Error::timeout(format!("not sent: not connected within {timeout:?}"), Some(false)))),
+            Race::Cancelled => return,
+        };
+        match open_channel(&link, deadline, &mut cancel).await {
+            Race::Done(Ok(channel)) => break (link, channel),
+            // The connection died under it: with reconnect, wait for the next one.
+            Race::Done(Err(_)) if link.is_gone() && inner.target.reconnect.is_some() => {}
+            Race::Done(Err(e)) if link.is_gone() => return finish(Err(Error::disconnected(format!("could not open a channel: {e}"), Some(false)))),
+            Race::Done(Err(e)) => return finish(Err(Error::Ssh(format!("could not open a channel: {e}")))),
+            Race::TimedOut => return finish(Err(Error::timeout(format!("not sent: the server did not open a channel within {timeout:?}"), Some(false)))),
+            Race::Cancelled => return,
+        }
     };
     // 2. The exec request.
     match race(channel.exec(true, command.command.as_bytes()), deadline, &mut cancel).await {
@@ -893,7 +1192,7 @@ async fn exec(
         }
     }
     let _ = tokio::time::timeout(GOODBYE, channel.close()).await;
-    if status.is_none() && signal.is_none() && (gone || inner.handle.is_closed()) {
+    if status.is_none() && signal.is_none() && (gone || link.handle.is_closed()) {
         return finish(Err(Error::disconnected("the connection was lost before the command ended", Some(true))));
     }
     drop(chunks);

@@ -185,7 +185,9 @@ pub struct AuthConfig {
     pub audit_retention_days: u32,
     /// How often the server reads revocations made by other processes (the command line, another
     /// instance) from the database and passes them to `subscribe_revocations` receivers, seconds.
-    /// Default 5 (0 = never: only this process's revocations are broadcast).
+    /// Default 5; at most 3600. 0 = never (only this process's revocations are broadcast), allowed
+    /// only with `ws.enabled = false`: with the WebSocket hub on, 0 is refused, because a ban made
+    /// by the command line or another instance would then never close open sockets.
     pub revocation_poll_secs: u64,
 }
 

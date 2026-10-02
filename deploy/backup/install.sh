@@ -4,7 +4,7 @@
 #   /etc/net-backend/backup.env (kept if it exists), net-backend-backup.service + .timer (enabled).
 #
 #   sudo bash deploy/backup/install.sh --mode systemd
-#   sudo bash deploy/backup/install.sh --mode docker --compose-dir /opt/net_backend/deploy/docker
+#   sudo bash deploy/backup/install.sh --mode docker --compose-dir /opt/net-backend
 set -euo pipefail
 
 mode="" compose_dir="" keep_days=14 backup_dir=/var/backups/net-backend
@@ -26,8 +26,13 @@ case "$mode" in systemd | docker) ;; *) echo "--mode systemd|docker is required"
 [ "$(id -u)" -eq 0 ] || { echo "run as root" >&2; exit 77; }
 here="$(cd "$(dirname "$0")" && pwd)"
 if [ "$mode" = docker ]; then
-	[ -n "$compose_dir" ] || compose_dir="$(cd "$here/../docker" && pwd)"
-	[ -f "$compose_dir/compose.yaml" ] || { echo "no compose.yaml in $compose_dir" >&2; exit 66; }
+	[ -n "$compose_dir" ] || { echo "--compose-dir <the folder with compose.yaml and .env> is required with --mode docker" >&2; exit 64; }
+	compose_dir="$(cd "$compose_dir" && pwd)"
+	found=0
+	for f in compose.yaml compose.yml docker-compose.yaml docker-compose.yml; do
+		[ -f "$compose_dir/$f" ] && found=1
+	done
+	[ "$found" -eq 1 ] || { echo "no compose.yaml in $compose_dir" >&2; exit 66; }
 fi
 
 install -m 0755 "$here/backup.sh" /usr/local/bin/net-backend-backup
@@ -40,7 +45,7 @@ else
 	sed -e "s|^NBS_BACKUP_MODE=.*|NBS_BACKUP_MODE=${mode}|" \
 		-e "s|^NBS_BACKUP_DIR=.*|NBS_BACKUP_DIR=${backup_dir}|" \
 		-e "s|^NBS_BACKUP_KEEP_DAYS=.*|NBS_BACKUP_KEEP_DAYS=${keep_days}|" \
-		-e "s|^NBS_COMPOSE_DIR=.*|NBS_COMPOSE_DIR=${compose_dir:-/opt/net_backend/deploy/docker}|" \
+		-e "s|^NBS_COMPOSE_DIR=.*|NBS_COMPOSE_DIR=${compose_dir:-/opt/net-backend}|" \
 		"$here/backup.env.example" >/etc/net-backend/backup.env
 	chmod 0644 /etc/net-backend/backup.env
 	echo "wrote    /etc/net-backend/backup.env"

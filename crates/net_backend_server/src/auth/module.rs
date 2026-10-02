@@ -107,7 +107,15 @@ impl Auth {
             (None, Some(config)) => config,
             (None, None) => AuthConfig::default(),
         };
-        config.resolve()
+        let config = config.resolve()?;
+        if config.revocation_poll_secs == 0 && setup.config().ws.enabled {
+            // Without the poll, a ban or revocation made by another process (the command line,
+            // another instance) would never close this server's open sockets.
+            return Err(Error::Config(vec![
+                "modules.auth.revocation_poll_secs must be at least 1 while ws.enabled = true (revocations made by the command line or another instance close open WebSockets through it)".into(),
+            ]));
+        }
+        Ok(config)
     }
 
     fn mailer_for(&self, config: &AuthConfig) -> Result<Arc<dyn Mailer>, Error> {

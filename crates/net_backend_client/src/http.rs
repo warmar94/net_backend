@@ -1,25 +1,145 @@
 //! The HTTP transport: hyper 1 (HTTP/1.1) through hyper-util's pooled client and hyper-rustls with
 //! the crate's ring config. One deadline covers connecting, sending and reading the whole answer;
 //! the answer body is capped; redirects are never followed; nothing is decompressed (the client
-//! never asks for compression, so there is nothing to inflate and no compression bomb).
+//! never asks for compression, so there is nothing to inflate and no compression bomb). A proxy
+//! (from the environment or the builder) is an HTTP CONNECT tunnel, never used for loopback.
 
+use std::fmt;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
 use http::header::{HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, DATE, RETRY_AFTER, USER_AGENT};
-use http::{Method, Request};
+use http::{Method, Request, Uri};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper_rustls::HttpsConnector;
+use hyper_util::client::legacy::connect::proxy::Tunnel;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client as HyperClient;
+use hyper_util::client::proxy::matcher::Matcher;
 use hyper_util::rt::TokioExecutor;
 use net_backend_protocol::{ErrorBody, HttpCall, PayloadKind, PROTOCOL_HEADER, PROTOCOL_VERSION};
 use serde::de::DeserializeOwned;
+use serde::Serialize;
 use tokio::time::Instant;
+use zeroize::Zeroizing;
 
 use crate::Error;
+
+/// Where the proxy comes from ([`ClientBuilder::proxy`](crate::ClientBuilder::proxy)).
+#[derive(Clone, Debug, Default)]
+pub(crate) enum ProxySetting {
+    /// `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` / `NO_PROXY` (and the lowercase forms).
+    #[default]
+    Env,
+    /// This proxy for every host that is not loopback.
+    Url(String),
+    /// No proxy.
+    Off,
+}
+
+/// The HTTP proxy every connection of a client goes through: an HTTP CONNECT tunnel.
+#[derive(Clone)]
+pub(crate) struct Proxy {
+    pub(crate) uri: Uri,
+    /// `Proxy-Authorization: Basic …` (from `user:password@` in the proxy URL).
+    pub(crate) auth: Option<HeaderValue>,
+}
+
+impl fmt::Debug for Proxy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Never the credentials.
+        f.debug_struct("Proxy").field("host", &self.uri.host()).field("port", &self.uri.port_u16()).field("auth", &self.auth.is_some()).finish()
+    }
+}
+
+impl Proxy {
+    /// The proxy for `base` under `setting`: none for loopback, none when the rules say so.
+    /// Only `http://` proxies (HTTP CONNECT) are used: another scheme is refused, so a request
+    /// never bypasses a proxy that was asked for.
+    pub(crate) fn resolve(setting: &ProxySetting, base: &BaseUrl) -> Result<Option<Self>, Error> {
+        if base.is_loopback() {
+            return Ok(None);
+        }
+        let matcher = match setting {
+            ProxySetting::Off => return Ok(None),
+            ProxySetting::Env => Matcher::from_env(),
+            ProxySetting::Url(url) => {
+                let uri: Uri = url.trim().parse().map_err(|_| Error::invalid("the proxy URL does not parse (use http://host:port)"))?;
+                if uri.scheme_str() != Some("http") || uri.host().is_none_or(str::is_empty) {
+                    return Err(Error::invalid("the proxy URL must be http://[user:password@]host:port (an HTTP CONNECT proxy)"));
+                }
+                Matcher::builder().all(url.trim().to_string()).build()
+            }
+        };
+        Self::from_matcher(&matcher, base)
+    }
+
+    fn from_matcher(matcher: &Matcher, base: &BaseUrl) -> Result<Option<Self>, Error> {
+        let destination: Uri = base.url("/").parse().map_err(|_| Error::invalid("the server URL is not valid"))?;
+        let Some(intercept) = matcher.intercept(&destination) else { return Ok(None) };
+        if intercept.uri().scheme_str() != Some("http") {
+            return Err(Error::invalid(format!(
+                "the proxy for `{}` is not an http:// proxy (only HTTP CONNECT proxies are used); set ClientBuilder::proxy or ClientBuilder::no_proxy",
+                base.host
+            )));
+        }
+        Ok(Some(Self { uri: intercept.uri().clone(), auth: intercept.basic_auth().cloned() }))
+    }
+
+    fn tunnel(&self) -> Tunnel<HttpConnector> {
+        let tunnel = Tunnel::new(self.uri.clone(), HttpConnector::new());
+        match &self.auth {
+            Some(auth) => tunnel.with_auth(auth.clone()),
+            None => tunnel,
+        }
+    }
+
+    /// A TCP stream to `host:port` through the proxy (the CONNECT answered 200).
+    #[cfg(feature = "ws")]
+    pub(crate) async fn connect(&self, host: &str, port: u16) -> Result<tokio::net::TcpStream, Error> {
+        use tower_service::Service;
+        let mut tunnel = self.tunnel();
+        let host = if host.contains(':') { format!("[{host}]") } else { host.to_string() };
+        let destination: Uri = format!("http://{host}:{port}/").parse().map_err(|_| Error::invalid("the host is not valid for a proxy tunnel"))?;
+        let fail = |e: &(dyn std::error::Error + 'static)| Error::network(format!("could not connect through the proxy: {}", chain(e)), Some(false));
+        std::future::poll_fn(|cx| tunnel.poll_ready(cx)).await.map_err(|e| fail(&e))?;
+        let io = tunnel.call(destination).await.map_err(|e| fail(&e))?;
+        Ok(io.into_inner())
+    }
+}
+
+/// `Bearer <token>` as a header value, built in a pre-sized buffer that is wiped when dropped.
+/// The header value itself (inside the request) is not wiped.
+pub(crate) fn bearer_header(token: &str) -> Result<HeaderValue, Error> {
+    let mut text = Zeroizing::new(String::with_capacity(token.len().saturating_add(7)));
+    text.push_str("Bearer ");
+    text.push_str(token);
+    let mut value = HeaderValue::from_str(&text).map_err(|_| Error::invalid("the access token is not a valid header value"))?;
+    value.set_sensitive(true);
+    Ok(value)
+}
+
+/// `value` as JSON in one exactly sized buffer that is overwritten with zeros when the last copy
+/// of the returned `Bytes` is dropped (a request body can hold a password or a refresh token).
+pub(crate) fn wiped_json<T: Serialize + ?Sized>(value: &T) -> Result<Bytes, serde_json::Error> {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(buf.len());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, value)?;
+    let mut buffer = Zeroizing::new(Vec::with_capacity(count.0));
+    serde_json::to_writer(&mut *buffer, value)?;
+    Ok(Bytes::from_owner(buffer))
+}
 
 /// `http://` or `https://`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,9 +229,7 @@ impl Outgoing {
         let method = Method::from_bytes(C::ROUTE.method.as_str().as_bytes()).map_err(|_| Error::invalid("unknown HTTP method"))?;
         let mut path = call.path().ok_or_else(|| Error::invalid(format!("a path parameter of `{}` is missing or would need escaping", C::ROUTE.path)))?;
         let body = match C::PAYLOAD {
-            PayloadKind::Json => {
-                Some(Bytes::from(serde_json::to_vec(call.payload()).map_err(|e| Error::invalid(format!("the JSON body cannot be encoded: {e}")))?))
-            }
+            PayloadKind::Json => Some(wiped_json(call.payload()).map_err(|e| Error::invalid(format!("the JSON body cannot be encoded: {e}")))?),
             PayloadKind::Query => {
                 let pairs = net_backend_protocol::http_call::query_pairs(call.payload()).map_err(|e| Error::invalid(e.message))?;
                 if !pairs.is_empty() {
@@ -169,20 +287,35 @@ impl Answer {
     }
 }
 
+/// The connection pool: straight to the server, or through a proxy's CONNECT tunnel.
+#[derive(Clone)]
+enum Pool {
+    Direct(HyperClient<HttpsConnector<HttpConnector>, Full<Bytes>>),
+    Tunnel(HyperClient<HttpsConnector<Tunnel<HttpConnector>>, Full<Bytes>>),
+}
+
 /// The pooled HTTP(S) client.
 #[derive(Clone)]
 pub(crate) struct Http {
-    client: HyperClient<HttpsConnector<HttpConnector>, Full<Bytes>>,
+    pool: Pool,
     pub(crate) base: BaseUrl,
     max_body: usize,
+    /// The proxy every connection of this client goes through (HTTP and the WebSocket).
+    #[cfg_attr(not(feature = "ws"), allow(dead_code))]
+    pub(crate) proxy: Option<Proxy>,
 }
 
 impl Http {
-    pub(crate) fn new(base: BaseUrl, max_body: usize) -> Result<Self, Error> {
+    pub(crate) fn new(base: BaseUrl, max_body: usize, proxy: Option<Proxy>) -> Result<Self, Error> {
         let tls = crate::tls::client_config().map_err(|e| Error::Tls(format!("the TLS configuration could not be built: {e}")))?;
-        let connector = hyper_rustls::HttpsConnectorBuilder::new().with_tls_config(tls).https_or_http().enable_http1().build();
-        let client = HyperClient::builder(TokioExecutor::new()).pool_idle_timeout(Duration::from_secs(30)).build(connector);
-        Ok(Self { client, base, max_body })
+        let builder = HyperClient::builder(TokioExecutor::new()).pool_idle_timeout(Duration::from_secs(30)).clone();
+        let pool = match &proxy {
+            None => Pool::Direct(builder.build(hyper_rustls::HttpsConnectorBuilder::new().with_tls_config(tls).https_or_http().enable_http1().build())),
+            Some(proxy) => Pool::Tunnel(
+                builder.build(hyper_rustls::HttpsConnectorBuilder::new().with_tls_config(tls).https_or_http().enable_http1().wrap_connector(proxy.tunnel())),
+            ),
+        };
+        Ok(Self { pool, base, max_body, proxy })
     }
 
     /// Send `out` (with `Authorization: Bearer <token>` when given) and read the whole answer
@@ -195,9 +328,7 @@ impl Http {
             .header(USER_AGENT, concat!("net_backend_client/", env!("CARGO_PKG_VERSION")))
             .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string());
         if let Some(token) = bearer {
-            let mut value = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| Error::invalid("the access token is not a valid header value"))?;
-            value.set_sensitive(true);
-            builder = builder.header(AUTHORIZATION, value);
+            builder = builder.header(AUTHORIZATION, bearer_header(token)?);
         }
         let body = match &out.body {
             Some(body) => {
@@ -208,8 +339,13 @@ impl Http {
         };
         let request = builder.body(body).map_err(|e| Error::invalid(format!("the request could not be built: {e}")))?;
         let answered = AtomicBool::new(false);
+        crate::runtime::mark_handed();
+        let pending = match &self.pool {
+            Pool::Direct(client) => client.request(request),
+            Pool::Tunnel(client) => client.request(request),
+        };
         let exchange = async {
-            let response = self.client.request(request).await.map_err(map_hyper_error)?;
+            let response = pending.await.map_err(map_hyper_error)?;
             answered.store(true, Ordering::Relaxed);
             let status = response.status().as_u16();
             let headers = response.headers();
@@ -352,6 +488,45 @@ mod tests {
         let out = Outgoing::for_call(&RemoveObject::new("saves", "a").if_version(ObjectVersion::new(3))).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(out.path, "/v1/storage/saves/a?if_version=3");
         assert_eq!(encode("a b/c+ä~"), "a%20b%2Fc%2B%C3%A4~");
+    }
+
+    #[test]
+    fn proxies_follow_the_rules_and_never_loopback() {
+        let https = BaseUrl::parse("https://api.example.com").unwrap_or_else(|e| panic!("{e}"));
+        let plain = BaseUrl::parse("http://lan.example.com:8080").unwrap_or_else(|e| panic!("{e}"));
+        let local = BaseUrl::parse("http://127.0.0.1:8080").unwrap_or_else(|e| panic!("{e}"));
+        let matcher = || {
+            Matcher::builder()
+                .https("http://user:fake-pw@proxy.example.com:3128")
+                .http("http://plain-proxy.example.com:80")
+                .no("internal.example.com, 10.0.0.0/8")
+        };
+        let proxy = Proxy::from_matcher(&matcher().build(), &https).unwrap_or_else(|e| panic!("{e}")).unwrap_or_else(|| panic!("intercepted"));
+        assert_eq!((proxy.uri.host(), proxy.uri.port_u16(), proxy.auth.is_some()), (Some("proxy.example.com"), Some(3128), true));
+        assert!(!format!("{proxy:?}").contains("fake-pw"), "never the credentials");
+        let proxy = Proxy::from_matcher(&matcher().build(), &plain).unwrap_or_else(|e| panic!("{e}")).unwrap_or_else(|| panic!("intercepted"));
+        assert_eq!((proxy.uri.host(), proxy.auth.is_none()), (Some("plain-proxy.example.com"), true));
+        for skipped in ["https://internal.example.com", "https://a.internal.example.com", "https://10.1.2.3"] {
+            let base = BaseUrl::parse(skipped).unwrap_or_else(|e| panic!("{e}"));
+            assert!(Proxy::from_matcher(&matcher().build(), &base).is_ok_and(|p| p.is_none()), "{skipped}: NO_PROXY");
+        }
+        let socks = Matcher::builder().all("socks5://127.0.0.1:1080").build();
+        assert!(matches!(Proxy::from_matcher(&socks, &https), Err(Error::InvalidRequest(_))), "never bypass a proxy that was asked for");
+        // Loopback never uses a proxy, whatever is set; `Off` never does.
+        assert!(Proxy::resolve(&ProxySetting::Url("http://proxy.example.com:3128".into()), &local).is_ok_and(|p| p.is_none()));
+        assert!(Proxy::resolve(&ProxySetting::Off, &https).is_ok_and(|p| p.is_none()));
+        assert!(Proxy::resolve(&ProxySetting::Url("http://proxy.example.com:3128".into()), &https).is_ok_and(|p| p.is_some()));
+        assert!(Proxy::resolve(&ProxySetting::Url("ftp://proxy.example.com".into()), &https).is_err());
+    }
+
+    #[test]
+    fn secret_buffers_hold_exactly_the_text() {
+        let value = serde_json::json!({"password": "fake-pw-1234", "n": [1, 2]});
+        let body = wiped_json(&value).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(serde_json::to_vec(&value).ok().as_deref(), Some(&body[..]));
+        let header = bearer_header("nbsa_fake").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((header.to_str().ok(), header.is_sensitive()), (Some("Bearer nbsa_fake"), true));
+        assert!(bearer_header("bad\ntoken").is_err());
     }
 
     #[test]

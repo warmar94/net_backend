@@ -28,12 +28,13 @@ use crate::state::AppState;
 pub const MAX_ROOM_NAME_BYTES: usize = 128;
 
 /// How long the hub remembers revocations, to refuse a socket whose token was checked just before
-/// its session (or its user) was revoked.
+/// its session (or its user) was revoked. A token checked longer ago than this is checked again
+/// before its socket is registered.
 const RECENT_REVOCATIONS: Duration = Duration::from_secs(30);
 
-/// After a `Lagged` revocation stream, re-read the sessions table from this long before the last
-/// revocation seen.
-const LAG_OVERLAP_MS: i64 = 10_000;
+/// The most revocations the hub remembers; evicting a younger one than the window forces a
+/// re-check of every token checked before it.
+const RECENT_REVOCATIONS_MAX: usize = 4096;
 
 /// Users per role query of the periodic role refresh.
 const ROLE_REFRESH_CHUNK: usize = 500;
@@ -370,6 +371,9 @@ struct Registry {
     rooms: HashMap<Arc<str>, HashSet<ConnectionId>>,
     /// Recent revocations (at, revocation), under the same lock as `set_user`.
     recent: VecDeque<(Instant, Revocation)>,
+    /// The newest revocation evicted from `recent` within the window (the cap overflowed): a token
+    /// checked at or before it must be checked again.
+    overflow_at: Option<Instant>,
 }
 
 /// Told when the hub took a socket out of a room on a [`Control::LeaveRoom`] (the chat module's
@@ -395,6 +399,8 @@ pub(crate) struct Inner {
     pub(crate) authenticators: Arc<[Arc<dyn Authenticator>]>,
     handshakes: Option<KeyedBuckets<IpAddr>>,
     metrics: bool,
+    /// `RECENT_REVOCATIONS` in milliseconds (shorter only in tests).
+    revocation_window_ms: AtomicU64,
 }
 
 /// The WebSocket hub: pushes, rooms and the open sockets. Cheap to clone. Get it with
@@ -505,7 +511,31 @@ impl Hub {
             authenticators,
             handshakes,
             metrics,
+            revocation_window_ms: AtomicU64::new(u64::try_from(RECENT_REVOCATIONS.as_millis()).unwrap_or(30_000)),
         }))
+    }
+
+    /// How long revocations are remembered (see `RECENT_REVOCATIONS`).
+    fn revocation_window(&self) -> Duration {
+        Duration::from_millis(self.0.revocation_window_ms.load(Ordering::Relaxed))
+    }
+
+    /// Shorten how long revocations are remembered (default 30 s), so a test can check the re-check
+    /// of tokens checked longer ago. Not for production use.
+    #[doc(hidden)]
+    pub fn set_revocation_window_for_tests(&self, window: Duration) {
+        self.0.revocation_window_ms.store(u64::try_from(window.as_millis()).unwrap_or(u64::MAX).max(1), Ordering::Relaxed);
+    }
+
+    /// Whether a token checked at `checked_at` must be checked again before its socket is
+    /// registered: longer ago than the revocation window, or before a revocation the full memory
+    /// had to evict.
+    pub(crate) fn needs_recheck(&self, checked_at: Instant) -> bool {
+        Self::stale(&self.read(), checked_at, self.revocation_window())
+    }
+
+    fn stale(registry: &Registry, checked_at: Instant, window: Duration) -> bool {
+        checked_at.elapsed() >= window || registry.overflow_at.is_some_and(|at| checked_at <= at)
     }
 
     fn read(&self) -> RwLockReadGuard<'_, Registry> {
@@ -896,12 +926,17 @@ impl Hub {
 
     /// Mark a socket as authenticated for `user` / `session` with `roles`, unless a revocation
     /// covering it arrived after `checked_at` (when the token was checked): then `Err` with that
-    /// revocation's close code (4001 / 4003). When the user then has more than
+    /// revocation's close code (4001 / 4003). `Err(1013)` when the check is too old to tell (see
+    /// [`needs_recheck`](Self::needs_recheck)): check the token again. When the user then has more than
     /// `ws.max_connections_per_user` sockets, the oldest are closed with 4009, those of the same
     /// session first.
     pub(crate) fn set_user(&self, id: ConnectionId, user: UserId, session: Option<i64>, roles: Vec<String>, checked_at: Instant) -> Result<(), CloseCode> {
         let cap = self.0.config.max_connections_per_user.max(1);
+        let window = self.revocation_window();
         let mut registry = self.write();
+        if Self::stale(&registry, checked_at, window) {
+            return Err(CloseCode::TRY_AGAIN_LATER);
+        }
         if let Some((_, revocation)) = registry.recent.iter().rev().find(|(at, r)| *at >= checked_at && r.applies_to(user, session)) {
             return Err(revocation.close_code());
         }
@@ -957,10 +992,17 @@ impl Hub {
     pub(crate) fn apply_revocation(&self, revocation: &Revocation) -> usize {
         let code = revocation.close_code();
         let reason = if code == CloseCode::BANNED { "the account is banned" } else { "the session was revoked" };
+        let window = self.revocation_window();
         let mut registry = self.write();
         let now = Instant::now();
-        while registry.recent.front().is_some_and(|(at, _)| now.duration_since(*at) > RECENT_REVOCATIONS) || registry.recent.len() >= 4096 {
+        while registry.recent.front().is_some_and(|(at, _)| now.duration_since(*at) > window) {
             registry.recent.pop_front();
+        }
+        while registry.recent.len() >= RECENT_REVOCATIONS_MAX {
+            // Still inside the window: tokens checked before it can no longer be judged here.
+            if let Some((at, _)) = registry.recent.pop_front() {
+                registry.overflow_at = Some(registry.overflow_at.map_or(at, |o| o.max(at)));
+            }
         }
         registry.recent.push_back((now, *revocation));
         let closed = registry
@@ -994,45 +1036,32 @@ impl Hub {
 
     // ---- start / shutdown -------------------------------------------------------------------------
 
-    /// Start the hub's background work: the broadcaster, the revocation and role listeners (with
-    /// the [`Auth`](crate::Auth) module) and the shutdown watcher.
+    /// Start the hub's background work: the broadcaster, the revocation sink and the role listener
+    /// (with the [`Auth`](crate::Auth) module) and the shutdown watcher. Revocations are applied
+    /// synchronously by the revoking call itself (also those the revocation poll reads back from
+    /// other processes), so a socket that authenticates after a ban returned is refused.
     pub(crate) fn start(&self, state: &AppState) -> Vec<JoinHandle<()>> {
         self.0.broadcaster.start(self.local());
         let mut tasks = Vec::new();
         if let Some(service) = state.get::<AuthService>() {
+            // A weak handle: the service lives in the state the hub's sockets hold.
+            let weak = Arc::downgrade(&self.0);
+            service.add_revocation_sink(Arc::new(move |revocation: &Revocation| {
+                if let Some(inner) = weak.upgrade() {
+                    Hub(inner).apply_revocation(revocation);
+                }
+            }));
             let hub = self.clone();
             let state = state.clone();
-            let mut revocations = service.subscribe_revocations();
             let mut role_changes = service.subscribe_role_changes();
             let refresh_every = self.0.config.roles_refresh_secs;
             tasks.push(tokio::spawn(async move {
-                let mut last = state.now();
                 let period = Duration::from_secs(refresh_every.max(1));
                 let mut refresh = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
                 refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
                     tokio::select! {
                         _ = state.shutdown().wait() => break,
-                        received = revocations.recv() => match received {
-                            Ok(revocation) => {
-                                last = state.now();
-                                hub.apply_revocation(&revocation);
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
-                                tracing::warn!(missed, "WebSocket: revocations lagged; re-reading the sessions table");
-                                let since = UnixMillis(last.get().saturating_sub(LAG_OVERLAP_MS));
-                                match service.revocations_since(&state, since).await {
-                                    Ok(list) => {
-                                        for (at, revocation) in list {
-                                            last = UnixMillis(last.get().max(at.get()));
-                                            hub.apply_revocation(&revocation);
-                                        }
-                                    }
-                                    Err(error) => tracing::warn!(%error, "WebSocket: reading revocations failed"),
-                                }
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                        },
                         changed = role_changes.recv() => match changed {
                             Ok(user) => hub.refresh_roles(&state, &service, vec![user]).await,
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {

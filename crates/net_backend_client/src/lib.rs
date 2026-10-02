@@ -8,11 +8,14 @@
 //!   before expiry, one refresh at a time, rotating refresh tokens reported through
 //!   [`TokenUpdates`], logout), errors as the server's codes ([`Error::Api`]).
 //! - [`blocking::Client`]: the same client for programs without a runtime, with [`Reply::try_take`]
-//!   for game loops.
+//!   for game loops and [`Reply::cancel`].
+//! - HTTP and the WebSocket go through an HTTP CONNECT proxy from the environment or
+//!   [`ClientBuilder::proxy`]. The protocol's secret types and the client's own copies of secrets
+//!   are overwritten with zeros when dropped (the README lists exactly what is and is not).
 //! - Feature `ws`: the WebSocket (module `ws`): typed requests, pushes, heartbeats, reconnects that obey
 //!   the close codes.
 //! - Features `ssh` / `sftp` / `ssh-rsa`: SSH and SFTP to the server machine's OpenSSH (module `ssh`),
-//!   for admin tools.
+//!   for admin tools: opt-in reconnects, pipelined transfers with progress.
 //!
 //! ```no_run
 //! use net_backend_client::protocol::auth::{GetAccount, LoginRequest};
@@ -54,7 +57,7 @@ pub use client::{Client, ClientBuilder, DEFAULT_MAX_RESPONSE_BYTES, DEFAULT_TIME
 pub use error::{Error, HostKeyProblem};
 /// The shared message types (`net_backend_protocol`), re-exported so the versions always match.
 pub use net_backend_protocol as protocol;
-pub use reply::Reply;
+pub use reply::{CancelHandle, Reply};
 pub use session::TokenUpdates;
 
 /// The README's Rust blocks, compiled as doctests.

@@ -9,8 +9,9 @@
 # ONE transaction, so a failure keeps the old data; SQLite: the old files are moved aside), run `migrate`
 # (applies migrations newer than the backup), start the server, wait until it is ready. The file is read
 # from a private copy, and the safety backup gets its own name (`…-before-restore-…`), so it can never
-# replace the backup being restored. If anything fails after the stop, the message names
-# the safety backup and the command that puts it back.
+# replace the backup being restored. If the PostgreSQL load fails, the transaction is rolled back:
+# the message says nothing was replaced and the server starts again with its old data. If anything
+# else fails after the stop, the message names the safety backup and the command that puts it back.
 # Same settings as backup.sh (NBS_BACKUP_MODE, NBS_DATABASE_URL_FILE, NBS_COMPOSE_DIR, NBS_BACKUP_DIR).
 set -euo pipefail
 
@@ -24,9 +25,14 @@ fi
 
 mode="${NBS_BACKUP_MODE:-systemd}"
 url_file="${NBS_DATABASE_URL_FILE:-/etc/net-backend/database_url}"
-compose_dir="${NBS_COMPOSE_DIR:-/opt/net_backend/deploy/docker}"
+compose_dir="${NBS_COMPOSE_DIR:-/opt/net-backend}"
 here="$(cd "$(dirname "$0")" && pwd)"
 
+# One field of a PostgreSQL password file: `\` and `:` escaped with a backslash.
+pgpass_field() {
+	local v="${1//\\/\\\\}"
+	printf '%s' "${v//:/\\:}"
+}
 log() { echo "net-backend-restore: $*"; }
 fail() { echo "net-backend-restore: ERROR: $*" >&2; exit 1; }
 
@@ -45,7 +51,12 @@ done
 file="$(cd "$(dirname "$file")" && pwd)/$(basename "$file")"
 
 if [ "$mode" = docker ]; then
-	url="$(cat "$compose_dir/secrets/database_url")"
+	# The database the `db` service runs (its secrets stay inside Docker volumes).
+	kind="$(cd "$compose_dir" && docker compose exec -T db sh -c \
+		'if command -v pg_dump >/dev/null 2>&1; then echo postgres; elif command -v mysqldump >/dev/null 2>&1; then echo mysql; fi')" ||
+		fail "the db service is not running (docker compose ps in $compose_dir)"
+	[ -n "$kind" ] || fail "the db service runs neither PostgreSQL nor MySQL (docker compose ps in $compose_dir)"
+	url="$kind://"
 else
 	url="$(cat "$url_file")"
 fi
@@ -57,6 +68,8 @@ cleanup() { rm -rf "$work"; }
 trap cleanup EXIT
 
 dc() { (cd "$compose_dir" && docker compose "$@"); }
+# The same without Compose's container progress lines (the restore log keeps only its own lines).
+dcq() { (cd "$compose_dir" && docker compose --progress quiet "$@"); }
 
 # Work on a private copy: nothing (not even a safety backup with the same name) can change the file
 # being restored while this script runs.
@@ -114,18 +127,50 @@ fi
 
 stop_server() {
 	if [ "$mode" = docker ]; then
-		dc stop server caddy
+		dcq stop server caddy
 	else
 		systemctl stop net-backend
 	fi
 }
 start_server() {
 	if [ "$mode" = docker ]; then
-		dc run --rm migrate && dc up -d
+		# `up` runs `migrate` (once) before the server: the server waits for it to complete.
+		dcq up -d
 	else
 		# ExecStartPre runs `migrate`.
 		systemctl start net-backend
 	fi
+}
+
+# Waits up to 2 minutes until the server is ready (Docker: healthy).
+wait_ready() {
+	local state
+	for _ in $(seq 1 60); do
+		if [ "$mode" = docker ]; then
+			state="$(dc ps --format '{{.Health}}' server 2>/dev/null || true)"
+			[ "$state" = healthy ] && return 0
+		else
+			if setpriv --reuid=nbs --regid=nbs --init-groups env NBS_CONFIG=/etc/net-backend/config.toml /usr/local/bin/net-backend-server healthcheck 2>/dev/null; then
+				return 0
+			fi
+		fi
+		sleep 2
+	done
+	return 1
+}
+
+# A PostgreSQL load that failed was rolled back (one transaction): the old data is untouched, so
+# the server starts again with it.
+pg_rolled_back() {
+	trap cleanup EXIT
+	echo "net-backend-restore: ERROR: loading the backup failed; nothing was replaced (the load runs in one transaction, which PostgreSQL rolled back)." >&2
+	log "starting the server again with the data it had before"
+	if start_server && wait_ready; then
+		log "the server runs again with the previous data"
+	else
+		echo "net-backend-restore: the server did not become ready within 2 minutes; check its log" >&2
+	fi
+	exit 1
 }
 
 # From here on a failure leaves the database partly replaced: say how to get back.
@@ -182,14 +227,17 @@ postgres | postgresql)
 	# The schema drop and the whole load run in ONE transaction (psql --single-transaction): if
 	# anything fails, PostgreSQL rolls back to the old data. pg_restore turns the dump into SQL; if it
 	# cannot read to the end, the last line is a statement that fails, so a cut stream never commits.
+	pg_load() {
 	if [ "$mode" = docker ]; then
 		dc exec -T db sh -c '
 			{
 				echo "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
 				pg_restore -f - --no-owner --no-privileges || echo "SELECT nbs_restore_could_not_read_the_dump();"
-			} | PGPASSWORD="$(cat /run/secrets/db_password)" psql -q -h 127.0.0.1 -U nbs -d nbs -v ON_ERROR_STOP=1 --single-transaction' <"$src"
+			} | PGOPTIONS="-c client_min_messages=warning" PGPASSWORD="$(cat /run/secrets/db_password)" \
+				psql -q -o /dev/null -h 127.0.0.1 -U nbs -d nbs -v ON_ERROR_STOP=1 --single-transaction' <"$src"
 	else
-		eval "$(python3 - "$url" <<'PY'
+		# `set -e` is off inside a function called from `if`: every step checks its own result.
+		parts="$(python3 - "$url" <<'PY'
 import shlex, sys
 from urllib.parse import urlsplit, unquote
 p = urlsplit(sys.argv[1].strip())
@@ -197,13 +245,22 @@ for k, v in (("user", unquote(p.username or "")), ("password", unquote(p.passwor
              ("host", p.hostname or "127.0.0.1"), ("port", str(p.port or "5432")), ("database", unquote(p.path.lstrip("/")))):
     print(k + "=" + shlex.quote(v))
 PY
-)"
-		printf '%s:%s:%s:%s:%s\n' "$host" "$port" "$database" "$user" "$password" >"$work/pgpass"
+)" || return 1
+		eval "$parts"
+		[ -n "$host" ] && [ -n "$user" ] && [ -n "$database" ] || return 1
+		printf '%s:%s:%s:%s:%s\n' "$(pgpass_field "$host")" "$port" "$(pgpass_field "$database")" \
+			"$(pgpass_field "$user")" "$(pgpass_field "$password")" >"$work/pgpass" || return 1
 		export PGPASSFILE="$work/pgpass"
 		{
 			echo "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
 			pg_restore -f - --no-owner --no-privileges "$src" || echo "SELECT nbs_restore_could_not_read_the_dump();"
-		} | psql -q -h "$host" -p "$port" -U "$user" -d "$database" -v ON_ERROR_STOP=1 --single-transaction
+		} | PGOPTIONS="-c client_min_messages=warning" \
+			psql -q -o /dev/null -h "$host" -p "$port" -U "$user" -d "$database" -v ON_ERROR_STOP=1 --single-transaction
+	fi
+	}
+	if ! pg_load; then
+		# One transaction: PostgreSQL rolled the schema drop and the load back.
+		pg_rolled_back
 	fi
 	;;
 sqlite)
@@ -224,19 +281,8 @@ esac
 # ---- 4. migrate, start, wait ----------------------------------------------------------------------
 log "starting the server (migrate first)"
 start_server
-for _ in $(seq 1 60); do
-	if [ "$mode" = docker ]; then
-		state="$(dc ps --format '{{.Health}}' server 2>/dev/null || true)"
-		if [ "$state" = healthy ]; then
-			log "done: the server is healthy"
-			exit 0
-		fi
-	else
-		if setpriv --reuid=nbs --regid=nbs --init-groups env NBS_CONFIG=/etc/net-backend/config.toml /usr/local/bin/net-backend-server healthcheck 2>/dev/null; then
-			log "done: the server is ready"
-			exit 0
-		fi
-	fi
-	sleep 2
-done
+if wait_ready; then
+	log "done: the server is ready"
+	exit 0
+fi
 fail "the server did not become ready within 2 minutes; check its log"

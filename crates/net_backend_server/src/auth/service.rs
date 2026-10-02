@@ -147,6 +147,8 @@ struct Inner {
     mail: MailQueue,
     steam: Option<Arc<dyn SteamVerifier>>,
     revocations: broadcast::Sender<Revocation>,
+    /// Applied synchronously to every revocation before it is broadcast (the WebSocket hub).
+    revocation_sinks: std::sync::RwLock<Vec<RevocationSink>>,
     role_changes: broadcast::Sender<UserId>,
     key: OnceCell<Vec<u8>>,
     /// Failed logins per (email address, client network).
@@ -161,6 +163,9 @@ struct Inner {
     background: Arc<Semaphore>,
     v6_prefix: u8,
 }
+
+/// A synchronous receiver of revocations (see [`AuthService::add_revocation_sink`]).
+pub(crate) type RevocationSink = Arc<dyn Fn(&Revocation) + Send + Sync>;
 
 /// The revocation poll's position (see [`AuthService::poll_revocations`]).
 #[derive(Debug, Default)]
@@ -207,6 +212,7 @@ impl AuthService {
             mail,
             steam,
             revocations,
+            revocation_sinks: std::sync::RwLock::new(Vec::new()),
             role_changes,
             key: OnceCell::new(),
             login_failures,
@@ -233,6 +239,23 @@ impl AuthService {
     /// [`authenticate_token`](Self::authenticate_token).
     pub fn subscribe_revocations(&self) -> broadcast::Receiver<Revocation> {
         self.0.revocations.subscribe()
+    }
+
+    /// Apply every revocation synchronously, before the revoking call returns and before the
+    /// broadcast (the WebSocket hub: a socket that authenticates after a ban returned never gets
+    /// `auth.ok`). Sinks stay for the service's life (a hub registers one when it starts; it holds
+    /// the hub weakly, so a dropped hub's sink does nothing).
+    pub(crate) fn add_revocation_sink(&self, sink: RevocationSink) {
+        self.0.revocation_sinks.write().unwrap_or_else(|p| p.into_inner()).push(sink);
+    }
+
+    /// Hand a revocation to the synchronous sinks, then to the subscribers.
+    fn publish_revocation(&self, revocation: Revocation) {
+        let sinks = self.0.revocation_sinks.read().unwrap_or_else(|p| p.into_inner()).clone();
+        for sink in sinks {
+            sink(&revocation);
+        }
+        let _ = self.0.revocations.send(revocation);
     }
 
     /// Receive the user of every role grant / revocation made in THIS process (admin routes, server
@@ -276,7 +299,7 @@ impl AuthService {
             for (at, revocation) in self.revocations_since(state, UnixMillis(from)).await? {
                 let RevokedSessions::One(id) = revocation.sessions else { continue };
                 if cursor.seen.insert(id, at.get()).is_none() {
-                    let _ = self.0.revocations.send(revocation);
+                    self.publish_revocation(revocation);
                     sent += 1;
                 }
                 cursor.since = cursor.since.max(at.get());
@@ -468,7 +491,7 @@ impl AuthService {
 
     /// Tell subscribers and `after` hooks about a revocation.
     async fn notify(&self, state: &AppState, info: &ReqInfo, revocation: Revocation) {
-        let _ = self.0.revocations.send(revocation);
+        self.publish_revocation(revocation);
         state.hooks().run_after(&Self::ctx(state, info), Arc::new(AfterSessionsRevoked { revocation })).await;
     }
 
@@ -972,11 +995,28 @@ impl AuthService {
         !self.0.config.rate_limits || self.0.mails.check(key.to_string()).is_allow()
     }
 
+    /// Delete a user's unused tokens of a purpose: a plain read of their ids, then a delete by
+    /// primary key (no ranged locking statement on the user index: no MySQL gap locks).
+    async fn delete_unused_tokens(tx: &mut DbTx, user: i64, purpose: &str) -> Result<(), AppError> {
+        let old: Vec<i64> = tx.fetch_all::<store::EmailTokenIdRow, _>(&store::unused_email_token_ids(user, purpose)).await?.into_iter().map(|r| r.id).collect();
+        if !old.is_empty() {
+            tx.execute(&store::delete_unused_email_tokens_by_id(&old)).await?;
+        }
+        Ok(())
+    }
+
     async fn new_email_token(&self, state: &AppState, user: i64, purpose: &str, normalized: &str, ttl_secs: u64) -> Result<String, AppError> {
         let token = tokens::random_token(EMAIL_PREFIX)?;
         let now = Self::now(state);
-        let mut tx = state.db().begin().await?;
-        tx.execute(&store::delete_unused_email_tokens(user, purpose)).await?;
+        // `begin_write`: on SQLite the read below must not stand before another writer's commit.
+        let mut tx = state.db().begin_write().await?;
+        // The account row first (a record lock): two new tokens of one account are made one after
+        // the other, so the second sees and replaces the first.
+        tx.fetch_optional::<store::EmailTokenIdRow, _>(&store::lock_user(user, state.db().dialect())).await?;
+        // The new token replaces the unused ones: found by a plain read and deleted by id, never by
+        // a ranged DELETE on the user index. On MySQL that DELETE took gap locks, and simultaneous
+        // registrations (new users, nothing to delete) then deadlocked on their inserts.
+        Self::delete_unused_tokens(&mut tx, user, purpose).await?;
         tx.execute(&store::insert_email_token(user, purpose, normalized, &tokens::hash(&token), now.saturating_add(secs_to_ms(ttl_secs)), now)?).await?;
         tx.commit().await?;
         Ok(token)
@@ -1107,7 +1147,7 @@ impl AuthService {
         if user.email_normalized.as_deref() == Some(row.email_normalized.as_str()) {
             tx.execute(&store::set_email_verified(user.id, now)).await?;
         }
-        tx.execute(&store::delete_unused_email_tokens(user.id, store::PURPOSE_RESET)).await?;
+        Self::delete_unused_tokens(&mut tx, user.id, store::PURPOSE_RESET).await?;
         tx.execute(&store::revoke_sessions(user.id, None, None, RevocationReason::PasswordReset.as_str(), now)).await?;
         // A reset often follows a compromise: a login provider linked by an intruder goes too.
         let unlinked = if self.0.config.unlink_identities_on_reset { tx.execute(&store::delete_identities(user.id, None)).await? } else { 0 };

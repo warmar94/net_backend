@@ -26,7 +26,7 @@ credentials.toml
 # Private design docs — local only (at any depth)
 **/docs/
 
-# A Docker Compose install's local files (deploy/docker/setup.sh writes them)
+# A 0.1.0 setup.sh install's files (deploy/docker/), kept out of commits
 deploy/docker/secrets/
 deploy/docker/config.toml
 deploy/docker/config.toml.bak

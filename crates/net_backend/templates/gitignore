@@ -1,0 +1,5 @@
+/target
+# The development database (config.toml: database.url).
+*.db
+*.db-shm
+*.db-wal

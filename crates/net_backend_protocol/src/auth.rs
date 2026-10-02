@@ -24,7 +24,7 @@
 //!
 //! Secrets ([`Password`], [`AccessToken`], [`RefreshToken`], [`Secret`]) never show in `Debug`
 //! output, and a decode error never quotes them; they serialize as plain strings because they
-//! must reach the other side.
+//! must reach the other side. Each one overwrites its memory with zeros when it is dropped.
 
 use std::fmt;
 
@@ -73,6 +73,12 @@ macro_rules! secret_type {
         /// `Debug` prints `<redacted>`; there is no `Display`. It serializes as a plain JSON string.
         /// No `PartialEq`: compare secrets in constant time (servers compare hashes). Decoding
         /// anything but a JSON string fails with a fixed message that never quotes the value.
+        ///
+        /// When it is dropped, its whole allocation (spare capacity included) is overwritten with
+        /// zeros first (the `zeroize` crate). Each clone is its own copy and is wiped when it is
+        /// dropped. Not wiped: the `String` returned by `into_inner` (it is the caller's), copies
+        /// made with `expose().to_string()` or by serializing the value, and the input a decoder
+        /// read it from.
         #[derive(Clone, Serialize)]
         #[serde(transparent)]
         pub struct $name(String);
@@ -83,8 +89,14 @@ macro_rules! secret_type {
             }
         }
 
+        impl Drop for $name {
+            fn drop(&mut self) {
+                zeroize::Zeroize::zeroize(&mut self.0);
+            }
+        }
+
         impl $name {
-            /// Wrap a secret.
+            /// Wrap a secret (the `String` is moved in: its allocation is the one wiped on drop).
             pub fn new(secret: impl Into<String>) -> Self {
                 Self(secret.into())
             }
@@ -94,9 +106,10 @@ macro_rules! secret_type {
                 &self.0
             }
 
-            /// The secret, consuming the wrapper. Never log it.
-            pub fn into_inner(self) -> String {
-                self.0
+            /// The secret, consuming the wrapper. Never log it. The returned `String` is not wiped
+            /// when it is dropped.
+            pub fn into_inner(mut self) -> String {
+                std::mem::take(&mut self.0)
             }
 
             /// Whether it is empty.

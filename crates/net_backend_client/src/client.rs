@@ -9,7 +9,7 @@ use net_backend_protocol::{codes, GetServerInfo, HttpCall, ServerInfo};
 use tokio::sync::watch;
 use tokio::time::Instant;
 
-use crate::http::{Answer, BaseUrl, Http, Outgoing};
+use crate::http::{Answer, BaseUrl, Http, Outgoing, Proxy, ProxySetting};
 use crate::session::{Session, TokenUpdates, UNCERTAIN_RETRY_WINDOW};
 use crate::Error;
 
@@ -30,10 +30,16 @@ pub struct ClientBuilder {
     refresh_margin: Duration,
     allow_insecure_http: bool,
     tokens: Option<TokenPair>,
+    proxy: ProxySetting,
 }
 
 impl fmt::Debug for ClientBuilder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let proxy = match &self.proxy {
+            ProxySetting::Env => "environment",
+            ProxySetting::Url(_) => "explicit",
+            ProxySetting::Off => "off",
+        };
         f.debug_struct("ClientBuilder")
             .field("url", &self.url)
             .field("timeout", &self.timeout)
@@ -41,6 +47,7 @@ impl fmt::Debug for ClientBuilder {
             .field("refresh_margin", &self.refresh_margin)
             .field("allow_insecure_http", &self.allow_insecure_http)
             .field("tokens", &self.tokens.is_some())
+            .field("proxy", &proxy)
             .finish()
     }
 }
@@ -54,6 +61,7 @@ impl ClientBuilder {
             refresh_margin: Duration::from_secs(net_backend_protocol::auth::ACCESS_TOKEN_REFRESH_MARGIN_SECS),
             allow_insecure_http: false,
             tokens: None,
+            proxy: ProxySetting::Env,
         }
     }
 
@@ -92,8 +100,30 @@ impl ClientBuilder {
         self
     }
 
-    /// Check the URL and build the client. No I/O: nothing connects until the first call. Needs no
-    /// runtime (the first call does).
+    /// Send every HTTP request and the WebSocket through this HTTP proxy
+    /// (`http://host:port`, or `http://user:password@host:port` for `Proxy-Authorization: Basic`)
+    /// as an HTTP CONNECT tunnel: TLS runs end to end through it. Replaces the proxy settings of
+    /// the environment. A loopback server is always reached directly.
+    pub fn proxy(mut self, url: &str) -> Self {
+        self.proxy = ProxySetting::Url(url.to_string());
+        self
+    }
+
+    /// Connect directly, whatever the environment's proxy settings say.
+    pub fn no_proxy(mut self) -> Self {
+        self.proxy = ProxySetting::Off;
+        self
+    }
+
+    /// Check the URL (and the proxy settings) and build the client. No I/O: nothing connects
+    /// until the first call. Needs no runtime (the first call does).
+    ///
+    /// The proxy, unless [`proxy`](Self::proxy) or [`no_proxy`](Self::no_proxy) was called,
+    /// comes from the environment as `build` reads it: `HTTPS_PROXY` for an `https://` server,
+    /// `HTTP_PROXY` for `http://`, `ALL_PROXY` for both, `NO_PROXY` (comma-separated hosts,
+    /// domains and IP ranges, `*` for all) to skip it; the lowercase names work too. A loopback
+    /// server never uses a proxy. A proxy URL that is not `http://` (e.g. `socks5://`) is
+    /// refused with `InvalidRequest`.
     pub fn build(self) -> Result<Client, Error> {
         let base = BaseUrl::parse(&self.url)?;
         if base.scheme == crate::http::Scheme::Http && !base.is_loopback() && !self.allow_insecure_http {
@@ -102,7 +132,8 @@ impl ClientBuilder {
                 base.host
             )));
         }
-        let http = Http::new(base, self.max_response_bytes)?;
+        let proxy = Proxy::resolve(&self.proxy, &base)?;
+        let http = Http::new(base, self.max_response_bytes, proxy)?;
         let session = Session::new(self.refresh_margin);
         if let Some(tokens) = self.tokens {
             session.set(tokens, None);
@@ -318,8 +349,8 @@ impl Client {
         };
         let request = request.with_refresh_token(tokens.refresh_token.clone());
         let out = Outgoing::for_call(&request)?;
-        let bearer = (!self.inner.session.expired()).then(|| tokens.access_token.expose().to_string());
-        let answer = self.inner.http.send(&out, bearer.as_deref(), deadline).await?;
+        let bearer = (!self.inner.session.expired()).then(|| tokens.access_token.clone());
+        let answer = self.inner.http.send(&out, bearer.as_ref().map(net_backend_protocol::AccessToken::expose), deadline).await?;
         match answer.decode::<net_backend_protocol::Ack>() {
             Ok(_) => {
                 self.inner.session.clear_if(generation);

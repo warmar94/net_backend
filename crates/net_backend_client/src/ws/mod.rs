@@ -363,6 +363,9 @@ impl WsConnection {
     /// Send a typed request; the [`Reply`] carries its answer (`C::Response`, or the server's error
     /// as [`Error::Api`]). The request is queued at once (answers come in the order requests were
     /// made); the default timeout applies ([`WsSettings::with_request_timeout`]).
+    /// [`Reply::cancel`] answers it [`Error::Cancelled`]: `sent: Some(false)` when it was still
+    /// waiting for the connection (it is never sent), `Some(true)` when it had been written (it may
+    /// have run; its late answer is dropped).
     pub fn request<C: WsCall>(&self, call: &C) -> Reply<C::Response>
     where
         C::Response: Send + 'static,
@@ -387,7 +390,7 @@ impl WsConnection {
             let _ = sender.send(typed);
         });
         self.enqueue(id, text, timeout, answer);
-        reply
+        reply.with_cancel(self.cancel_hook(id))
     }
 
     /// A request of any kind with untyped JSON (a game's own kinds without a [`WsCall`] type).
@@ -402,7 +405,19 @@ impl WsConnection {
             let _ = sender.send(result);
         });
         self.enqueue(id, text, self.shared.settings.request_timeout, answer);
-        reply
+        reply.with_cancel(self.cancel_hook(id))
+    }
+
+    /// What [`Reply::cancel`] does for request `id`: tell the connection task, which answers it
+    /// `Cancelled` (never sent if it was still waiting; a late answer is dropped). A weak sender:
+    /// a reply never keeps the connection open.
+    fn cancel_hook(&self, id: u64) -> impl Fn() + Send + Sync + 'static {
+        let commands = self.shared.commands.downgrade();
+        move || {
+            if let Some(commands) = commands.upgrade() {
+                let _ = commands.send(Command::Cancel(id));
+            }
+        }
     }
 
     fn enqueue(&self, id: u64, text: String, timeout: Duration, answer: Box<dyn FnOnce(Result<Value, Error>) + Send>) {

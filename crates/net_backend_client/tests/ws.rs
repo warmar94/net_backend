@@ -273,3 +273,42 @@ mod tokio_tungstenite_for_tests {
         (addr, accepted)
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_request_is_answered_cancelled_with_an_honest_sent() {
+    let server = Server::start();
+    let (client, user) = registered(&server, "cal").await;
+    // A 2 s pause before the reconnect: the request below is made and cancelled long before.
+    let settings =
+        WsSettings::default().with_reconnect(Reconnect::default().with_base(Duration::from_secs(2)).with_cap(Duration::from_secs(2)).with_jitter(false));
+    let ws = client.connect_ws(settings).await.expect("connect");
+    let mut events = ws.events();
+    // Written to the connection (the server runs it): Cancelled, sent; the late answer is dropped.
+    let started = SLOW_STARTED.load(Ordering::SeqCst);
+    let running = ws.request(&Slow { millis: 1_000 });
+    until("the slow request to reach the server", || SLOW_STARTED.load(Ordering::SeqCst) > started).await;
+    running.cancel();
+    let error = running.await.expect_err("cancelled");
+    assert!(matches!(error, Error::Cancelled { sent: Some(true), .. }), "{error:?}");
+    assert_eq!(echo(&ws, "still fine").await.expect("echo"), user.get());
+    // Waiting for the connection (it reconnects): Cancelled, never sent.
+    server.close_user(user, CloseCode::INTERNAL_ERROR);
+    event(&mut events, "reconnecting", |e| matches!(e, WsEvent::Reconnecting { .. })).await;
+    let waiting = ws.request(&Echo { text: "never".into() });
+    let handle = waiting.cancel_handle();
+    handle.cancel();
+    let error = waiting.await.expect_err("cancelled");
+    assert!(matches!(error, Error::Cancelled { sent: Some(false), .. }), "{error:?}");
+    assert_eq!(error.was_sent(), Some(false));
+    // A reply keeps no connection open: dropping the connection closes it.
+    assert_eq!(echo(&ws, "after").await.expect("echo after the reconnect"), user.get());
+    let reply = ws.request(&Echo { text: "kept".into() });
+    drop(ws);
+    let _ = reply.await;
+    reply_less_close(&server, user).await;
+}
+
+/// Every connection of `user` is gone once the app dropped its handles (replies do not keep one).
+async fn reply_less_close(server: &Server, user: UserId) {
+    until("the connection to close", || server.connections_of(user) == 0).await;
+}

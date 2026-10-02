@@ -291,4 +291,102 @@ async fn app_commands() {
     assert!(matches!(result, Err(Error::Cli(m)) if m.contains("built-in")));
     let (result, _) = run_with(&config, Count("Bad Name"), &["serve"]).await;
     assert!(matches!(result, Err(Error::Cli(_))));
+    // `asyncapi` is a built-in name too.
+    let (result, _) = run_with(&config, Count("asyncapi"), &["serve"]).await;
+    assert!(matches!(result, Err(Error::Cli(m)) if m.contains("built-in")));
+    // An app command named `healthcheck` replaces the built-in one (and hides it from --help).
+    let (result, out) = run_with(&config, Count("healthcheck"), &["healthcheck", "--prefix=own "]).await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(out.trim(), "own 0", "the app command ran (nothing left to migrate)");
+    let (_, out) = run_with(&config, Count("healthcheck"), &["--help"]).await;
+    assert!(out.contains("Count the applied migrations") && !out.contains("Check that the running server is ready"), "{out}");
+    let (_, out) = run_with(&config, Count("game:count"), &["--help"]).await;
+    assert!(out.contains("Check that the running server is ready"), "{out}");
+}
+
+/// `healthcheck` (0.1.1): exit 0 while the running server's `/readyz` answers 200 (also with an
+/// unspecified bind address, which means loopback), an error otherwise; no database contact.
+#[cfg(feature = "sqlite")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn healthcheck_asks_readyz() {
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let config = sqlite_config("cli-healthcheck");
+    let prepared = NetBackendServer::new(config.clone()).module(Scores).build().await.expect("build");
+    prepared.migrate().await.expect("migrate");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let serving = tokio::spawn(prepared.serve_with_shutdown(listener, async move {
+        let _ = stopped.await;
+    }));
+    let mut running = config.clone();
+    running.server.bind = addr;
+    // Ready once the modules started (one overall deadline, not a fixed sleep).
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let (result, _) = run(&running, &["healthcheck"]).await;
+        if result.is_ok() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the server never became ready: {result:?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let mut unspecified = config.clone();
+    unspecified.server.bind = std::net::SocketAddr::from(([0, 0, 0, 0], addr.port()));
+    let (result, _) = run(&unspecified, &["healthcheck"]).await;
+    assert!(result.is_ok(), "0.0.0.0 means loopback: {result:?}");
+    let _ = stop.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(30), serving).await;
+    // Nobody listens there any more: refused.
+    let (result, _) = run(&running, &["healthcheck"]).await;
+    assert!(matches!(&result, Err(Error::Cli(m)) if m.starts_with("healthcheck:")), "{result:?}");
+    // Something answers, but not 200.
+    let fake = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let mut busy = config.clone();
+    busy.server.bind = fake.local_addr().expect("addr");
+    tokio::spawn(async move {
+        if let Ok((mut socket, _)) = fake.accept().await {
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            let _ = socket.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+        }
+    });
+    let (result, _) = run(&busy, &["healthcheck"]).await;
+    assert!(matches!(&result, Err(Error::Cli(m)) if m.contains("503")), "{result:?}");
+}
+
+/// 0.1.1 live NIT 3: `--help`, `help`, `<built-in> --help` and `--version` need no configuration
+/// and no database (`run_main`); every other command loads the configuration first.
+#[tokio::test]
+async fn help_and_version_need_no_configuration() {
+    async fn main_with(args: &[&str]) -> (Result<(), Error>, String, bool) {
+        let mut output = Vec::new();
+        let mut argv = vec!["game-server"];
+        argv.extend_from_slice(args);
+        let loaded = std::sync::atomic::AtomicBool::new(false);
+        let load = || {
+            loaded.store(true, std::sync::atomic::Ordering::SeqCst);
+            Err(Error::Config(vec!["database.url (or database.url_file) is required".into()]))
+        };
+        let result = NetBackendServer::run_main_with_output(argv, load, |config| NetBackendServer::new(config).module(Scores), &mut output).await;
+        (result, String::from_utf8_lossy(&output).into_owned(), loaded.load(std::sync::atomic::Ordering::SeqCst))
+    }
+    for args in [&["--help"][..], &["-h"], &["help"], &["migrate", "--help"], &["healthcheck", "-h"]] {
+        let (result, out, loaded) = main_with(args).await;
+        assert!(result.is_ok() && !loaded, "{args:?}: {result:?}");
+        assert!(out.contains("Usage:"), "{args:?}: {out}");
+    }
+    let (result, out, loaded) = main_with(&["--help"]).await;
+    assert!(result.is_ok() && !loaded && out.contains("healthcheck") && out.contains("--version"), "{out}");
+    for flag in ["--version", "-V"] {
+        let (result, out, loaded) = main_with(&[flag]).await;
+        assert!(result.is_ok() && !loaded, "{result:?}");
+        assert_eq!(out.trim(), format!("net_backend_server {}", env!("CARGO_PKG_VERSION")));
+    }
+    // Anything else loads the configuration (and reports its error).
+    for args in [&[][..], &["migrate"], &["healthcheck"], &["scores:x", "-h"]] {
+        let (result, _, loaded) = main_with(args).await;
+        assert!(loaded && matches!(&result, Err(Error::Config(_))), "{args:?}: {result:?}");
+    }
 }

@@ -8,7 +8,8 @@
 //! module service through [`CommandCtx::state`], then closes the pool.
 //!
 //! Names: `[a-z][a-z0-9_-]*` with optional `:` sections (`user:create`), unique, and not a
-//! built-in command. Arguments arrive unparsed; [`CommandArgs::parse`] covers the usual shape
+//! built-in command ([`BUILT_IN_COMMANDS`]); a command named `healthcheck` replaces the built-in
+//! health check. Arguments arrive unparsed; [`CommandArgs::parse`] covers the usual shape
 //! (positionals, `--flag`, `--name value` / `--name=value`) and refuses unknown options.
 //!
 //! **Defaults:** `name`, `about` and `run` are required; `usage` has a default implementation.
@@ -42,8 +43,9 @@ use crate::app::PreparedServer;
 use crate::error::Error;
 use crate::state::AppState;
 
-/// The built-in command names (an app command may not use them).
-pub const BUILT_IN_COMMANDS: &[&str] = &["serve", "migrate", "migrations", "config", "openapi", "help"];
+/// The built-in command names (an app command may not use them). The built-in `healthcheck` is not
+/// listed: an app command of that name replaces it.
+pub const BUILT_IN_COMMANDS: &[&str] = &["serve", "migrate", "migrations", "config", "openapi", "asyncapi", "help"];
 
 /// A command-line command added by a module or the app.
 pub trait AppCommand: Send + Sync + 'static {

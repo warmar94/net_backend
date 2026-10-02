@@ -1,0 +1,11 @@
+[package]
+name = "{{package}}"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# The Rust client with the WebSocket (feature `ws`).
+net_backend_client = { version = "{{version}}", features = ["ws"] }
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+serde_json = "1"

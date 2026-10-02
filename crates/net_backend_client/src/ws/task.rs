@@ -36,6 +36,8 @@ pub(crate) struct Pending {
 /// What the handles tell the task.
 pub(crate) enum Command {
     Request(Pending),
+    /// The app cancelled this request ([`crate::Reply::cancel`]).
+    Cancel(u64),
     Close,
 }
 
@@ -204,6 +206,7 @@ impl Task {
                 command = self.commands.recv() => match command {
                     None | Some(Command::Close) => return None,
                     Some(Command::Request(pending)) => self.queue(pending),
+                    Some(Command::Cancel(id)) => self.cancel(id),
                 },
                 output = &mut future => return Some(output),
                 () = sleep_until(next) => self.expire(),
@@ -222,6 +225,18 @@ impl Task {
             return;
         }
         self.waiting.push_back(pending);
+    }
+
+    /// The app cancelled request `id`: a waiting one is answered and never sent, a running one is
+    /// answered and its late answer dropped (as an unknown id). An answered one: nothing to do.
+    fn cancel(&mut self, id: u64) {
+        if let Some(at) = self.waiting.iter().position(|p| p.id == id) {
+            if let Some(pending) = self.waiting.remove(at) {
+                (pending.answer)(Err(Error::Cancelled { sent: Some(false) }));
+            }
+        } else if let Some(pending) = self.in_flight.remove(&id) {
+            (pending.answer)(Err(Error::Cancelled { sent: Some(true) }));
+        }
     }
 
     /// The earliest deadline of a waiting or running request.
@@ -277,6 +292,7 @@ impl Task {
                             return end;
                         }
                     }
+                    Some(Command::Cancel(id)) => self.cancel(id),
                 },
                 message = link.next() => {
                     last_seen = Instant::now();
@@ -371,8 +387,9 @@ impl Task {
         }
         self.commands.close();
         while let Ok(command) = self.commands.try_recv() {
-            if let Command::Request(pending) = command {
-                (pending.answer)(Err(Error::disconnected(reason.clone(), Some(false))));
+            match command {
+                Command::Request(pending) => (pending.answer)(Err(Error::disconnected(reason.clone(), Some(false)))),
+                Command::Cancel(_) | Command::Close => {}
             }
         }
         if let Some(error) = &error {

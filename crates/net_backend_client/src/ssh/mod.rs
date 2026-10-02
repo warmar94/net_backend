@@ -27,6 +27,16 @@
 //! [`SshTarget::allow_terrapin_vulnerable`] is set (the refusal is tested against an in-process mock server;
 //! OpenSSH 9.6+ supports strict key exchange and connects). RSA keys need feature `ssh-rsa`; SHA-1 RSA
 //! signatures are never used.
+//!
+//! **A lost connection** ends the session, unless the target opts in to
+//! [`SshTarget::with_reconnect`]: then a new connection is opened with backoff, a command that was
+//! running is never run again, and commands started meanwhile wait for it ([`SshReconnect`];
+//! [`SshSession::state`], [`SshSession::events`]).
+//!
+//! **SFTP** (feature `sftp`): downloads keep 16 reads of 64 KiB in flight and write them in file
+//! order; transfers report their progress (`SshSession::start_download` and the other `start_*`
+//! methods return an `SftpTask`); the remote file handle is closed after every transfer, also a
+//! cancelled or timed-out one.
 
 mod known_hosts;
 mod session;
@@ -41,10 +51,10 @@ use std::time::Duration;
 
 use net_backend_protocol::Secret;
 
-pub use session::{SshChunk, SshRun, SshSession};
+pub use session::{SshChunk, SshEvent, SshEvents, SshRun, SshSession, SshState};
 #[cfg(feature = "sftp")]
 #[cfg_attr(docsrs, doc(cfg(feature = "sftp")))]
-pub use sftp::{SftpEntry, SftpEntryKind};
+pub use sftp::{SftpEntry, SftpEntryKind, SftpProgress, SftpTask};
 
 use crate::{Error, MAX_TIMEOUT};
 
@@ -215,6 +225,87 @@ impl SshPromptResponder for SshPromptAnswers {
     }
 }
 
+/// Automatic reconnect of an SSH session ([`SshTarget::with_reconnect`]; off unless set):
+/// exponential backoff with full jitter, as for the WebSocket. A reconnect **never re-runs a
+/// command**: a command that was running when the connection was lost is answered
+/// [`Error::Disconnected`] (`sent: Some(true)` once it had started); an SFTP operation that was
+/// running is answered [`Error::Disconnected`] too (`sent: Some(true)` once the server had answered
+/// part of a transfer, else `None`) and is not repeated either; commands and
+/// SFTP operations started while it reconnects wait for the new connection (bounded by their own
+/// timeout). Not retried: host key, authentication, protocol ([`Error::Ssh`]) and invalid-settings
+/// errors end the session. The delay before attempt `n` is a random value in
+/// `0..=min(cap, base · 2^(n-1))`; the counter resets once a connection stayed up for
+/// `stable_after`. Defaults: base 1 s, cap 30 s, no attempt limit, stable after 10 s.
+#[derive(Clone, Debug)]
+pub struct SshReconnect {
+    base: Duration,
+    cap: Duration,
+    max_attempts: Option<u32>,
+    stable_after: Duration,
+    jitter: bool,
+}
+
+impl Default for SshReconnect {
+    fn default() -> Self {
+        Self { base: Duration::from_secs(1), cap: Duration::from_secs(30), max_attempts: None, stable_after: Duration::from_secs(10), jitter: true }
+    }
+}
+
+impl SshReconnect {
+    /// The first delay bound (default 1 s, 1 ms..=1 h).
+    pub fn with_base(mut self, base: Duration) -> Self {
+        self.base = base.clamp(Duration::from_millis(1), MAX_TIMEOUT);
+        self
+    }
+
+    /// The largest delay (default 30 s, at most 1 h).
+    pub fn with_cap(mut self, cap: Duration) -> Self {
+        self.cap = cap.min(MAX_TIMEOUT);
+        self
+    }
+
+    /// Give up after this many failed attempts in a row (`None` = never; default).
+    pub fn with_max_attempts(mut self, max: Option<u32>) -> Self {
+        self.max_attempts = max;
+        self
+    }
+
+    /// How long a connection must stay up before the attempt counter resets (default 10 s).
+    pub fn with_stable_after(mut self, stable_after: Duration) -> Self {
+        self.stable_after = stable_after.min(MAX_TIMEOUT);
+        self
+    }
+
+    /// Random jitter on (default) or off (exact delays, for tests).
+    pub fn with_jitter(mut self, jitter: bool) -> Self {
+        self.jitter = jitter;
+        self
+    }
+
+    /// The upper bound of the delay before attempt `attempt` (1-based).
+    pub fn delay_bound(&self, attempt: u32) -> Duration {
+        let factor = 2u32.checked_pow(attempt.saturating_sub(1).min(30)).unwrap_or(u32::MAX);
+        self.base.saturating_mul(factor).min(self.cap.max(self.base))
+    }
+
+    pub(crate) fn delay(&self, attempt: u32, random: u64) -> Duration {
+        let bound = self.delay_bound(attempt);
+        if !self.jitter {
+            return bound;
+        }
+        let nanos = u64::try_from(bound.as_nanos()).unwrap_or(u64::MAX);
+        Duration::from_nanos(random % nanos.saturating_add(1))
+    }
+
+    pub(crate) fn may_retry(&self, attempt: u32) -> bool {
+        self.max_attempts.is_none_or(|max| attempt <= max)
+    }
+
+    pub(crate) fn stable_after(&self) -> Duration {
+        self.stable_after
+    }
+}
+
 /// The last component of a path, for logs and errors (a full path can hold a user name).
 pub(crate) fn file_name(path: &Path) -> String {
     path.file_name().map_or_else(|| "<no file name>".to_string(), |n| n.to_string_lossy().into_owned())
@@ -261,6 +352,7 @@ pub struct SshTarget {
     pub(crate) max_channels: usize,
     pub(crate) allow_terrapin_vulnerable: bool,
     pub(crate) allow_in_release: bool,
+    pub(crate) reconnect: Option<SshReconnect>,
 }
 
 impl fmt::Debug for SshTarget {
@@ -282,6 +374,7 @@ impl fmt::Debug for SshTarget {
             .field("max_channels", &self.max_channels)
             .field("allow_terrapin_vulnerable", &self.allow_terrapin_vulnerable)
             .field("allow_in_release", &self.allow_in_release)
+            .field("reconnect", &self.reconnect)
             .finish()
     }
 }
@@ -325,6 +418,7 @@ impl SshTarget {
             max_channels: 8,
             allow_terrapin_vulnerable: false,
             allow_in_release: false,
+            reconnect: None,
         }
     }
 
@@ -426,6 +520,14 @@ impl SshTarget {
     /// that reaches players is shell access for anyone who extracts it.
     pub fn allow_in_release(mut self, allow: bool) -> Self {
         self.allow_in_release = allow;
+        self
+    }
+
+    /// Reconnect automatically after the connection is lost (default: off; a lost connection
+    /// ends the session). See [`SshReconnect`]: a command is never re-run. The first connection
+    /// is the one [`SshSession::connect`] returns (an error there is the caller's answer).
+    pub fn with_reconnect(mut self, reconnect: SshReconnect) -> Self {
+        self.reconnect = Some(reconnect);
         self
     }
 
@@ -662,6 +764,20 @@ mod tests {
         assert!(answers.respond(&SshPromptRequest::new(vec![SshPrompt::new("Favourite colour?", true)])).is_none());
         let debug = format!("{answers:?} {:?} {:?}", SshAuth::password("fake-pw-1"), SshAuth::keyboard_interactive(answers.clone()));
         assert!(!debug.contains("fake-pw-1") && !debug.contains("123456"), "{debug}");
+    }
+
+    #[test]
+    fn reconnect_backoff_is_bounded() {
+        let policy = SshReconnect::default().with_base(Duration::from_millis(100)).with_cap(Duration::from_secs(2)).with_jitter(false);
+        assert_eq!(policy.delay_bound(1), Duration::from_millis(100));
+        assert_eq!(policy.delay_bound(3), Duration::from_millis(400));
+        assert_eq!(policy.delay(40, 0), Duration::from_secs(2));
+        let jitter = SshReconnect::default().with_base(Duration::MAX).with_cap(Duration::MAX);
+        assert!(jitter.delay(5, u64::MAX) <= MAX_TIMEOUT);
+        assert!(SshReconnect::default().with_max_attempts(Some(2)).may_retry(2));
+        assert!(!SshReconnect::default().with_max_attempts(Some(2)).may_retry(3));
+        assert_eq!(SshReconnect::default().delay_bound(1), Duration::from_secs(1));
+        assert!(format!("{:?}", SshTarget::new("h", "u").with_reconnect(SshReconnect::default())).contains("reconnect: Some"));
     }
 
     #[test]

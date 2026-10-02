@@ -101,3 +101,81 @@ fn a_blocking_websocket_polled_from_a_loop() {
         std::thread::sleep(Duration::from_millis(5));
     }
 }
+
+/// A server that accepts connections, reads, and never answers; counts accepted connections.
+fn silent_server() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::Read;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let base = format!("http://{}", listener.local_addr().expect("addr"));
+    let accepted = std::sync::Arc::new(AtomicUsize::new(0));
+    let count = std::sync::Arc::clone(&accepted);
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for socket in listener.incoming().flatten() {
+            let mut socket = socket;
+            let mut buffer = [0u8; 4096];
+            let _ = socket.set_read_timeout(Some(Duration::from_millis(200)));
+            let _ = socket.read(&mut buffer);
+            count.fetch_add(1, Ordering::SeqCst);
+            held.push(socket);
+        }
+    });
+    (base, accepted)
+}
+
+/// Poll `reply` like a game loop until its answer arrives (one overall deadline).
+fn take<T>(reply: &mut net_backend_client::Reply<T>) -> Result<T, Error> {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        if let Some(answer) = reply.try_take() {
+            return answer;
+        }
+        assert!(Instant::now() < deadline, "no answer");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn a_cancelled_send_is_answered_cancelled_with_an_honest_sent() {
+    use net_backend_client::protocol::auth::{AccessToken, RefreshToken, TokenPair};
+    use net_backend_client::protocol::UnixMillis;
+    use std::sync::atomic::Ordering;
+
+    let (base, accepted) = silent_server();
+    let later = UnixMillis(UnixMillis::now().get() + 3_600_000);
+    // Handed to the connection (the request went out; the server never answers): `sent: None`.
+    let client = Client::new(&base).expect("client");
+    client.resume(TokenPair::new(AccessToken::new("nbsa_fake_cancel"), later, RefreshToken::new("nbsr_fake_cancel"), later));
+    let mut reply = client.send(GetAccount::new());
+    let deadline = Instant::now() + WAIT;
+    while accepted.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline, "the request never reached the server");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    reply.cancel();
+    let error = take(&mut reply).expect_err("cancelled");
+    assert!(matches!(error, Error::Cancelled { sent: None, .. }), "{error:?}");
+    assert_eq!(error.was_sent(), None);
+    // Still waiting for a token refresh (which itself hangs): never sent, `sent: Some(false)`.
+    let waiting = Client::new(&base).expect("client");
+    let expired = UnixMillis(UnixMillis::now().get() - 1_000);
+    waiting.resume(TokenPair::new(AccessToken::new("nbsa_fake_cancel_2"), expired, RefreshToken::new("nbsr_fake_cancel_2"), later));
+    let before = accepted.load(Ordering::SeqCst);
+    let mut reply = waiting.send(GetAccount::new());
+    let handle = reply.cancel_handle();
+    while accepted.load(Ordering::SeqCst) == before {
+        assert!(Instant::now() < deadline, "the refresh never reached the server");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    handle.cancel();
+    let error = take(&mut reply).expect_err("cancelled");
+    assert!(matches!(error, Error::Cancelled { sent: Some(false), .. }), "{error:?}");
+    // An answered request: cancel changes nothing.
+    let server = Server::start();
+    let client = Client::new(&server.base).expect("client");
+    let mut reply = client.send(net_backend_client::protocol::GetServerInfo::new());
+    let info = take(&mut reply).expect("info");
+    reply.cancel();
+    assert_eq!(info.protocol, net_backend_client::protocol::PROTOCOL_VERSION);
+}

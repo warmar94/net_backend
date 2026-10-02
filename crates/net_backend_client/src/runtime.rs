@@ -4,18 +4,30 @@
 use std::cell::Cell;
 use std::future::Future;
 use std::pin::pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
 use tokio::runtime::Handle;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Notify};
 
 use crate::{Error, Reply};
 
 thread_local! {
     /// Set on the client's own runtime threads (the `net-backend-client` thread and its blocking pool).
     static CLIENT_THREAD: Cell<bool> = const { Cell::new(false) };
+}
+
+tokio::task_local! {
+    /// Set inside a cancellable blocking-interface task once an HTTP request was handed to a
+    /// connection (from then on a cancel cannot promise "never sent").
+    static HANDED: Arc<AtomicBool>;
+}
+
+/// An HTTP request is about to be handed to a connection (it may reach the server from now on).
+pub(crate) fn mark_handed() {
+    let _ = HANDED.try_with(|handed| handed.store(true, Ordering::SeqCst));
 }
 
 /// The current tokio runtime, or `InvalidRequest` (an async call made outside tokio would panic
@@ -103,13 +115,30 @@ impl RuntimeThread {
         Ok(Arc::new(Self { handle, stop: Some(stop) }))
     }
 
-    /// Run `future` on the runtime thread; its result arrives in the reply.
+    /// Run `future` on the runtime thread; its result arrives in the reply. [`Reply::cancel`] stops
+    /// it and answers `Cancelled` (`sent: Some(false)` when no HTTP request had been handed to a
+    /// connection, `None` after).
     pub(crate) fn spawn<T: Send + 'static>(&self, future: impl Future<Output = Result<T, Error>> + Send + 'static) -> Reply<T> {
         let (sender, reply) = Reply::channel();
+        let cancel = Arc::new(Notify::new());
+        let cancelled = Arc::clone(&cancel);
         self.handle.spawn(async move {
-            let _ = sender.send(future.await);
+            let handed = Arc::new(AtomicBool::new(false));
+            let mut work = pin!(HANDED.scope(Arc::clone(&handed), future));
+            let mut cancel = pin!(cancelled.notified());
+            // The cancel first; the work is dropped with this task when the cancel wins.
+            let outcome = std::future::poll_fn(|cx| {
+                if cancel.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(None);
+                }
+                work.as_mut().poll(cx).map(Some)
+            })
+            .await;
+            let answer = outcome.unwrap_or_else(|| Err(Error::Cancelled { sent: if handed.load(Ordering::SeqCst) { None } else { Some(false) } }));
+            let _ = sender.send(answer);
         });
-        reply
+        // `notify_one` keeps the cancel for a task that is not waiting at that moment.
+        reply.with_cancel(move || cancel.notify_one())
     }
 
     /// Run `future` on the runtime thread and block until it is done.

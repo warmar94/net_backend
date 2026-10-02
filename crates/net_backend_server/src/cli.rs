@@ -9,6 +9,7 @@
 //! | `config check [--connect]` | validate the configuration, every module's settings included (and try the database) |
 //! | `openapi export [--output <file>]` | write or print the OpenAPI document (no database needed) |
 //! | `asyncapi export [--output <file>]` | write or print the AsyncAPI document of the WebSocket endpoint (no database needed) |
+//! | `healthcheck` | ask the running server's `/readyz` on `server.bind`: exit 0 on `200`, 1 otherwise, within 4 s (no database needed; an app command of that name replaces it) |
 //!
 //! The configuration comes from `NBS_CONFIG` / `config.toml` + `NBS__*` variables
 //! ([`Config::load`](crate::Config::load)), loaded by the app before the builder is created.
@@ -16,11 +17,13 @@
 //! `user:create`, `user:role`, `user:ban`, `user:unban` and `sessions:revoke`. `--help` lists them.
 
 use std::ffi::OsString;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
+use std::time::{Duration, Instant};
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
-use crate::command::{validate_command_name, CommandCtx};
+use crate::command::{validate_command_name, CommandCtx, BUILT_IN_COMMANDS};
 use crate::config::{LogConfig, LogFormat};
 use crate::db::{Db, Dialect};
 use crate::error::Error;
@@ -28,7 +31,7 @@ use crate::migrate::MigrationState;
 use crate::NetBackendServer;
 
 #[derive(Parser, Debug)]
-#[command(about = "A game backend server built with net_backend_server", disable_version_flag = true)]
+#[command(about = "A game backend server built with net_backend_server", version)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -63,6 +66,9 @@ enum Command {
         #[command(subcommand)]
         action: OpenapiAction,
     },
+    /// Check that the running server is ready: `GET /readyz` on `server.bind` (an unspecified
+    /// address means loopback); exit 0 on `200`, 1 otherwise. Needs no database.
+    Healthcheck,
     /// An app command (from a module or the app; listed below).
     #[command(external_subcommand)]
     External(Vec<OsString>),
@@ -115,6 +121,20 @@ fn out(w: &mut (dyn Write + Send), line: impl std::fmt::Display) -> Result<(), E
     writeln!(w, "{line}").map_err(|e| Error::io("writing output", e))
 }
 
+/// Whether `args` only ask for the help or the version (`--help` / `-h` / `help` / `--version` /
+/// `-V`, also after a built-in command's name): those need no configuration.
+pub(crate) fn informational(args: &[OsString]) -> bool {
+    let flag = |a: &OsString| a == "--help" || a == "-h" || a == "--version" || a == "-V";
+    match args.get(1) {
+        Some(first) if flag(first) || first == "help" => true,
+        Some(first) => {
+            let built_in = first.to_str().is_some_and(|name| BUILT_IN_COMMANDS.contains(&name) || name == HEALTHCHECK);
+            built_in && args[2..].iter().any(flag)
+        }
+        None => false,
+    }
+}
+
 /// Parse `args` and run the command, writing human output to `w`.
 pub(crate) async fn run<I, T>(server: NetBackendServer, args: I, w: &mut (dyn Write + Send)) -> Result<(), Error>
 where
@@ -129,7 +149,14 @@ where
             return Err(Error::Cli(format!("command `{}` is registered twice", command.name())));
         }
     }
+    let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    // An app command named `healthcheck` (written before the framework had one) replaces the
+    // built-in: it runs, and the built-in is hidden from `--help`.
+    let own_healthcheck = commands.iter().any(|c| c.name() == HEALTHCHECK);
     let mut parser = Cli::command();
+    if own_healthcheck {
+        parser = parser.mut_subcommand(HEALTHCHECK, |c| c.hide(true));
+    }
     if !commands.is_empty() {
         let mut list = String::from("App commands:\n");
         for command in &commands {
@@ -138,13 +165,17 @@ where
         }
         parser = parser.after_help(list);
     }
-    let parsed = parser.try_get_matches_from(args).and_then(|matches| Cli::from_arg_matches(&matches));
+    let parsed = if own_healthcheck && args.get(1).is_some_and(|a| a == HEALTHCHECK) {
+        Ok(Cli { command: Some(Command::External(args[1..].to_vec())) })
+    } else {
+        parser.try_get_matches_from(args).and_then(|matches| Cli::from_arg_matches(&matches))
+    };
     let cli = match parsed {
         Ok(cli) => cli,
         Err(error) => {
             use clap::error::ErrorKind;
-            if matches!(error.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand) {
-                return out(w, error.render());
+            if matches!(error.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand | ErrorKind::DisplayVersion) {
+                return out(w, error.render().to_string().trim_end());
             }
             return Err(Error::Cli(error.render().to_string()));
         }
@@ -224,6 +255,15 @@ where
             }
             out(w, format!("The app now owns the `{module}` migrations; edit them before the first `migrate`."))
         }
+        Command::Healthcheck => {
+            let bind = server.config().server.bind;
+            // Blocking socket calls with their own timeouts, off the runtime's worker threads.
+            match tokio::task::spawn_blocking(move || ready(bind)).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(problem)) => Err(Error::Cli(format!("healthcheck: {problem}"))),
+                Err(error) => Err(Error::Cli(format!("healthcheck: {error}"))),
+            }
+        }
         Command::Openapi { action: OpenapiAction::Export { output } } => export(document(server, false).await?, output, w),
         Command::Asyncapi { action: OpenapiAction::Export { output } } => export(document(server, true).await?, output, w),
         Command::Config { action: ConfigAction::Check { connect } } => {
@@ -269,6 +309,64 @@ where
     }
 }
 
+/// The built-in health check's name (an app command of that name replaces it).
+const HEALTHCHECK: &str = "healthcheck";
+
+/// The longest a whole `healthcheck` may take (connect, request and answer together): below the
+/// 5 s `HEALTHCHECK --timeout` of the Docker files, so the check reports its own reason.
+const HEALTHCHECK_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// `GET /readyz` on the listening address (an unspecified address means loopback: `[::]` tries
+/// `::1`, then `127.0.0.1`, for a machine without IPv6); `Ok` on a `200` answer. Everything
+/// together within [`HEALTHCHECK_TIMEOUT`].
+fn ready(bind: SocketAddr) -> Result<(), String> {
+    let deadline = Instant::now() + HEALTHCHECK_TIMEOUT;
+    let left = || deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
+    let port = bind.port();
+    let candidates = match bind.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)],
+        IpAddr::V6(ip) if ip.is_unspecified() => {
+            vec![SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port), SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)]
+        }
+        ip => vec![SocketAddr::new(ip, port)],
+    };
+    let mut problem = String::new();
+    let mut connected = None;
+    for addr in candidates {
+        match TcpStream::connect_timeout(&addr, left()) {
+            Ok(stream) => {
+                connected = Some(stream);
+                break;
+            }
+            Err(e) => problem = format!("cannot connect to {addr}: {e}"),
+        }
+    }
+    let mut stream = connected.ok_or(problem)?;
+    stream.set_write_timeout(Some(left())).map_err(|e| e.to_string())?;
+    stream.write_all(b"GET /readyz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").map_err(|e| format!("cannot send the request: {e}"))?;
+    // The status line is all that matters: read until its end (at most 4 KiB).
+    let mut answer = Vec::with_capacity(256);
+    let mut chunk = [0u8; 512];
+    while !answer.contains(&b'\n') && answer.len() < 4096 {
+        if Instant::now() >= deadline {
+            return Err(format!("no answer within {} s", HEALTHCHECK_TIMEOUT.as_secs()));
+        }
+        stream.set_read_timeout(Some(left())).map_err(|e| e.to_string())?;
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => answer.extend_from_slice(&chunk[..n]),
+            Err(e) => return Err(format!("cannot read the answer: {e}")),
+        }
+    }
+    let status_line = answer.split(|&b| b == b'\n').next().map(String::from_utf8_lossy).unwrap_or_default();
+    let status = status_line.split_whitespace().nth(1).unwrap_or("");
+    if status == "200" {
+        Ok(())
+    } else {
+        Err(format!("/readyz answered `{}`", status_line.trim()))
+    }
+}
+
 /// Write a document to `output`, or print it.
 fn export(json: String, output: Option<std::path::PathBuf>, w: &mut (dyn Write + Send)) -> Result<(), Error> {
     match output {
@@ -295,7 +393,8 @@ async fn document(mut server: NetBackendServer, asyncapi: bool) -> Result<String
 pub fn init_logging(config: &LogConfig) -> bool {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env().or_else(|_| EnvFilter::try_new(&config.level)).unwrap_or_else(|_| EnvFilter::new("info"));
-    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+    // Colours only on a terminal: `docker logs`, journald and files get plain text.
+    let builder = tracing_subscriber::fmt().with_env_filter(filter).with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()));
     match config.format {
         LogFormat::Json => builder.json().try_init().is_ok(),
         _ => builder.try_init().is_ok(),

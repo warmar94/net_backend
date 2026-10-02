@@ -1,0 +1,11 @@
+[package]
+name = "{{package}}"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# The server framework with SQLite (compiled in, no system library) and the storage and chat modules.
+# PostgreSQL / MySQL: add the feature `postgres` / `mysql` (any combination; `database.url` picks one).
+net_backend_server = { version = "{{version}}", default-features = false, features = ["sqlite", "storage", "chat"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

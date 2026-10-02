@@ -414,6 +414,57 @@ impl NetBackendServer {
         crate::cli::run(self, args, &mut std::io::stdout()).await
     }
 
+    /// The whole `main` of a server binary: `--help` / `-h` / `help` and `--version` / `-V` work
+    /// without a configuration file or a database (the help lists the app's commands of a server
+    /// `make` builds from the default configuration); every other command loads the configuration
+    /// ([`Config::load`]), builds the server with `make` and [`run`](Self::run)s it. An error is
+    /// printed and gives exit code 1.
+    ///
+    /// ```no_run
+    /// use net_backend_server::{Auth, NetBackendServer};
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> std::process::ExitCode {
+    ///     NetBackendServer::run_main(|config| NetBackendServer::new(config).module(Auth::new())).await
+    /// }
+    /// ```
+    pub async fn run_main<F>(make: F) -> std::process::ExitCode
+    where
+        F: FnOnce(Config) -> NetBackendServer,
+    {
+        let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+        let result = if crate::cli::informational(&args) {
+            make(Config::default()).run_with_args(args).await
+        } else {
+            match Config::load() {
+                Ok(config) => make(config).run().await,
+                Err(error) => Err(error),
+            }
+        };
+        match result {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::ExitCode::FAILURE
+            }
+        }
+    }
+
+    /// [`run_main`](Self::run_main) with explicit arguments and configuration loader, writing the
+    /// command output to `output` (tests, tools). `load` is called only when the arguments ask for
+    /// more than the help or the version; logging is not set up.
+    pub async fn run_main_with_output<I, T, L, F>(args: I, load: L, make: F, output: &mut (dyn std::io::Write + Send)) -> Result<(), Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+        L: FnOnce() -> Result<Config, Error>,
+        F: FnOnce(Config) -> NetBackendServer,
+    {
+        let args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
+        let config = if crate::cli::informational(&args) { Config::default() } else { load()? };
+        make(config).run_with_output(args, output).await
+    }
+
     /// [`run_with_args`](Self::run_with_args) writing the command output to `output` instead
     /// of stdout (tests, tools).
     pub async fn run_with_output<I, T>(self, args: I, output: &mut (dyn std::io::Write + Send)) -> Result<(), Error>

@@ -1,17 +1,14 @@
 # net_backend_server: production configuration of the reference server (Auth + Storage + Chat).
 #
-# Both install paths use this file:
-#   systemd:        /etc/net-backend/config.toml           (the installer copies it once)
-#   Docker Compose: deploy/docker/config.toml               (setup.sh copies it once; mounted read-only)
-# Docker overrides the address, the database URL file and the trusted proxies through NBS__* variables
-# in compose.yaml; everything else is read from here. Unknown keys are errors: check a change with
+# The systemd install copies it once to /etc/net-backend/config.toml. (The Docker Compose files carry
+# the same settings inline, as their `x-nbs-config`.) Unknown keys are errors: check a change with
 #   net-backend-server config check --connect
 #
 # Secrets never go into this file: the database URL is read from `database.url_file`, the SMTP password
 # from `modules.auth.smtp_password_file`, the Steam key from `modules.auth.steam_web_api_key_file`.
 
 [server]
-# Behind Caddy on the same machine: loopback only (Docker: NBS__SERVER__BIND=0.0.0.0:8080).
+# Behind Caddy on the same machine: loopback only.
 bind = "127.0.0.1:8080"
 # In-flight requests and closing WebSockets get this long after SIGTERM; then each module gets up to
 # server.module_shutdown_timeout_secs (10 s), one after the other. systemd's TimeoutStopSec and
@@ -20,7 +17,6 @@ shutdown_grace_secs = 20
 
 [database]
 # A file holding the URL (mysql://… / postgres://… / sqlite:…), written by the installer.
-# Docker: NBS__DATABASE__URL_FILE=/run/secrets/database_url.
 url_file = "/etc/net-backend/database_url"
 max_connections = 20
 # Production runs `migrate` as a deploy step (systemd ExecStartPre, the Compose `migrate` service).
@@ -29,8 +25,7 @@ migrate_on_start = false
 migrations_dir = "/etc/net-backend/migrations"
 
 [http]
-# The proxy in front (Caddy on the same machine). Docker: the Compose network's subnet
-# (NBS__HTTP__TRUSTED_PROXIES). Needed for per-address rate limits and WebSocket caps.
+# The proxy in front (Caddy on the same machine). Needed for per-address rate limits and WebSocket caps.
 trusted_proxies = ["127.0.0.1", "::1"]
 
 [log]

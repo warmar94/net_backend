@@ -5,6 +5,7 @@ target/
 .github/
 **/NOTES.md
 **/docs/
+# A 0.1.0 setup.sh install's files (deploy/docker/): never in a build context
 deploy/docker/secrets/
 deploy/docker/config.toml
 deploy/docker/config.toml.bak

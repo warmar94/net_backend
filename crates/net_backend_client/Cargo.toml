@@ -1,6 +1,6 @@
 [package]
 name = "net_backend_client"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 rust-version.workspace = true
 description = "A Rust client for net_backend_server: typed HTTP calls with automatic token refresh, a reconnecting WebSocket, SSH / SFTP to the server machine, async (tokio) or blocking."
@@ -17,12 +17,12 @@ exclude = ["NOTES.md", "docs/", "/target"]
 # HTTP(S), the session (login, refresh, logout) and the blocking interface are always compiled.
 default = []
 # The WebSocket: typed requests and answers, pushes, heartbeats, reconnects (tokio-tungstenite over our
-# own TCP / TLS stream).
-ws = ["dep:tokio-tungstenite", "dep:tokio-rustls", "dep:futures-util", "tokio/macros"]
+# own TCP / TLS stream; the upgrade request goes out through hyper).
+ws = ["dep:tokio-tungstenite", "dep:tokio-rustls", "dep:futures-util", "dep:tower-service", "tokio/macros", "tokio/io-util"]
 # ADMIN / DEV TOOLS ONLY. SSH to the server machine's OpenSSH (russh with ring, never aws-lc): strict
 # known_hosts checking, key files / agent / password / keyboard-interactive. Refused in release builds
 # unless the target opts in.
-ssh = ["dep:russh", "dep:ssh2-config", "dep:glob", "dep:hmac", "dep:sha1", "dep:zeroize", "tokio/macros"]
+ssh = ["dep:russh", "dep:ssh2-config", "dep:glob", "dep:hmac", "dep:sha1", "tokio/macros"]
 # SFTP (upload, download, list, mkdir, remove, rename) on SSH sessions.
 sftp = ["ssh", "dep:russh-sftp"]
 # RSA host keys and RSA key files for SSH (rsa-sha2-256/512). Off by default: the `rsa` crate carries
@@ -31,13 +31,15 @@ ssh-rsa = ["ssh", "russh/rsa"]
 
 [dependencies]
 # The shared message types.
-net_backend_protocol = { path = "../net_backend_protocol", version = "0.1.0" }
+net_backend_protocol = { path = "../net_backend_protocol", version = "0.1.1" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # Ubiquitous crates: caret minimums (PLUGINS §8), the same ones the server uses (one tokio, one hyper).
 tokio = { version = "1.47", default-features = false, features = ["rt", "net", "time", "sync"] }
 hyper = { version = "1.6", default-features = false, features = ["client", "http1"] }
-hyper-util = { version = "0.1.10", default-features = false, features = ["client-legacy", "http1", "tokio"] }
+# `client-proxy`: the proxy settings from the environment (`HTTPS_PROXY`, `NO_PROXY`, ...) and the
+# HTTP CONNECT tunnel (adds only `ipnet`; base64 and percent-encoding are in every TLS build already).
+hyper-util = { version = "0.1.21", default-features = false, features = ["client-legacy", "client-proxy", "http1", "tokio"] }
 http = "1.3"
 http-body-util = "0.1.3"
 bytes = "1.10"
@@ -47,12 +49,18 @@ hyper-rustls = { version = "0.27.10", default-features = false, features = ["htt
 rustls = { version = "0.23.31", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "1.0"
 tracing = { version = "0.1.41", default-features = false, features = ["std"] }
+# Wipes the crate's own copies of secrets (the `Bearer …` text, request bodies, SSH key file text).
+# rustls already depends on it.
+zeroize = { version = "1.7", default-features = false, features = ["alloc"] }
 
 # Feature `ws`: the WebSocket protocol engine of the server's own version (tungstenite 0.29, as axum's),
 # only its `handshake` feature: TLS is ours (tokio-rustls with the same ring config).
 tokio-tungstenite = { version = "0.29.0", default-features = false, features = ["handshake"], optional = true }
 tokio-rustls = { version = "0.26.2", default-features = false, features = ["ring", "tls12"], optional = true }
 futures-util = { version = "0.3.31", default-features = false, features = ["std", "sink"], optional = true }
+# Drives hyper-util's CONNECT tunnel for a WebSocket through a proxy (already in the tree through
+# hyper-util; no new crate).
+tower-service = { version = "0.3.3", optional = true }
 
 # Feature `ssh`: the same crates and versions as `bevy_net_backend` (pinned exactly: SSH security fixes
 # arrive as patch releases and are bumped deliberately). ring only, RSA only with `ssh-rsa`.
@@ -64,8 +72,6 @@ glob = { version = "0.3", optional = true }
 # Hashed known_hosts entries (`|1|salt|hash` = HMAC-SHA1); the same versions russh uses.
 hmac = { version = "0.13", optional = true }
 sha1 = { version = "0.11", default-features = false, optional = true }
-# Wipes key file contents read into memory.
-zeroize = { version = "1.7", optional = true }
 # Feature `sftp`.
 russh-sftp = { version = "=3.0.1", optional = true }
 
@@ -75,6 +81,8 @@ net_backend_server = { path = "../net_backend_server", default-features = false,
 tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
 # Random seeds for the throwaway keys of the in-process SSH test server.
 getrandom = { version = "0.4", features = ["sys_rng"] }
+# The log-capture test also records the `log` crate's records (tungstenite and russh log through it).
+log = { version = "0.4", features = ["std"] }
 
 [[example]]
 name = "quickstart"
@@ -103,6 +111,12 @@ required-features = ["ws"]
 [[test]]
 name = "ssh"
 required-features = ["ssh"]
+
+[[test]]
+name = "redaction"
+
+[[test]]
+name = "proxy"
 
 [package.metadata.docs.rs]
 all-features = true

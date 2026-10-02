@@ -79,6 +79,15 @@ fn busy(message: &'static str) -> Response {
     response
 }
 
+/// The reason given when a revocation that arrived during authentication refuses a socket.
+fn revoked_reason(code: CloseCode) -> &'static str {
+    if code == CloseCode::BANNED {
+        "the account is banned"
+    } else {
+        "the session was revoked"
+    }
+}
+
 /// A temporary failure (the database is down, a hook timed out, rate limited): the client should
 /// come back, so it never becomes a permanent refusal.
 fn is_transient(error: &AppError) -> bool {
@@ -133,6 +142,25 @@ async fn handshake_auth(state: &AppState, hub: &Hub, parts: &Parts, ip: Option<I
         }
     }
     Ok(None)
+}
+
+/// The handshake's credentials checked again (the first check is older than the hub's revocation
+/// memory, e.g. after a slow connect hook): the header through the authenticators, else the query
+/// token.
+async fn recheck_handshake(state: &AppState, hub: &Hub, parts: &Parts, ip: Option<IpAddr>) -> Result<(AuthContext, Instant), AppError> {
+    let checked_at = Instant::now();
+    if parts.headers.contains_key(AUTHORIZATION) {
+        for authenticator in hub.0.authenticators.iter() {
+            if let Some(context) = authenticator.authenticate(parts, state).await? {
+                return Ok((context, checked_at));
+            }
+        }
+        return Err(AppError::new(codes::UNAUTHORIZED, "the credentials are not accepted"));
+    }
+    match query_token(&parts.uri) {
+        Some(token) => authenticate_token(state, hub, &token, ip).await.map(|context| (context, checked_at)),
+        None => Err(AppError::new(codes::UNAUTHORIZED, "the credentials are not accepted")),
+    }
 }
 
 async fn before_connect(
@@ -197,7 +225,18 @@ pub(crate) async fn endpoint(State(state): State<AppState>, request: Request) ->
                     count(&hub, "nbs_ws_handshakes_refused_total", "reason", "hook");
                     return refuse(error);
                 }
-                Start::Authenticated(context, checked_at)
+                if hub.needs_recheck(checked_at) {
+                    // Checked too long ago for the hub's revocation memory: check again.
+                    match recheck_handshake(&state, &hub, &parts, ip).await {
+                        Ok((context, checked_at)) => Start::Authenticated(context, checked_at),
+                        Err(error) => {
+                            count(&hub, "nbs_ws_handshakes_refused_total", "reason", "auth");
+                            return refuse(error);
+                        }
+                    }
+                } else {
+                    Start::Authenticated(context, checked_at)
+                }
             }
             Ok(None) => Start::Anonymous,
             Err(error) => {
@@ -407,7 +446,9 @@ impl Connection {
             Start::RefuseVersion => self.close(CloseCode::UNSUPPORTED_PROTOCOL, Cow::Borrowed("unsupported protocol version")).await,
             Start::Authenticated(context, checked_at) => match self.become_user(context, checked_at) {
                 Ok(()) => self.serve().await,
-                Err(code) => self.close(code, Cow::Borrowed("the session was revoked")).await,
+                // Too old to judge (rare: the revocation memory overflowed meanwhile): reconnect.
+                Err(CloseCode::TRY_AGAIN_LATER) => self.close(CloseCode::TRY_AGAIN_LATER, Cow::Borrowed("authentication unavailable; try again later")).await,
+                Err(code) => self.close(code, Cow::Borrowed(revoked_reason(code))).await,
             },
             Start::Anonymous => self.serve().await,
         }
@@ -711,8 +752,8 @@ impl Connection {
             let error = ApiError::new(codes::UNSUPPORTED_PROTOCOL, "this protocol version is not supported").with_details(version_details());
             return self.auth_failed(error, CloseCode::UNSUPPORTED_PROTOCOL).await;
         }
-        let checked_at = Instant::now();
-        let context = match authenticate_token(&self.state, &self.hub, auth.token.expose(), self.ip).await {
+        let mut checked_at = Instant::now();
+        let mut context = match authenticate_token(&self.state, &self.hub, auth.token.expose(), self.ip).await {
             Ok(context) => context,
             Err(error) => return self.auth_refused(error).await,
         };
@@ -723,9 +764,33 @@ impl Connection {
         } else if let Err(error) = before_connect(&self.state, Some(self.id), &context, self.ip, self.origin.clone(), self.request_id.clone()).await {
             return self.auth_refused(error).await;
         }
+        if self.hub.needs_recheck(checked_at) {
+            // The connect hook took longer than the hub's revocation memory: check the token again.
+            checked_at = Instant::now();
+            context = match authenticate_token(&self.state, &self.hub, auth.token.expose(), self.ip).await {
+                Ok(again) if again.user_id == context.user_id => again,
+                Ok(_) => return self.auth_failed(ApiError::new(codes::UNAUTHORIZED, "the access token is not accepted"), CloseCode::UNAUTHORIZED).await,
+                Err(error) => return self.auth_refused(error).await,
+            };
+        }
         let user = context.user_id;
         if let Err(code) = self.become_user(context, checked_at) {
-            return self.auth_failed(ApiError::new(codes::UNAUTHORIZED, "the session was revoked"), code).await;
+            if code == CloseCode::TRY_AGAIN_LATER {
+                // Too old to judge (the revocation memory overflowed meanwhile): the client reconnects.
+                self.close(CloseCode::TRY_AGAIN_LATER, Cow::Borrowed("authentication unavailable; try again later")).await;
+                return Flow::Stop;
+            }
+            if code == CloseCode::BANNED {
+                // A ban that landed while this socket authenticated answers `banned` (like the close
+                // code), with the ban's end (`details.until`) read again from the account.
+                if let Err(error) = authenticate_token(&self.state, &self.hub, auth.token.expose(), self.ip).await {
+                    if error.code() == codes::BANNED {
+                        return self.auth_refused(error).await;
+                    }
+                }
+                return self.auth_failed(ApiError::new(codes::BANNED, "this account is banned"), code).await;
+            }
+            return self.auth_failed(ApiError::new(codes::UNAUTHORIZED, revoked_reason(code)), code).await;
         }
         self.send_frame(&WsServerFrame::AuthOk(Some(WsAuthOk::new(user)))).await
     }

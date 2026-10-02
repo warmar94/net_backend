@@ -27,7 +27,7 @@ pub(crate) fn client_config() -> Result<rustls::ClientConfig, String> {
 }
 
 /// Bytes from the operating system's secure random source (through ring; no extra dependency).
-#[cfg(feature = "ws")]
+#[cfg(any(feature = "ws", feature = "ssh"))]
 pub(crate) fn random_u64() -> u64 {
     let mut bytes = [0u8; 8];
     if rustls::crypto::ring::default_provider().secure_random.fill(&mut bytes).is_err() {

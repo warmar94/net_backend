@@ -5,6 +5,18 @@ All notable changes to this crate are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) (before 1.0: a minor bump for any API
 change or a key dependency bump).
 
+## [0.1.1] - Unreleased
+
+### Changed
+
+- The README and the API documentation describe what the crate has and does. No API change.
+
+### Security
+
+- `Password`, `AccessToken`, `RefreshToken` and `Secret` overwrite their whole allocation with
+  zeros when they are dropped (new dependency `zeroize`, no default features); each clone is wiped
+  on its own. `into_inner` hands the `String` over unwiped.
+
 ## [0.1.0] - 2026-10-02
 
 ### Added

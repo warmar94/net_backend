@@ -114,11 +114,21 @@ only what it registers (`features = ["mysql", "storage", "chat"]`).
 
 ## Install
 
-Pick ONE of the first two lines (the database), then add tokio and serde:
+The project generator writes a server with the `Auth`, `Storage` and `Chat` modules on SQLite, a
+development `config.toml`, a `Dockerfile` and (with `new`) a client, ready for `cargo run`:
+
+```text
+cargo install net_backend
+net-backend new mygame            # server/ + client/; or `net-backend new-server mygame`: the server alone
+```
+
+In your own project, pick ONE of the first three lines (the database and the modules), then add
+tokio and serde:
 
 ```text
 cargo add net_backend_server                                                  # MySQL (the default)
 cargo add net_backend_server --no-default-features --features sqlite          # or SQLite (postgres: --features postgres)
+cargo add net_backend_server --no-default-features --features sqlite,storage,chat   # or SQLite with storage + chat
 cargo add tokio --features rt-multi-thread,macros
 cargo add serde --features derive                                             # for your own request types
 ```
@@ -127,8 +137,8 @@ The same in `Cargo.toml`:
 
 ```toml
 [dependencies]
-net_backend_server = { version = "0.1.0" }                                   # MySQL
-# net_backend_server = { version = "0.1.0", default-features = false, features = ["sqlite"] }
+net_backend_server = { version = "0.1.1" }                                   # MySQL
+# net_backend_server = { version = "0.1.1", default-features = false, features = ["sqlite"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 serde = { version = "1", features = ["derive"] }
 ```
@@ -170,18 +180,21 @@ async fn main() -> Result<(), net_backend_server::Error> {
 }
 ```
 
-```text
-NBS__DATABASE__URL=sqlite::memory: cargo run       # with the `sqlite` feature (Linux / macOS shells)
-curl http://127.0.0.1:8080/v1/info                 # {"protocol":1,"min_protocol":1,"modules":[]}
+With the `sqlite` feature, a `config.toml` in the folder `cargo run` runs in names the database
+(an in-memory one here; `sqlite:game.db` is a file, created on the first start):
+
+```toml
+[database]
+url = "sqlite::memory:"
+migrate_on_start = true
 ```
 
-On Windows (PowerShell):
-
 ```text
-$env:NBS__DATABASE__URL = "sqlite::memory:"
 cargo run
-curl.exe http://127.0.0.1:8080/v1/info
 ```
+
+`http://127.0.0.1:8080/v1/info` in a browser (or `curl.exe` on Windows, `curl` elsewhere) answers
+`{"protocol":1,"min_protocol":1,"modules":[]}`.
 
 A complete headless example: [`examples/minimal.rs`](examples/minimal.rs).
 
@@ -226,7 +239,7 @@ max_age_secs = 600
 
 [log]
 level = "info"                 # a tracing filter; RUST_LOG wins
-format = "pretty"              # or "json"
+format = "pretty"              # or "json"; "pretty" has colours only on a terminal
 
 [metrics]
 enabled = false                # Prometheus text at GET /metrics on its own listener
@@ -449,9 +462,11 @@ characters).
 - **Sessions:** one per login, each its own token family. Logout revokes one session or all;
   a password change revokes the others, a reset or a ban revokes all. Revocation takes effect on
   the next request. Revocations made by other processes (the command line, another instance)
-  reach `subscribe_revocations` receivers within `revocation_poll_secs` (5 s). Expired tokens and
-  old sessions are deleted hourly (`purge_interval_secs`), audit entries after
-  `audit_retention_days` (365).
+  reach `subscribe_revocations` receivers within `revocation_poll_secs` (default 5 s, at most
+  3600). 0 turns the poll off and is accepted only with `ws.enabled = false`: with the WebSocket hub
+  on, a ban made by the command line would then never close open sockets, so the configuration is
+  refused (at start and by `config check`). Expired tokens and old sessions are deleted hourly
+  (`purge_interval_secs`), audit entries after `audit_retention_days` (365).
 - **Your handlers** take `AuthContext` (user id, session id, roles, session start),
   `Option<AuthContext>` (bad credentials = anonymous) or `MaybeAuth` (bad credentials answer their
   error); `RequireRole<R>` / `RequireAdmin` also check a role (403 without it).
@@ -612,8 +627,12 @@ than `ws.request_timeout_secs`), `internal` (never with details), plus whatever 
 - An open socket survives the expiry of its access token. Revoking its session closes it: logout,
   password change or reset, admin revocation, refresh-token reuse → 4001; a ban → 4003. Revocations
   made by another process (the command line, another instance) arrive through the `Auth` module's
-  database poll (`revocation_poll_secs`, 5 s). A revocation that lands while a socket is still
-  authenticating (after its token was checked) is applied too.
+  database poll (`revocation_poll_secs`, 5 s). A revocation is applied to the hub before the call
+  that made it returns, also while a socket is still authenticating (after its token was checked):
+  that socket is answered `auth.failed` (`banned` with the ban's `details.until` for a ban, else
+  `unauthorized`) and closed with 4003 / 4001, never `auth.ok`. The hub remembers revocations for
+  30 s (at most 4096); a token checked longer ago (a slow `BeforeWsConnect` hook) or before a
+  revocation it had to drop is checked again before the socket is registered.
 - `WsCtx.auth.roles` follow role changes: at once for changes made in this process (admin routes,
   server code), within `ws.roles_refresh_secs` (60 s) for changes made elsewhere (the command line,
   another instance).
@@ -1086,7 +1105,10 @@ Plain SQL per dialect, in files you can read and change.
 
 ## The command line
 
-Every server binary built with `.run()` has these commands:
+Every server binary built with `.run()` has these commands, plus `--help` and `--version` (the
+framework's version). With `NetBackendServer::run_main(|config| NetBackendServer::new(config)…)` as the
+whole `main`, `--help` and `--version` work without a configuration file or a database; every other
+command loads the configuration first.
 
 | Command | What |
 |---|---|
@@ -1097,6 +1119,7 @@ Every server binary built with `.run()` has these commands:
 | `config check [--connect]` | validate the configuration and print a summary without secrets (and try the database) |
 | `openapi export [--output <file>]` | write or print the OpenAPI document (needs no database) |
 | `asyncapi export [--output <file>]` | write or print the AsyncAPI document of the WebSocket endpoint (needs no database) |
+| `healthcheck` | ask the running server's `/readyz` on `server.bind` (an unspecified address means loopback; `[::]` tries `::1`, then `127.0.0.1`): exit 0 on `200`, 1 otherwise, within 4 s in all; needs no database |
 | `user:create <email> [--name <n>] [--password-file <f>] [--admin] [--verified]` | create an account (auth module); without a file a password is generated and printed once |
 | `user:role <email or id> <role> [--revoke]` | grant or revoke a role |
 | `user:ban <email or id> [--reason <text>] [--hours <n>]`, `user:unban <email or id>` | ban (revokes the sessions) or lift a ban |
@@ -1104,10 +1127,12 @@ Every server binary built with `.run()` has these commands:
 
 ```text
 my-game-server migrate && my-game-server serve
+my-game-server healthcheck    # a container health check: no shell or curl needed in the image
 ```
 
 Modules and the app add their own commands: implement `command::AppCommand` and register it with
-`.command(..)` (or return it from `Module::commands`). The command line builds the server first
+`.command(..)` (or return it from `Module::commands`). The names in `command::BUILT_IN_COMMANDS` are
+refused; an app command named `healthcheck` replaces the built-in one (and hides it from `--help`). The command line builds the server first
 (configuration, database, modules), so a command can use every service; `--help` lists them.
 Passwords are never taken from the command line itself (it is visible to other users of the
 machine).
@@ -1215,30 +1240,46 @@ above the grace period plus the module shutdown time.
 
 ## Deployment
 
-The repository's [`deploy/`](https://github.com/warmar94/net_backend/tree/main/deploy) folder installs a server on one
-Linux machine (Ubuntu 24.04), with the install path chosen once:
+**Try it with Docker**, the same command in PowerShell, cmd, bash and zsh:
+
+```text
+docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/warmar94/net_backend_server:0.1
+```
+
+The image (`linux/amd64`, `linux/arm64`) is the reference server with a configuration built in: SQLite in
+`/data` (`-v nbs-data:/data` keeps it), migrations applied on start, accounts, storage and chat with a
+`world` room. `http://127.0.0.1:8080/v1/info` answers right away. The trial is plain HTTP for your own
+computer: never publish its port on a public machine; production is the Compose install below.
+
+**Production**: the repository's [`deploy/`](https://github.com/warmar94/net_backend/tree/main/deploy) folder
+installs a server on one Linux machine (Ubuntu 24.04), with the install path chosen once:
 
 | | Docker Compose | systemd |
 |---|---|---|
-| The server | a distroless, non-root, read-only container with a health check | a service of a dedicated user with systemd's sandboxing (`NoNewPrivileges`, `ProtectSystem=strict`, …), `LimitNOFILE=262144` |
-| Database | MySQL 8.4 or PostgreSQL 16 in a container | MySQL, PostgreSQL or SQLite on the machine (`install.sh` creates the database and its account) |
+| Install | one Compose file + `DOMAIN=…` in `.env` + `docker compose up -d` (with Docker Desktop, the same commands on macOS and Windows) | build the binary, run `install.sh` |
+| The server | the prebuilt image: a distroless, non-root, read-only container with a health check | a service of a dedicated user with systemd's sandboxing (`NoNewPrivileges`, `ProtectSystem=strict`, …), `LimitNOFILE=262144` |
+| Database | PostgreSQL 16 or MySQL 8.4 in a container; its secrets generated on the first start | MySQL, PostgreSQL or SQLite on the machine (`install.sh` creates the database and its account) |
 | Migrations | a one-shot `migrate` service before the server starts | `ExecStartPre=… migrate` before every start |
 | HTTPS + WSS | Caddy: automatic certificates, `request_body max_size 5MB` (the 4 MiB batch put), access logs without tokens, the server trusting only Caddy's `X-Forwarded-For` | the same |
 | Backups | a daily systemd timer: `mysqldump --single-transaction`, `pg_dump -Fc` or SQLite's online backup, checked, kept 14 days; `net-backend-restore` puts one back (safety backup, migrate, readiness wait) | the same |
 
-Both install the **reference server**,
+```text
+curl -fsSLo compose.yaml https://raw.githubusercontent.com/warmar94/net_backend/main/deploy/docker/compose.postgres.yaml
+echo DOMAIN=api.example.com > .env
+docker compose up -d
+```
+
+(`curl.exe` in PowerShell and cmd.) Both paths install the **reference server**,
 [`examples/server.rs`](https://github.com/warmar94/net_backend/blob/main/crates/net_backend_server/examples/server.rs):
-the framework with `Auth`, `Storage` and `Chat`, configured from `config.toml`, plus a `healthcheck`
-command (exit 0 when `/readyz` answers 200) for containers without a shell. Your own server binary has the
-same command line and drops into the same files. The guide also covers the configuration, capacity numbers
-measured on a 2 vCPU machine, the limits to raise together (open files, `ws.max_connections`, Caddy's
-~120 KiB per proxied WebSocket), an
+the framework with `Auth`, `Storage` and `Chat`, configured from its configuration file. Its command
+line, which every server binary started with `.run()` has, includes `healthcheck` (exit 0 when `/readyz`
+answers 200) for containers without a shell. Your own server binary uses the same files: the
+[Dockerfile](https://github.com/warmar94/net_backend/blob/main/deploy/docker/Dockerfile) builds its image
+with three build arguments, and the Compose file runs it in place of the reference server. The guide also
+covers the configuration, capacity numbers measured on a 2 vCPU machine, the limits to raise together
+(open files, `ws.max_connections`, Caddy's ~120 KiB per proxied WebSocket), an
 [SSH hardening guide](https://github.com/warmar94/net_backend/blob/main/deploy/ssh-hardening.md) and the
 [`load_test`](https://github.com/warmar94/net_backend/tree/main/crates/load_test) tool for sizing a machine.
-
-```text
-cargo build --release --locked -p net_backend_server --example server --no-default-features --features mysql,storage,chat,smtp
-```
 
 ## How it works
 
@@ -1262,6 +1303,7 @@ cargo build --release --locked -p net_backend_server --example server --no-defau
 
 | net_backend_server | net_backend_protocol | axum | sqlx | sea-query | utoipa | Rust |
 |---|---|---|---|---|---|---|
+| 0.1.1 | 0.1 (≥ 0.1.0) | 0.8 (≥ 0.8.9) | 0.9 | 1.0 (≥ 1.0.2) | 6 | 1.95+ |
 | 0.1.0 | 0.1.0 | 0.8 (≥ 0.8.9) | 0.9 | 1.0 (≥ 1.0.2) | 6 | 1.95+ |
 
 ## Testing

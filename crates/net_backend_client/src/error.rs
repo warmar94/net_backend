@@ -125,6 +125,15 @@ pub enum Error {
     /// The client (its runtime thread, a WebSocket connection or an SSH session) shut down before
     /// an answer arrived.
     Shutdown,
+    /// The app cancelled the request ([`Reply::cancel`](crate::Reply::cancel)) before its answer
+    /// arrived; a late answer is dropped.
+    #[non_exhaustive]
+    Cancelled {
+        /// `Some(false)`: it never went out; `Some(true)`: it had gone out (a WebSocket request
+        /// written to the connection; it may have run); `None`: an HTTP request that was already
+        /// handed to the connection (it may have reached the server).
+        sent: Option<bool>,
+    },
     /// The SSH server's host key could not be verified (feature `ssh`): unknown, changed or
     /// revoked. The connection was closed before authentication: nothing was sent.
     #[non_exhaustive]
@@ -178,7 +187,7 @@ impl Error {
         match self {
             Error::InvalidRequest(_) | Error::NotLoggedIn | Error::RequestTooLarge { .. } | Error::Tls(_) => Some(false),
             Error::HostKey { .. } | Error::AuthFailed(_) => Some(false),
-            Error::Network { sent, .. } | Error::Timeout { sent, .. } | Error::Disconnected { sent, .. } => *sent,
+            Error::Network { sent, .. } | Error::Timeout { sent, .. } | Error::Disconnected { sent, .. } | Error::Cancelled { sent } => *sent,
             Error::Api { .. } | Error::Status { .. } | Error::Decode { .. } | Error::BodyTooLarge { .. } => Some(true),
             _ => None,
         }
@@ -296,6 +305,7 @@ impl fmt::Debug for Error {
             Error::Disconnected { reason, sent } => f.debug_struct("Disconnected").field("reason", reason).field("sent", sent).finish(),
             Error::Lagged { missed } => f.debug_struct("Lagged").field("missed", missed).finish(),
             Error::Shutdown => f.write_str("Shutdown"),
+            Error::Cancelled { sent } => f.debug_struct("Cancelled").field("sent", sent).finish(),
             Error::HostKey { host, fingerprint, problem } => {
                 f.debug_struct("HostKey").field("host", host).field("fingerprint", fingerprint).field("problem", problem).finish()
             }
@@ -328,6 +338,9 @@ impl fmt::Display for Error {
             Error::Disconnected { reason, sent: None } => write!(f, "disconnected: {reason}"),
             Error::Lagged { missed } => write!(f, "{missed} pushes were missed (the reader fell behind)"),
             Error::Shutdown => f.write_str("the client shut down before an answer arrived"),
+            Error::Cancelled { sent: Some(false) } => f.write_str("cancelled before it was sent"),
+            Error::Cancelled { sent: Some(true) } => f.write_str("cancelled after it was sent"),
+            Error::Cancelled { sent: None } => f.write_str("cancelled (it may have reached the server)"),
             Error::HostKey { host, fingerprint, problem } => write!(f, "SSH host key check failed for `{host}`: {problem} ({fingerprint})"),
             Error::AuthFailed(why) => write!(f, "SSH authentication failed: {why}"),
             Error::Ssh(why) => write!(f, "SSH error: {why}"),

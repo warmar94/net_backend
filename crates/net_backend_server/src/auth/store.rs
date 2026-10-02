@@ -2,9 +2,9 @@
 //! them on the pool or inside a transaction. Every statement here runs in the auth test suite on
 //! SQLite locally and on MySQL / PostgreSQL in CI and on the test server.
 
-use sea_query::{DeleteStatement, Expr, ExprTrait, Func, InsertStatement, LikeExpr, Order, Query, SelectStatement, UpdateStatement};
+use sea_query::{DeleteStatement, Expr, ExprTrait, Func, InsertStatement, LikeExpr, LockType, Order, Query, SelectStatement, UpdateStatement};
 
-use crate::db::DbError;
+use crate::db::{DbError, Dialect};
 
 pub(crate) const USERS: &str = "auth_users";
 pub(crate) const CREDENTIALS: &str = "auth_credentials";
@@ -510,6 +510,49 @@ pub(crate) fn use_email_token(id: i64, now: i64) -> UpdateStatement {
     update
 }
 
+/// The account row, locked for the transaction (a primary-key record lock, never a gap): new email
+/// tokens of one account are made one at a time. MySQL `FOR UPDATE`; PostgreSQL `FOR NO KEY UPDATE`
+/// (compatible with the `FOR KEY SHARE` of the token insert's foreign-key check); SQLite's write
+/// transaction holds the database lock anyway.
+pub(crate) fn lock_user(user: i64, dialect: Dialect) -> SelectStatement {
+    let mut select = Query::select();
+    select.column("id").from(USERS).and_where(Expr::col("id").eq(user));
+    match dialect {
+        Dialect::Postgres => {
+            select.lock(LockType::NoKeyUpdate);
+        }
+        Dialect::Sqlite => {}
+        _ => {
+            select.lock_exclusive();
+        }
+    }
+    select
+}
+
+#[derive(Debug, sqlx::FromRow)]
+pub(crate) struct EmailTokenIdRow {
+    pub(crate) id: i64,
+}
+
+/// The ids of a user's unused tokens of a purpose (a plain read: no gap locks on MySQL).
+pub(crate) fn unused_email_token_ids(user: i64, purpose: &str) -> SelectStatement {
+    let mut select = Query::select();
+    select
+        .column("id")
+        .from(EMAIL_TOKENS)
+        .and_where(Expr::col("user_id").eq(user))
+        .and_where(Expr::col("purpose").eq(purpose))
+        .and_where(Expr::col("used_at").is_null());
+    select
+}
+
+/// Delete unused tokens by id (MySQL locks only these rows, never a gap of the user index).
+pub(crate) fn delete_unused_email_tokens_by_id(ids: &[i64]) -> DeleteStatement {
+    let mut delete = Query::delete();
+    delete.from_table(EMAIL_TOKENS).and_where(Expr::col("id").is_in(ids.iter().copied())).and_where(Expr::col("used_at").is_null());
+    delete
+}
+
 /// Delete a user's unused tokens of a purpose (a new one replaces them).
 pub(crate) fn delete_unused_email_tokens(user: i64, purpose: &str) -> DeleteStatement {
     let mut delete = Query::delete();
@@ -669,6 +712,15 @@ mod tests {
         // PostgreSQL's escape-string literal doubles the backslash: E'%ada\\_%'.
         assert!(sql.contains(r"LIKE E'%ada\\_%' ESCAPE"), "{sql}");
         assert!(sql.contains("ORDER BY \"auth_users\".\"id\" DESC LIMIT 51"), "{sql}");
+    }
+
+    #[test]
+    fn email_token_statements_take_no_ranged_lock() {
+        assert!(render_statement(&lock_user(7, Dialect::MySql), Dialect::MySql).ends_with("FOR UPDATE"));
+        assert!(render_statement(&lock_user(7, Dialect::Postgres), Dialect::Postgres).ends_with("FOR NO KEY UPDATE"));
+        assert!(!render_statement(&lock_user(7, Dialect::Sqlite), Dialect::Sqlite).contains("FOR "));
+        let delete = render_statement(&delete_unused_email_tokens_by_id(&[3, 4]), Dialect::MySql);
+        assert!(delete.contains("`id` IN (3, 4)") && !delete.contains("user_id"), "{delete}");
     }
 
     #[test]

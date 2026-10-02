@@ -29,6 +29,9 @@ features as Bevy plugins.
 - [Typed calls and errors](#typed-calls-and-errors)
 - [WebSocket (`ws`)](#websocket-ws)
 - [SSH and SFTP (`ssh`, `sftp`)](#ssh-and-sftp-ssh-sftp)
+- [Proxies](#proxies)
+- [Secrets in memory](#secrets-in-memory)
+- [Secrets in logs](#secrets-in-logs)
 - [How it works](#how-it-works)
 - [Defaults and limits](#defaults-and-limits)
 - [Clients](#clients)
@@ -51,12 +54,17 @@ features as Bevy plugins.
   server pushes, heartbeats, automatic reconnects with backoff that never retry after a "do not
   come back" close code.
 - **SSH and SFTP to the server machine** (features `ssh`, `sftp`) for admin tools: strict host key
-  checking, key files, the SSH agent, passwords and keyboard-interactive logins.
+  checking, key files, the SSH agent, passwords and keyboard-interactive logins, opt-in automatic
+  reconnects, pipelined transfers with progress.
 - **Async or blocking.** One async core on tokio, plus a blocking interface for programs without a
   runtime, where nothing ever blocks a game frame.
+- **Proxies.** HTTP and the WebSocket go through an HTTP CONNECT proxy from the environment
+  (`HTTPS_PROXY`, `NO_PROXY`, …) or the builder.
 - **Honest answers.** Every call gets exactly one answer; an error says whether the request may
-  have reached the server (`was_sent()`); secrets never show in `Debug` or `Display`; nothing
-  panics on bad input.
+  have reached the server (`was_sent()`); a cancelled request says whether it went out; secrets
+  never show in `Debug`, `Display` or the logs ([Secrets in logs](#secrets-in-logs)), and are
+  overwritten in memory when dropped;
+  nothing panics on bad input.
 
 ## Features
 
@@ -71,7 +79,7 @@ features as Bevy plugins.
 - One async core on tokio, plus a blocking interface for game loops and simple programs.
 - TLS with rustls + ring.
 - A small footprint: HTTP and the WebSocket use the same crates as the server (hyper, rustls with
-  ring, tungstenite), so an app that also runs the server adds no new crate for them.
+  ring, tungstenite); next to the server they add one small crate, `ipnet` (the proxy rules).
 
 `default = []`: the HTTP client and the blocking interface are always there; everything else is
 opt-in.
@@ -80,11 +88,11 @@ opt-in.
 
 ```toml
 [dependencies]
-net_backend_client = { version = "0.1.0" }
+net_backend_client = { version = "0.1.1" }
 # or with the WebSocket:
-# net_backend_client = { version = "0.1.0", features = ["ws"] }
+# net_backend_client = { version = "0.1.1", features = ["ws"] }
 # an admin tool with SSH and SFTP:
-# net_backend_client = { version = "0.1.0", features = ["ws", "sftp"] }
+# net_backend_client = { version = "0.1.1", features = ["ws", "sftp"] }
 ```
 
 The protocol's types are re-exported as `net_backend_client::protocol`, so the versions always
@@ -141,6 +149,10 @@ loop {
 - `client.call(&request)` blocks until the answer; `client.send(request)` returns a
   [`Reply`](https://docs.rs/net_backend_client/latest/net_backend_client/struct.Reply.html) at once:
   poll it with `try_take()` every frame, `.await` it in async code, or `wait()` for it.
+- `reply.cancel()` (or a `reply.cancel_handle()` kept elsewhere) cancels a request made with
+  `send`: its answer becomes `Error::Cancelled { sent }`, with `sent: Some(false)` when the request
+  had not been handed to a connection (it is never sent) and `None` after (it may have reached
+  the server). Dropping a `Reply` does not cancel the request.
 - Every blocking client (and its clones) shares one private thread with a small tokio runtime; it
   stops when the last clone is dropped.
 - Blocking calls work on any thread, also inside tokio's `spawn_blocking` (the place for blocking
@@ -225,6 +237,7 @@ A game's own routes work the same way: implement the protocol's `HttpCall` for y
 | `Network { sent, .. }`, `Tls(..)`, `Timeout { sent, .. }` | transport failures |
 | `BodyTooLarge` / `RequestTooLarge` | the answer / the request over its limit |
 | `NotLoggedIn`, `SessionEnded { code }` | log in (again) |
+| `Cancelled { sent }` | the app cancelled the request (`Reply::cancel`) |
 | `InvalidRequest(..)` | refused before sending: a bad URL, a path parameter that would need escaping, a call from the wrong place (an async call outside tokio, a blocking call on the client's own thread) |
 
 Helpers on `Error`: `code()`, `is(code)`, `status()`, `retry_after()` (from
@@ -290,6 +303,9 @@ loop {
   `Error::Api` with the server's code). The request is queued at once, so answers come in the
   order requests were made. Each has a timeout (10 s, `with_request_timeout`, or
   `request_with_timeout`). `request_raw(kind, json)` sends a kind without a type.
+- **Cancel:** `reply.cancel()` answers a request `Error::Cancelled`: `sent: Some(false)` when it was
+  still waiting for the connection (it is never sent), `sent: Some(true)` when it had been written
+  (it may have run; its late answer is dropped).
 - **Pushes:** `ws.subscribe::<P>()` is a stream of one push kind, decoded; `ws.pushes()` every push
   untyped. Each stream buffers 256 pushes; a reader that falls further behind gets
   `Error::Lagged { missed }` (resync then).
@@ -367,13 +383,118 @@ ssh.close().await;
 - **SFTP:** `upload`, `upload_file`, `download`, `download_file` (through a part file, renamed when
   complete), `list_dir`, `create_dir`, `remove_file`, `remove_dir`, `rename`. Names in a listing
   come from the server: use `entry.safe_file_name()` before turning one into a local path.
-- **Blocking:** `net_backend_client::blocking::SshSession` has the same methods, blocking.
-- After a lost SSH connection, connect again.
+- **Transfers:** a download keeps 16 reads of 64 KiB in flight (at most 1 MiB asked for or waiting
+  to be written, whatever the file size) and writes them in file order; an upload keeps 16 writes
+  of 32 KiB in flight. A file the server reports over the transfer limit is refused before any
+  data is read. Each SFTP request waits at most the operation timeout (`with_sftp_timeout`, at
+  least 1 s).
+- **Progress:** `start_upload`, `start_upload_file`, `start_download`, `start_download_file` return
+  an `SftpTask`: `next_progress()` / `try_progress()` (bytes done and the size; at most about 10
+  reports a second, only growing, the last one is the whole size), then `finish()` / `try_finish()`.
+  Dropping the task (or the future of `upload`, `download`, …) cancels the transfer.
+- **Cancel, timeout, error:** the remote file handle is closed after every transfer, also one that
+  was cancelled, timed out or failed; a download's part file is removed.
+- **Reconnect (opt-in):** `SshTarget::with_reconnect(SshReconnect::default())` opens a new
+  connection after a lost one: backoff from 1 s doubling up to 30 s with full jitter
+  (`with_base`, `with_cap`, `with_max_attempts`, `with_stable_after`). A command that was running
+  is answered `Error::Disconnected` (`sent: Some(true)` once it had started) and never run again;
+  a transfer that was running ends with `Error::Disconnected` (`sent: Some(true)` once the server
+  had answered part of it, else `None`) and is not repeated either; commands and transfers started while it reconnects wait for the new
+  connection (bounded by their own timeout); the SFTP channel is opened again on it. Host key,
+  login, protocol (`Error::Ssh`) and settings errors end the session. `ssh.state()` and
+  `ssh.events()` (`Reconnecting { attempt, retry_in, error }`, `Connected { reconnected }`,
+  `Closed { error }`) show what happens. Without it, a lost connection ends the session
+  (`Closed`); connect again.
+- **Blocking:** `net_backend_client::blocking::SshSession` has the same methods, blocking, plus the
+  `start_*` transfers polled with `try_progress()` / `try_finish()` and `events().try_next()`.
+
+```rust,no_run
+use net_backend_client::ssh::{SshAuth, SshReconnect, SshSession, SshTarget};
+
+# async fn run() -> Result<(), net_backend_client::Error> {
+let target = SshTarget::new("server.example.com", "deploy")
+    .with_auth(SshAuth::agent())
+    .with_reconnect(SshReconnect::default().with_max_attempts(Some(10)));
+let ssh = SshSession::connect(target).await?;
+
+// feature `sftp`: a download with progress
+let mut download = ssh.start_download_file("backups/db.sql.gz", "db.sql.gz");
+while let Some(progress) = download.next_progress().await {
+    println!("{} of {:?} bytes", progress.done, progress.total);
+}
+let bytes = download.finish().await?;
+println!("{bytes} bytes saved");
+# Ok(())
+# }
+```
+
+## Proxies
+
+HTTP calls and the WebSocket go through an HTTP proxy as an HTTP CONNECT tunnel: TLS runs end to
+end through it (for an `https://` server the proxy sees only the host and port). Where the proxy
+comes from:
+
+| Setting | What |
+|---|---|
+| (default) the environment, read at `build` | `HTTPS_PROXY` for an `https://` server, `HTTP_PROXY` for `http://`, `ALL_PROXY` for both; `NO_PROXY` (comma-separated hosts, domains with their subdomains, IP addresses and ranges, `*` for all) skips it; the lowercase names work too |
+| `ClientBuilder::proxy("http://host:port")` | this proxy instead of the environment's; `http://user:password@host:port` sends `Proxy-Authorization: Basic` |
+| `ClientBuilder::no_proxy()` | always direct |
+
+- A loopback server (`localhost`, `127.0.0.1`, `::1`) is always reached directly.
+- A proxy URL that is not `http://` (e.g. `socks5://`) is refused at `build` with `InvalidRequest`,
+  so a request never goes around a proxy that was asked for.
+- A proxy that refuses the tunnel (e.g. `407 Proxy Authentication Required`) or cannot be reached
+  is `Error::Network` with `sent: Some(false)`.
+- SSH connects directly to its host.
+
+## Secrets in memory
+
+The protocol's secret types (`Password`, `AccessToken`, `RefreshToken`, `Secret`) overwrite their
+whole allocation with zeros when they are dropped (the `zeroize` crate); each clone is its own copy
+and is wiped when it is dropped. That covers the tokens the session keeps and every request the
+client builds from them.
+
+The client also wipes, when it is done with them:
+
+- the `Bearer …` text it builds for the `Authorization` header (HTTP and the WebSocket handshake);
+- every JSON request body it encodes (a login's or registration's password, the refresh token of a
+  refresh or a logout), once the HTTP connection has dropped the body;
+- the first-message `auth` frame of the WebSocket (the crate masks and writes it itself);
+- the text of an SSH key file it reads (decoded ed25519 and ECDSA keys wipe themselves); SSH
+  passwords, passphrases and prompt answers are `Secret`s.
+
+Not wiped:
+
+- the `Authorization` and `Proxy-Authorization` header values inside a request, and the copies
+  hyper, rustls and russh make while sending (write buffers, TLS records);
+- answer bodies (a login or refresh answer holds the new tokens) and the input a decoder read;
+- SSH passwords and keyboard-interactive answers handed to russh;
+- strings that stay with your app: the `&str` a secret was copied from (a `String` passed in is
+  moved, and wiped), and what `into_inner`, `expose().to_string()`, serializing a `TokenPair` for
+  storage or `TokenPair::authorization_header` return.
+
+## Secrets in logs
+
+The crate logs through `tracing` and never puts a password, token, passphrase or key in a log
+line. Its libraries log too, through the `log` crate:
+
+- tungstenite (the WebSocket) logs every frame it sends or receives, with its content, at TRACE.
+  The WebSocket's secrets never pass through it: the upgrade request with the
+  `Authorization: Bearer` header goes out through hyper (which logs no headers), and the crate
+  masks and writes the first-message `auth` frame itself before tungstenite takes the
+  connection. Chat text and other requests and answers do show in those TRACE lines; the
+  directive `tungstenite=debug` (in `RUST_LOG` or a `tracing_subscriber::EnvFilter`) leaves them
+  out.
+- russh (SSH) logs the protocol's steps; the crate's tests and a live run against OpenSSH found
+  no key, password, passphrase or prompt answer in them.
+
+The crate installs no logger and no filter; that stays with your program.
 
 ## How it works
 
 - **One async core** on tokio. HTTP is hyper 1 (HTTP/1.1) through hyper-util's pooled client and
-  hyper-rustls; the WebSocket is tokio-tungstenite over the crate's own TCP / TLS stream; SSH is
+  hyper-rustls; the WebSocket is tokio-tungstenite over the crate's own TCP / TLS stream (the
+  upgrade request goes out through hyper); SSH is
   russh. TLS is rustls with ring, handed in explicitly (never a process-wide default), with
   Mozilla's root certificates (webpki-roots).
 - **One deadline per call:** waiting for a token refresh, connecting, sending and reading the
@@ -384,7 +505,11 @@ ssh.close().await;
 - **The blocking interface** runs the same core on one private thread (`net-backend-client`) with
   a current-thread runtime.
 - **The WebSocket** is owned by one background task per connection: it is the only thing that
-  answers requests, so every request gets exactly one answer even when the link dies.
+  answers requests (also a cancelled one), so every request gets exactly one answer even when the
+  link dies.
+- **An SSH session** has one supervisor task that watches its connection, reports the state and,
+  with `with_reconnect`, opens the next connection; each command and each SFTP transfer runs as a
+  task of its own.
 - Nothing panics on bad input or from the wrong place: an async call outside tokio answers `InvalidRequest`;
   blocking calls work from any thread but the client's own.
 - One async `Client` belongs to one tokio runtime (its pooled connections belong to the runtime
@@ -398,6 +523,7 @@ ssh.close().await;
 | largest HTTP answer body | 10 MiB | `ClientBuilder::max_response_bytes` |
 | refresh margin | 60 s | `ClientBuilder::refresh_margin` |
 | plain `http://` | loopback only | `ClientBuilder::allow_insecure_http` |
+| proxy | from the environment (`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY`), never for loopback | `ClientBuilder::proxy` / `no_proxy` |
 | WebSocket connect (TCP + TLS + handshake + `auth.ok`) | 10 s | `WsSettings::with_connect_timeout` |
 | WebSocket request timeout | 10 s | `WsSettings::with_request_timeout` |
 | heartbeat | ping 15 s, lost after 45 s silent | `WsSettings::with_heartbeat` |
@@ -410,7 +536,11 @@ ssh.close().await;
 | SSH command line | 64 KiB | (fixed) |
 | SSH channels at once | 8 | `with_max_channels` |
 | SSH keepalive | every 15 s, lost after 3 unanswered | `with_keepalive` |
+| SSH reconnect | off; when set: 1 s doubling to 30 s, full jitter, no attempt limit, reset after 10 s | `SshTarget::with_reconnect` |
 | SFTP operation time / transfer size | 5 min / 256 MiB | `with_sftp_timeout` / `with_max_transfer_bytes` |
+| SFTP request time (each read, write, …) | the operation time (at least 1 s) | `with_sftp_timeout` |
+| SFTP reads / writes in flight | 16 × 64 KiB / 16 × 32 KiB | (fixed) |
+| SFTP progress reports | at most about 10 a second, plus the last | (fixed) |
 
 ## Clients
 
@@ -424,6 +554,7 @@ ssh.close().await;
 
 | `net_backend_client` | `net_backend_protocol` | `net_backend_server` | Rust | tokio |
 |---|---|---|---|---|
+| 0.1.1 | 0.1 (≥ 0.1.1, whose secret types wipe themselves; protocol version 1) | 0.1 (0.1.0 or newer) | 1.95+ | 1.x |
 | 0.1.0 | 0.1.0 (protocol version 1) | 0.1.0 | 1.95+ | 1.x |
 
 ## Testing
@@ -443,11 +574,21 @@ They cover: typed calls and every kind of error (404, 409 with details, 422, 403
 `retry_after`), refresh before expiry with twenty concurrent calls sharing one refresh,
 `token_expired` → refresh → one retry, refresh-token reuse ending the session, logout and logout
 everywhere, body limits, unreachable and silent servers, the blocking interface (also from `spawn_blocking` and
-inside a runtime), WebSocket header and first-message auth, pushes, chat, close codes (1001
+inside a runtime), cancelled requests (HTTP and WebSocket, before and after they went out),
+HTTP and the WebSocket through a local CONNECT proxy (with and without credentials, refused,
+unreachable), WebSocket header and first-message auth, pushes, chat, close codes (1001
 reconnects; 4001 one refresh + reconnect, then final; 4003 and 4009 final), a refused handshake
 token, exactly one answer when the link dies, a silent peer, a busy handshake with `Retry-After`,
 SSH commands, limits, timeouts, host keys (unknown, changed, pinned), every login kind, the
-Terrapin refusal and its opt-out, and SFTP.
+Terrapin refusal and its opt-out, SSH reconnects (a lost command never re-run, waiting commands,
+a refused login and the attempt limit final), and SFTP (a 256 MiB download byte for byte, sizes
+from 0 bytes up with and without short reads, progress, a cancel, a timeout and a server error
+midway with the remote handle closed and no file left, a connection lost midway answered
+`Disconnected`). A log-capture test runs the session, the WebSocket and SSH with every level on,
+records every `tracing` event and every `log` record of the client's side (tungstenite's and
+russh's TRACE lines included), and finds no password, token or passphrase in any of them, also
+not hex-encoded (`net_backend_protocol`'s tests check that its secret types leave nothing behind in
+freed memory).
 
 ## FAQ
 

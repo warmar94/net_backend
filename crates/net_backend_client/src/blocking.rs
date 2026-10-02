@@ -90,6 +90,9 @@ impl Client {
     }
 
     /// Any typed call, without blocking: the answer arrives in the [`Reply`].
+    /// [`Reply::cancel`] stops it: answered [`Error::Cancelled`] with `sent: Some(false)` when the
+    /// request had not been handed to a connection (it is never sent), `None` after (it may have
+    /// reached the server). A token refresh it was waiting for keeps running (it is shared).
     pub fn send<C: HttpCall + Send + Sync + 'static>(&self, call: C) -> Reply<C::Response>
     where
         C::Response: Send + 'static,
@@ -202,9 +205,19 @@ impl SshSession {
         self.inner.fingerprint()
     }
 
-    /// Whether the connection is gone.
+    /// Whether the session is gone (see [`crate::ssh::SshSession::is_closed`]).
     pub fn is_closed(&self) -> bool {
         self.inner.is_closed()
+    }
+
+    /// The current state (connected, reconnecting, closed).
+    pub fn state(&self) -> crate::ssh::SshState {
+        self.inner.state()
+    }
+
+    /// What happens to the session; poll it with [`SshEvents::try_next`](crate::ssh::SshEvents::try_next).
+    pub fn events(&self) -> crate::ssh::SshEvents {
+        self.inner.events()
     }
 
     /// Run a command and block until it ends (see [`crate::ssh::SshSession::run`]).
@@ -256,6 +269,29 @@ impl SshSession {
     pub fn download_file(&self, remote: &str, local: impl AsRef<std::path::Path>) -> Result<u64, Error> {
         let (session, remote, local) = (self.inner.clone(), remote.to_string(), local.as_ref().to_path_buf());
         self.runtime.block(async move { session.download_file(&remote, &local).await })
+    }
+
+    /// Start an upload without blocking; poll its [`SftpTask`](crate::ssh::SftpTask) with
+    /// `try_progress` / `try_finish` (see [`crate::ssh::SshSession::start_upload`]). Dropping the
+    /// task cancels the transfer. Keep this session (or a clone) alive while it runs.
+    pub fn start_upload(&self, remote: &str, data: impl Into<Vec<u8>>) -> crate::ssh::SftpTask<u64> {
+        self.runtime.enter(|| self.inner.start_upload(remote, data))
+    }
+
+    /// Start copying a local file to `remote` without blocking (see [`start_upload`](Self::start_upload)).
+    pub fn start_upload_file(&self, local: impl AsRef<std::path::Path>, remote: &str) -> crate::ssh::SftpTask<u64> {
+        self.runtime.enter(|| self.inner.start_upload_file(local, remote))
+    }
+
+    /// Start reading `remote` into memory without blocking (see [`start_upload`](Self::start_upload)).
+    pub fn start_download(&self, remote: &str) -> crate::ssh::SftpTask<Vec<u8>> {
+        self.runtime.enter(|| self.inner.start_download(remote))
+    }
+
+    /// Start copying `remote` to the local file `local` without blocking (see
+    /// [`start_upload`](Self::start_upload)).
+    pub fn start_download_file(&self, remote: &str, local: impl AsRef<std::path::Path>) -> crate::ssh::SftpTask<u64> {
+        self.runtime.enter(|| self.inner.start_download_file(remote, local))
     }
 
     /// List the remote directory `path`.

@@ -1,0 +1,164 @@
+name: Docker image
+
+# The reference server's image, ghcr.io/warmar94/net_backend_server, for linux/amd64 and linux/arm64,
+# each built natively on its own runner (no emulation), then joined into one multi-arch image.
+#
+# On a server release tag (net_backend_server-X.Y.Z, pushed or picked in a manual run): the tags X.Y.Z,
+# X.Y (when X.Y.Z is the newest X.Y release) and latest (when it is the newest release). An X.Y.Z that
+# is already published is never overwritten.
+# A manual run on anything else (a branch): only `edge` and `sha-<commit>`; release tags stay untouched.
+on:
+  push:
+    tags: ["net_backend_server-*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/warmar94/net_backend_server
+
+concurrency:
+  group: docker-image
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      release: ${{ steps.v.outputs.release }}
+      tags: ${{ steps.v.outputs.tags }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - id: v
+        name: the version and the tags to push
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/net_backend_server/Cargo.toml | head -n 1)"
+          echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "unexpected version '$version'" >&2; exit 1; }
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            if [ "$GITHUB_REF_NAME" != "net_backend_server-$version" ]; then
+              echo "tag $GITHUB_REF_NAME is not net_backend_server-$version (the crate version)" >&2
+              exit 1
+            fi
+            minor="${version%.*}"
+            released="$(git tag -l 'net_backend_server-*' | sed 's/^net_backend_server-//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V)"
+            tags="$version"
+            [ "$(echo "$released" | awk -F. -v m="$minor" '($1 "." $2) == m' | tail -n 1)" = "$version" ] && tags="$tags $minor"
+            [ "$(echo "$released" | tail -n 1)" = "$version" ] && tags="$tags latest"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          else
+            tags="edge sha-${GITHUB_SHA::12}"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          echo "tags: $tags"
+
+  build:
+    needs: version
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          platforms: ${{ matrix.platform }}
+          pull: true
+          labels: |
+            org.opencontainers.image.title=net_backend_server
+            org.opencontainers.image.description=The net_backend_server reference server (Auth + Storage + Chat)
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.url=https://net-backend.com
+            org.opencontainers.image.version=${{ needs.version.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=MIT OR Apache-2.0
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          provenance: mode=max
+          sbom: true
+      - name: keep the digest
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "$RUNNER_TEMP/digests/${digest#sha256:}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: digest-${{ matrix.runner }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: a release version is published once
+        if: needs.version.outputs.release == 'true'
+        # Only a clear "not found" from the registry counts as unpublished; any other error (network,
+        # authentication, rate limit) stops the job before anything is pushed.
+        run: |
+          ref="$IMAGE:${{ needs.version.outputs.version }}"
+          if out="$(docker buildx imagetools inspect "$ref" 2>&1)"; then
+            echo "$ref exists already; it is not overwritten" >&2
+            exit 1
+          fi
+          if echo "$out" | grep -Eqi 'not found|manifest unknown'; then
+            echo "$ref is not published yet: going on"
+          else
+            echo "cannot tell whether $ref is published:" >&2
+            echo "$out" >&2
+            exit 1
+          fi
+      - name: one multi-arch image under the tags
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          TAGS: ${{ needs.version.outputs.tags }}
+        run: |
+          args=()
+          for tag in $TAGS; do args+=(-t "$IMAGE:$tag"); done
+          docker buildx imagetools create "${args[@]}" \
+            --annotation "index:org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            --annotation "index:org.opencontainers.image.description=The net_backend_server reference server (Auth + Storage + Chat)" \
+            --annotation "index:org.opencontainers.image.licenses=MIT OR Apache-2.0" \
+            --annotation "index:org.opencontainers.image.version=${{ needs.version.outputs.version }}" \
+            $(printf "$IMAGE@sha256:%s " *)
+      - name: check
+        env:
+          TAGS: ${{ needs.version.outputs.tags }}
+        run: docker buildx imagetools inspect "$IMAGE:${TAGS%% *}"

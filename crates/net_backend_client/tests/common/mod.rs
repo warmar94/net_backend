@@ -22,6 +22,8 @@ use tokio::sync::oneshot;
 pub const PASSWORD: &str = "correct horse battery";
 /// The upper bound of every wait in the tests (a condition, never a fixed time).
 pub const WAIT: Duration = Duration::from_secs(60);
+/// The name of every thread of the test server (its runtime's workers and blocking threads too).
+pub const SERVER_THREADS: &str = "test-server";
 
 /// A request the test server answers with the caller's id.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -88,8 +90,8 @@ impl Server {
     pub fn start_with(tweak: impl FnOnce(&mut Setup) + Send + 'static) -> Server {
         let (ready_sender, ready) = std::sync::mpsc::channel();
         let (stop, stopped) = oneshot::channel::<()>();
-        let thread = std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("runtime");
+        let thread = std::thread::Builder::new().name(SERVER_THREADS.into()).spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).thread_name(SERVER_THREADS).enable_all().build().expect("runtime");
             let handle = runtime.handle().clone();
             runtime.block_on(async move {
                 let mut config = Config::default();
@@ -138,6 +140,7 @@ impl Server {
             });
             runtime.shutdown_timeout(Duration::from_secs(5));
         });
+        let thread = thread.expect("the test server thread");
         let (state, base, clock, handle) = ready.recv_timeout(WAIT).expect("the test server did not start");
         Server { state, base, clock, handle, stop: Some(stop), thread: Some(thread) }
     }

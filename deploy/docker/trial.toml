@@ -1,0 +1,32 @@
+# The configuration baked into the image (/etc/net-backend/config.toml): a complete server with no
+# setup at all, for trying it on one machine.
+#
+#   docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/warmar94/net_backend_server:0.1
+#
+# SQLite in /data (add `-v nbs-data:/data` to keep it), migrations applied on start, accounts,
+# storage and chat with a `world` room. The Compose files replace this file with their own
+# production configuration.
+
+[server]
+bind = "0.0.0.0:8080"
+
+[database]
+url = "sqlite:/data/nbs.db"
+migrate_on_start = true
+migrations_dir = "/data/migrations"
+
+[log]
+level = "info"
+format = "pretty"
+
+[modules.auth]
+app_name = "My Game"
+
+[modules.storage]
+
+[modules.chat]
+
+[[modules.chat.rooms]]
+key = "world"
+name = "World"
+max_members = 200
