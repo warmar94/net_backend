@@ -3,7 +3,7 @@
 # repository). Safe to run again: existing configuration, secrets and databases are kept.
 #
 #   sudo bash deploy/systemd/install.sh --db mysql|postgres|sqlite --binary target/release/examples/server \
-#        [--domain api.example.com --email admin@example.com] [--no-backup]
+#        [--domain api.example.com [--email admin@example.com]] [--no-backup]
 #
 # What it does:
 #   - the system user `nbs`; /etc/net-backend (config.toml, database_url, migrations/); /var/lib/net-backend
@@ -17,7 +17,7 @@
 set -euo pipefail
 
 usage() {
-	echo "usage: $0 --db mysql|postgres|sqlite --binary <path> [--domain <host name> --email <address>] [--no-backup]" >&2
+	echo "usage: $0 --db mysql|postgres|sqlite --binary <path> [--domain <host name> [--email <address>]] [--no-backup]" >&2
 	exit 64
 }
 
@@ -36,12 +36,26 @@ done
 case "$db" in mysql | postgres | sqlite) ;; *) usage ;; esac
 [ -n "$binary" ] || usage
 [ -x "$binary" ] || { echo "$binary is not an executable file (build it first, see deploy/README.md)" >&2; exit 66; }
+[ -z "$email" ] || [ -n "$domain" ] || usage
 if [ -n "$domain" ]; then
-	[ -n "$email" ] || usage
 	case "$domain" in *[!A-Za-z0-9.-]*) echo "invalid host name: $domain" >&2; exit 64 ;; esac
-	case "$email" in *[!A-Za-z0-9.@+_-]* | *@*@* | @* | *@) echo "invalid email: $email" >&2; exit 64 ;; *@*) ;; *) echo "invalid email: $email" >&2; exit 64 ;; esac
+	if [ -n "$email" ]; then
+		case "$email" in *[!A-Za-z0-9.@+_-]* | *@*@* | @* | *@) echo "invalid email: $email" >&2; exit 64 ;; *@*) ;; *) echo "invalid email: $email" >&2; exit 64 ;; esac
+	fi
 fi
 [ "$(id -u)" -eq 0 ] || { echo "run as root (sudo)" >&2; exit 77; }
+if [ -n "$domain" ]; then
+	# Before anything is installed: Caddy 2.8 or newer (the site uses `stream_close_delay` and the
+	# log filter's field syntax).
+	command -v caddy >/dev/null || { echo "Caddy is not installed (see deploy/README.md, 'Path B')" >&2; exit 69; }
+	caddy_version="$(caddy version | grep -oE '[0-9]+\.[0-9]+' | head -n 1 || true)"
+	caddy_major="${caddy_version%%.*}" caddy_minor="${caddy_version#*.}"
+	[ -n "$caddy_version" ] || { caddy_major=0; caddy_minor=0; }
+	if [ "$caddy_major" -lt 2 ] || { [ "$caddy_major" -eq 2 ] && [ "$caddy_minor" -lt 8 ]; }; then
+		echo "Caddy $(caddy version | head -n 1) is too old: 2.8 or newer is needed (install it from Caddy's repository, deploy/README.md 'Path B'); nothing was installed" >&2
+		exit 69
+	fi
+fi
 here="$(cd "$(dirname "$0")" && pwd)"
 step() { echo "==> $*"; }
 
@@ -132,20 +146,20 @@ echo "ready    net-backend (127.0.0.1:8080)"
 
 if [ -n "$domain" ]; then
 	step "Caddy (HTTPS + WSS for $domain)"
-	command -v caddy >/dev/null || { echo "Caddy is not installed (see deploy/README.md, 'Caddy')" >&2; exit 69; }
-	# Caddy 2.8 or newer: the site uses `stream_close_delay` and the log filter's field syntax.
-	caddy_version="$(caddy version | grep -oE '[0-9]+\.[0-9]+' | head -n 1 || true)"
-	caddy_major="${caddy_version%%.*}" caddy_minor="${caddy_version#*.}"
-	[ -n "$caddy_version" ] || { caddy_major=0; caddy_minor=0; }
-	if [ "$caddy_major" -lt 2 ] || { [ "$caddy_major" -eq 2 ] && [ "$caddy_minor" -lt 8 ]; }; then
-		echo "Caddy $(caddy version | head -n 1) is too old: 2.8 or newer is needed (install it from Caddy's repository, deploy/README.md 'Path B')" >&2
-		exit 69
-	fi
 	stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 	install -d -m 0755 /var/log/caddy /etc/caddy/sites
 	# The site file is ours: rewritten on every run (a changed one is kept with a time stamp first).
 	site=/etc/caddy/sites/net-backend.caddy
-	sed -e "s|API_DOMAIN|${domain}|" -e "s|ACME_EMAIL|${email}|" "$here/net-backend.caddy" >"$site.new"
+	# Without --email the `tls <email>` line goes (certificates work without a contact address).
+	if [ -n "$email" ]; then
+		sed -e "s|API_DOMAIN|${domain}|" -e "s|ACME_EMAIL|${email}|" "$here/net-backend.caddy" >"$site.new"
+	else
+		sed -e "s|API_DOMAIN|${domain}|" -e '/^[[:space:]]*tls ACME_EMAIL$/d' -e '/The address for certificate expiry notices/d' "$here/net-backend.caddy" >"$site.new"
+	fi
+	caddy_changed=0
+	if [ ! -e "$site" ] || ! cmp -s "$site" "$site.new"; then
+		caddy_changed=1
+	fi
 	if [ -e "$site" ] && ! cmp -s "$site" "$site.new"; then
 		cp -p "$site" "$site.before-$stamp"
 		echo "kept     $site.before-$stamp"
@@ -180,16 +194,28 @@ if [ -n "$domain" ]; then
 			exit 1
 		fi
 		mv "$main.new" "$main"
+		caddy_changed=1
 	else
 		caddy validate --adapter caddyfile --config "$main"
 	fi
 	# The check above may have created the log file as root; Caddy runs as `caddy`.
 	chown -R caddy:caddy /var/log/caddy
+	# The open-file limit needs a restart (closes every proxied WebSocket of every site), so only when
+	# the drop-in is new or changed; a changed site or Caddyfile only needs a reload (open WebSockets
+	# stay, `stream_close_delay`); nothing changed: Caddy is left alone.
+	dropin=/etc/systemd/system/caddy.service.d/net-backend-limits.conf
 	install -d -m 0755 /etc/systemd/system/caddy.service.d
-	install -m 0644 "$here/caddy-limits.conf" /etc/systemd/system/caddy.service.d/net-backend-limits.conf
-	systemctl daemon-reload
-	# A restart (not a reload) applies the new open-file limit.
-	systemctl restart caddy
+	if [ ! -e "$dropin" ] || ! cmp -s "$dropin" "$here/caddy-limits.conf"; then
+		install -m 0644 "$here/caddy-limits.conf" "$dropin"
+		systemctl daemon-reload
+		systemctl restart caddy
+		echo "restart  caddy (new open-file limit)"
+	elif [ "$caddy_changed" -eq 1 ]; then
+		systemctl reload caddy
+		echo "reload   caddy"
+	else
+		echo "kept     caddy (nothing changed)"
+	fi
 	echo "ready    https://${domain}/v1/info (the certificate may take a minute)"
 fi
 

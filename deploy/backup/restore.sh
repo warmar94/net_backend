@@ -5,9 +5,11 @@
 #
 # Steps: check the backup COMPLETELY (nothing is stopped or dropped before that), take a safety backup of
 # the current state (unless --no-safety-backup), stop the server, replace the database with the backup's
-# content (MySQL: drop + create the database; PostgreSQL: drop + create the `public` schema, the load in
-# one transaction; SQLite: the old files are moved aside), run `migrate` (applies migrations newer than the
-# backup), start the server, wait until it is ready. If anything fails after the stop, the message names
+# content (MySQL: drop + create the database; PostgreSQL: drop + create the `public` schema and the load in
+# ONE transaction, so a failure keeps the old data; SQLite: the old files are moved aside), run `migrate`
+# (applies migrations newer than the backup), start the server, wait until it is ready. The file is read
+# from a private copy, and the safety backup gets its own name (`…-before-restore-…`), so it can never
+# replace the backup being restored. If anything fails after the stop, the message names
 # the safety backup and the command that puts it back.
 # Same settings as backup.sh (NBS_BACKUP_MODE, NBS_DATABASE_URL_FILE, NBS_COMPOSE_DIR, NBS_BACKUP_DIR).
 set -euo pipefail
@@ -56,29 +58,37 @@ trap cleanup EXIT
 
 dc() { (cd "$compose_dir" && docker compose "$@"); }
 
+# Work on a private copy: nothing (not even a safety backup with the same name) can change the file
+# being restored while this script runs.
+src="$work/$(basename "$file")"
+cp -- "$file" "$src"
+
 # ---- 1. check the backup completely, before anything is touched ---------------------------------
 log "checking $file"
 case "$file" in
 *.sql.gz)
 	case "$scheme" in mysql | mariadb) ;; *) fail "a MySQL backup, but the server uses $scheme" ;; esac
-	gzip -t "$file" || fail "not a valid gzip file"
+	# The whole stream (gzip checks every block and the final CRC).
+	gzip -t "$src" || fail "not a valid gzip file; nothing was changed"
 	# mysqldump writes this line last: a dump without it was cut off.
-	tail_lines="$(zcat "$file" | tail -n 3)"
+	tail_lines="$(zcat "$src" | tail -n 3)"
 	case "$tail_lines" in *"Dump completed"*) ;; *) fail "the dump is incomplete (no 'Dump completed' line); nothing was changed" ;; esac
 	;;
 *.dump)
 	case "$scheme" in postgres | postgresql) ;; *) fail "a PostgreSQL backup, but the server uses $scheme" ;; esac
+	# Read EVERY block (not only the table of contents, which a cut dump still has): the restore
+	# turned into SQL and thrown away.
 	if [ "$mode" = docker ]; then
-		dc exec -T db pg_restore --list <"$file" >/dev/null || fail "pg_restore cannot read the dump; nothing was changed"
+		dc exec -T db pg_restore -f /dev/null <"$src" || fail "the dump cannot be read completely (cut or damaged); nothing was changed"
 	else
-		pg_restore --list "$file" >/dev/null || fail "pg_restore cannot read the dump; nothing was changed"
+		pg_restore -f /dev/null "$src" || fail "the dump cannot be read completely (cut or damaged); nothing was changed"
 	fi
 	;;
 *.db.gz)
 	[ "$scheme" = sqlite ] || fail "a SQLite backup, but the server uses $scheme"
 	command -v sqlite3 >/dev/null || fail "sqlite3 is not installed (apt install sqlite3)"
-	gzip -t "$file" || fail "not a valid gzip file"
-	zcat "$file" >"$work/restore.db"
+	gzip -t "$src" || fail "not a valid gzip file; nothing was changed"
+	zcat "$src" >"$work/restore.db"
 	[ "$(sqlite3 "$work/restore.db" 'PRAGMA integrity_check;')" = ok ] || fail "the backup fails PRAGMA integrity_check; nothing was changed"
 	;;
 *) fail "unknown backup type: $file" ;;
@@ -95,9 +105,10 @@ if [ "$safety" -eq 1 ]; then
 		fail "backup.sh / net-backend-backup not found for the safety backup"
 	fi
 	log "safety backup of the current state first"
-	NBS_BACKUP_KEEP_DAYS=0 "${backup_cmd[@]}" | tee "$work/safety.log"
+	NBS_BACKUP_KEEP_DAYS=0 NBS_BACKUP_TAG=before-restore "${backup_cmd[@]}" | tee "$work/safety.log"
 	safety_file="$(sed -n 's/^net-backend-backup: wrote \(.*\) ([^)]*)$/\1/p' "$work/safety.log" | tail -n 1)"
 	[ -n "$safety_file" ] && [ -s "$safety_file" ] || fail "the safety backup did not report its file; nothing was changed"
+	[ "$(realpath -- "$safety_file")" != "$(realpath -- "$file")" ] || fail "the safety backup has the name of the backup being restored; nothing was changed"
 	log "safety backup: $safety_file"
 fi
 
@@ -144,7 +155,7 @@ mysql | mariadb)
 	if [ "$mode" = docker ]; then
 		dc exec -T db sh -c \
 			'MYSQL_PWD="$(cat /run/secrets/db_password)" exec mysql -h 127.0.0.1 -u nbs -e "DROP DATABASE IF EXISTS nbs; CREATE DATABASE nbs CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;"'
-		zcat "$file" | dc exec -T db sh -c \
+		zcat "$src" | dc exec -T db sh -c \
 			'MYSQL_PWD="$(cat /run/secrets/db_password)" exec mysql -h 127.0.0.1 -u nbs nbs'
 	else
 		eval "$(python3 - "$url" <<'PY'
@@ -164,15 +175,19 @@ PY
 			[ -n "$port" ] && echo "port=$port"
 		} >"$work/client.cnf"
 		mysql --defaults-extra-file="$work/client.cnf" -e "DROP DATABASE IF EXISTS \`$database\`; CREATE DATABASE \`$database\` CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;"
-		zcat "$file" | mysql --defaults-extra-file="$work/client.cnf" "$database"
+		zcat "$src" | mysql --defaults-extra-file="$work/client.cnf" "$database"
 	fi
 	;;
 postgres | postgresql)
+	# The schema drop and the whole load run in ONE transaction (psql --single-transaction): if
+	# anything fails, PostgreSQL rolls back to the old data. pg_restore turns the dump into SQL; if it
+	# cannot read to the end, the last line is a statement that fails, so a cut stream never commits.
 	if [ "$mode" = docker ]; then
-		dc exec -T db sh -c \
-			'PGPASSWORD="$(cat /run/secrets/db_password)" exec psql -h 127.0.0.1 -U nbs -d nbs -v ON_ERROR_STOP=1 -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"'
-		dc exec -T db sh -c \
-			'PGPASSWORD="$(cat /run/secrets/db_password)" exec pg_restore -h 127.0.0.1 -U nbs -d nbs --no-owner --no-privileges --exit-on-error --single-transaction' <"$file"
+		dc exec -T db sh -c '
+			{
+				echo "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
+				pg_restore -f - --no-owner --no-privileges || echo "SELECT nbs_restore_could_not_read_the_dump();"
+			} | PGPASSWORD="$(cat /run/secrets/db_password)" psql -q -h 127.0.0.1 -U nbs -d nbs -v ON_ERROR_STOP=1 --single-transaction' <"$src"
 	else
 		eval "$(python3 - "$url" <<'PY'
 import shlex, sys
@@ -185,8 +200,10 @@ PY
 )"
 		printf '%s:%s:%s:%s:%s\n' "$host" "$port" "$database" "$user" "$password" >"$work/pgpass"
 		export PGPASSFILE="$work/pgpass"
-		psql -h "$host" -p "$port" -U "$user" -d "$database" -v ON_ERROR_STOP=1 -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
-		pg_restore -h "$host" -p "$port" -U "$user" -d "$database" --no-owner --no-privileges --exit-on-error --single-transaction "$file"
+		{
+			echo "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
+			pg_restore -f - --no-owner --no-privileges "$src" || echo "SELECT nbs_restore_could_not_read_the_dump();"
+		} | psql -q -h "$host" -p "$port" -U "$user" -d "$database" -v ON_ERROR_STOP=1 --single-transaction
 	fi
 	;;
 sqlite)

@@ -115,8 +115,19 @@ jobs:
           cargo clippy -p net_backend_server --locked --all-targets --no-default-features --features steam,smtp -- -D warnings
           cargo test -p net_backend_server --locked --no-default-features --features sqlite,steam,smtp --test external_fakes
 
-  # net_backend_client: the skeleton builds cleanly.
+  # net_backend_client: every feature set (build, clippy, tests against the real server on loopback and the
+  # in-process mock SSH server, docs). The plain `--lib` build has no dev-dependencies, so a tokio feature the
+  # client forgot cannot hide behind the server's (feature unification of the test build).
   client:
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - ""
+          - "--features ws"
+          - "--features ssh"
+          - "--features sftp"
+          - "--all-features"
     runs-on: ubuntu-latest
     # A hang fails the job instead of eating CI time (the ws tests also abort themselves).
     timeout-minutes: 45
@@ -127,10 +138,11 @@ jobs:
           toolchain: "1.96.0"
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build -p net_backend_client --locked --all-targets
-      - run: cargo clippy -p net_backend_client --locked --all-targets -- -D warnings
-      - run: cargo test -p net_backend_client --locked
-      - run: cargo doc -p net_backend_client --locked --no-deps
+      - run: cargo build -p net_backend_client --locked --lib ${{ matrix.features }}
+      - run: cargo build -p net_backend_client --locked --all-targets ${{ matrix.features }}
+      - run: cargo clippy -p net_backend_client --locked --all-targets ${{ matrix.features }} -- -D warnings
+      - run: cargo test -p net_backend_client --locked ${{ matrix.features }}
+      - run: cargo doc -p net_backend_client --locked --no-deps ${{ matrix.features }}
 
   # End to end: the server's WebSocket hub, storage and chat driven by the published Bevy client (`bevy_net_backend`
   # 0.1.0) in a headless app over loopback. Bevy (and the protocol's `bevy_net_backend` feature) is only in this
@@ -217,6 +229,7 @@ jobs:
       - run: cargo build -p net_backend_server --locked --no-default-features --features sqlite,storage,chat
       - run: cargo build -p net_backend_server --locked --all-features
       - run: cargo build -p net_backend_client --locked
+      - run: cargo build -p net_backend_client --locked --all-features
 
   # The dependency rules.
   deps:
@@ -253,7 +266,12 @@ jobs:
               echo "forbidden dependency with [$*]"; exit 1
             fi
           }
-          check -p net_backend_client
+          for f in "" "--features ws" "--features ssh" "--features sftp" "--all-features"; do
+            check -p net_backend_client $f
+            if [ "$(cargo tree -p net_backend_client --locked --target all -e normal $f -i tokio --depth 0 --prefix none | grep -E '^tokio v' | sort -u | wc -l)" != "1" ]; then
+              echo "more than one tokio in net_backend_client with [$f]"; exit 1
+            fi
+          done
           check -p load_test
           for f in "--all-features" "" "--no-default-features --features sqlite" "--no-default-features --features postgres" "--no-default-features --features sqlite,steam,smtp" "--no-default-features --features mysql,storage,chat"; do
             check -p net_backend_server $f
@@ -274,7 +292,7 @@ jobs:
         with:
           toolchain: "1.96.0"
       - run: |
-          for c in net_backend_protocol net_backend_server; do
+          for c in net_backend_protocol net_backend_server net_backend_client; do
             cargo package -p $c --locked --list --allow-dirty > files-$c.txt
             echo "== $c"; cat files-$c.txt
             if grep -E '(^|/)(NOTES\.md|docs/)' files-$c.txt; then echo "private files in the $c package"; exit 1; fi

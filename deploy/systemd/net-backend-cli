@@ -4,5 +4,7 @@
 # Installed as /usr/local/bin/net-backend-cli by install.sh.
 set -eu
 cd /var/lib/net-backend
+# Files it creates (a new SQLite database) get the same mode as the service's (UMask=0077).
+umask 077
 exec setpriv --reuid=nbs --regid=nbs --init-groups --no-new-privs \
 	env NBS_CONFIG=/etc/net-backend/config.toml /usr/local/bin/net-backend-server "$@"

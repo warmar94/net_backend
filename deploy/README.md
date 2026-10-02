@@ -143,7 +143,7 @@ which are the only proxies the server trusts.
 
    ```text
    sudo bash deploy/systemd/install.sh --db mysql --binary target/release/examples/server \
-       --domain api.example.com --email admin@example.com
+       --domain api.example.com --email admin@example.com        # --email is optional
    ```
 
    It creates the system user `nbs`, `/etc/net-backend/` (`config.toml`, `database_url`, `migrations/`),
@@ -156,7 +156,10 @@ which are the only proxies the server trusts.
    own sites and options). Only Caddy's package default (or a missing file) is replaced by
    `systemd/Caddyfile` (global timeouts + the import). Every file changed is kept first as
    `….before-<time>`. Running it again keeps the configuration, the secrets and the database, installs the
-   new binary, rewrites only the site file and restarts. It refuses a Caddy older than 2.8.
+   new binary, rewrites only the site file and restarts the server. Caddy is reloaded only when its site or
+   main file changed (open WebSockets of every site stay) and restarted only when its open-file limit is
+   new. A Caddy older than 2.8 is refused before anything is installed. `--email` (certificate notices) is
+   optional.
 5. **Review `/etc/net-backend/config.toml`** (app name, mail, chat rooms), then `sudo systemctl restart net-backend`.
 6. **The first administrator**: `sudo net-backend-cli user:create admin@example.com --admin`.
 
@@ -192,9 +195,9 @@ Both Caddyfiles do the same:
   it as well; otherwise every client looks like that proxy.
 - **Not proxied:** Prometheus metrics (`metrics.enabled`) listen on `127.0.0.1:9100`, never through Caddy.
 
-**Memory:** Caddy needs about **100 KiB per proxied WebSocket** (measured: 2000 sockets raised its memory by
-~200 MB), six times what the server needs per socket. On a small machine Caddy, not the server, bounds the
-number of sockets: plan ~1 GB of Caddy memory per 10 000 connected players. Caddy holds two file
+**Memory:** Caddy needs about **120 KiB per proxied WebSocket** (measured: 10 000 sockets over HTTPS raised its
+memory by ~1.2 GB), eight times what the server needs per socket. On a small machine Caddy, not the server,
+bounds the number of sockets: plan ~1.2 GB of Caddy memory per 10 000 connected players. Caddy holds two file
 descriptors per socket; both installs raise its limit to 1 048 576.
 
 ## Configuration
@@ -221,8 +224,10 @@ module's own section, so a typo under `[modules.chat]` fails here, not at the ne
 ## Migrations on deploy
 
 - **systemd:** `ExecStartPre=/usr/local/bin/net-backend-server migrate` runs before every start; a failed
-  migration stops the start (the service is `failed`, the old schema untouched except as the migration
-  error describes).
+  migration stops the start (the old schema untouched except as the migration error describes). systemd
+  retries every 5 s (`activating (auto-restart)` in `systemctl status`) and marks the service `failed`
+  after 5 failed starts within 10 minutes; fix the cause, then `systemctl reset-failed net-backend` and
+  start it.
 - **Docker Compose:** the `migrate` service runs `net-backend-server migrate` and exits; the server starts
   only after it succeeded (`service_completed_successfully`). `docker compose up -d` runs it on every deploy.
 - **Alternative:** `database.migrate_on_start = true` makes `serve` migrate first. Several instances
@@ -244,7 +249,9 @@ run), check (`/readyz`, `migrate status`, the logs).
 ## Backups and restore
 
 `backup/install.sh` installs `net-backend-backup`, `net-backend-restore`, the settings file
-`/etc/net-backend/backup.env` and a timer that runs a backup every day at about 03:30.
+`/etc/net-backend/backup.env` and a timer that runs a backup every day at about 03:30. There is one settings
+file per machine, for the install path the machine runs (systemd or Docker); a second install path on the
+same machine keeps the first one's settings.
 
 | Database | How | File |
 |---|---|---|
@@ -269,11 +276,13 @@ sudo net-backend-restore /var/backups/net-backend/net-backend-mysql-20261002T033
 ```
 
 It first checks the backup completely, before anything is stopped or dropped (MySQL: a valid gzip ending
-with mysqldump's "Dump completed" line; PostgreSQL: `pg_restore --list`; SQLite: unpacked and
-`PRAGMA integrity_check`). Then it takes a safety backup of the current state and prints its path, stops
-the server (Docker: the server and Caddy), replaces the database with the backup (MySQL: the database is
-dropped and created again; PostgreSQL: the `public` schema, the load in one transaction; SQLite: the old
-files are moved aside as `….before-restore-<time>`), runs `migrate` (migrations newer than the backup),
+with mysqldump's "Dump completed" line; PostgreSQL: the whole dump read through `pg_restore`; SQLite:
+unpacked and `PRAGMA integrity_check`), from a private copy of the file. Then it takes a safety backup of
+the current state under its own name (`net-backend-<db>-before-restore-<time>…`; backups never overwrite each
+other) and prints its path, stops the server (Docker: the server and Caddy), replaces the database with the
+backup (MySQL: the database is dropped and created again; PostgreSQL: the `public` schema dropped, created
+and loaded in ONE transaction, so a failed load leaves the old data; SQLite: the old files are moved aside
+as `….before-restore-<time>`), runs `migrate` (migrations newer than the backup),
 starts everything and waits until `/readyz` answers. If a step after the stop fails, it prints the
 command that puts the safety backup back (`net-backend-restore <safety file> --yes --no-safety-backup`).
 
@@ -288,23 +297,28 @@ A restore drill, step by step:
 
 ## Capacity, limits and load testing
 
-Measured on a 2 vCPU / 7.8 GiB virtual machine (Ubuntu 24.04, MySQL 8 on the same machine, Caddy in front):
+Measured on a 2 vCPU / 7.8 GiB virtual machine (Ubuntu 24.04, MySQL 8 or PostgreSQL 16 on the same machine,
+Caddy in front). The HTTPS rows ran `load_test` on that same machine, so it shared the 2 vCPU with the
+server, Caddy and the database:
 
 | What | Measured |
 |---|---|
-| Idle authenticated WebSockets | 10 000 connected in 8.9 s; the server's memory ~17.4 KiB per socket |
-| Caddy per proxied WebSocket | ~100 KiB |
-| Room fan-out (one sender, 64-byte pushes) | 105 000 deliveries/s into 200 members; 149 000/s into 1000 members |
-| A busy chat room: 500 members, 50 senders, every message stored | 337 500 of 337 500 deliveries, p99 latency 30 ms (MySQL), 21 ms (PostgreSQL) |
-| 200 players saving for the first time at the same moment (MySQL) | all 200 stored, no deadlock |
+| 10 000 authenticated WebSockets over HTTPS through Caddy | all connected in 56 s (TLS handshakes), none closed during the hold; server ~15 KiB per socket, Caddy ~121 KiB |
+| A redeploy: 5000 sockets closed with 1001 by a restart | all 5000 reconnected (p99 17 s, bound by TLS handshakes on the shared CPUs) |
+| Chat over HTTPS: 200 members, 50 senders at 1 message/s, every message stored | 600 000 of 600 000 deliveries, p99 294 ms (MySQL), 241 ms (PostgreSQL) |
+| Room fan-out on loopback (one sender, 64-byte pushes) | 105 000 deliveries/s into 200 members; 149 000/s into 1000 members |
+| 1000 players saving for the first time at the same moment | all 1000 stored in 8.6 s (MySQL), 7.4 s (PostgreSQL) |
+| 4 MiB batch saves through Caddy | 10 of 10, median 0.97 s (MySQL), 0.47 s (PostgreSQL) |
+| HTTP through Caddy, 64 connections | `/v1/info` ~4 500 requests/s; `GET /v1/account` 770 (MySQL) / 890 (PostgreSQL); a storage read 940 / 1 050 |
 
 The limits to set together:
 
 - **Open files:** one per socket in the server (`LimitNOFILE=262144` / Compose `ulimits`), two in Caddy
   (1 048 576). `ws.max_connections` (default 10 000) stays below the server's limit; above it new sockets
   get 503 with `Retry-After`.
-- **Memory:** ~17 KiB per socket in the server plus ~100 KiB in Caddy, so roughly 1.2 GB per 10 000
-  connected players, on top of the database's buffer pool and the system. Raise `ws.max_connections` only
+- **Memory:** ~15 KiB per socket in the server plus ~120 KiB in Caddy, so roughly 1.4 GB per 10 000
+  connected players, on top of the database's buffer pool and the system (the default
+  `ws.max_connections = 10000` wants a 4 GB machine). Raise `ws.max_connections` only
   after a load test on the machine itself.
 - **Per player:** at most 5 sockets per account (`ws.max_connections_per_user`), 100 per client address
   (`ws.max_connections_per_ip`; IPv6 counted by /64), 60 WebSocket handshakes per address per minute.
@@ -347,7 +361,7 @@ NBS__MODULES__STORAGE__WRITE_RATE=1000
 | Symptom | Look at |
 |---|---|
 | `install.sh` stops at `config check` | the message names the key; `database reachable` needs the database running and the URL in `/etc/net-backend/database_url` |
-| the service is `failed` right after a deploy | `journalctl -u net-backend -n 50`: a failing migration prints which statements ran and how to recover |
+| the service is `activating (auto-restart)` or `failed` right after a deploy | `journalctl -u net-backend -n 50`: a failing migration prints which statements ran and how to recover |
 | Docker: `server` never becomes healthy | `docker compose logs migrate server`; `docker compose exec server net-backend-server healthcheck` |
 | HTTPS does not come up | DNS points at the machine, ports 80 / 443 reachable; `journalctl -u caddy` (Docker: `docker compose logs caddy`) |
 | 413 from Caddy on a batch save | the site's `request_body max_size` is below 5 MB |

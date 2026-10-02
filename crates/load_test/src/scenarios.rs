@@ -342,12 +342,17 @@ async fn send_burst(sink: &mut Sink, room: RoomId, first_id: u64, count: u64, ev
     }
 }
 
-/// Wait until `delivered` reaches `expected` or `drain` passed.
-async fn drain(delivered: &AtomicU64, expected: impl Fn() -> u64, drain: Duration) {
+/// Wait (one deadline: `drain` from now) until every sent request is answered (accepted or refused)
+/// AND every accepted message reached `per_message` sockets. The answers of one socket come one after
+/// another, so "deliveries == accepted x N" alone would be true long before the burst is answered.
+async fn drain(counters: &Counters, sent: u64, per_message: u64, drain: Duration) {
     let end = Instant::now() + drain;
     while Instant::now() < end {
-        if delivered.load(Ordering::Relaxed) >= expected() {
-            // A short grace for late duplicates / answers.
+        let answers = counters.acks.snapshot();
+        let answered: u64 = answers.values().sum();
+        let accepted = answers.get("ok").copied().unwrap_or(0);
+        if answered >= sent && counters.delivered.load(Ordering::Relaxed) >= accepted * per_message {
+            // A short grace for late duplicates.
             tokio::time::sleep(Duration::from_millis(500)).await;
             return;
         }
@@ -429,8 +434,7 @@ pub async fn chat(
         }
     }
     let send_seconds = seconds(send_started.elapsed());
-    let acks = counters.acks.clone();
-    drain(&counters.delivered, || acks.snapshot().get("ok").copied().unwrap_or(0) * member_count, drain_for).await;
+    drain(&counters, sent.load(Ordering::Relaxed), member_count, drain_for).await;
     let _ = stop_tx.send(true);
     for reader in readers {
         let _ = reader.await;
@@ -444,7 +448,7 @@ pub async fn chat(
         json!({
             "room": room, "members": member_count, "join_seconds": join_seconds, "join_errors": errors.snapshot(),
             "senders": senders, "rate_per_sender": rate, "sent": sent.load(Ordering::Relaxed), "send_seconds": send_seconds,
-            "answers": counters.acks.snapshot(), "accepted": accepted,
+            "answers": counters.acks.snapshot(), "unanswered": sent.load(Ordering::Relaxed).saturating_sub(counters.acks.total()), "accepted": accepted,
             "deliveries_expected": expected, "delivered": delivered, "lost": expected.saturating_sub(delivered),
             "deliveries_per_second": if send_seconds > 0.0 { (delivered as f64 / send_seconds).round() } else { 0.0 },
             "latency": counters.latency.summary(), "closes": counters.closes.snapshot(),
@@ -511,8 +515,7 @@ pub async fn dm(target: &Target, users: &[User], pairs: usize, messages: u64, dr
     }
     let send_seconds = seconds(started.elapsed());
     // Each accepted DM goes to both members (one socket each).
-    let acks = counters.acks.clone();
-    drain(&counters.delivered, || acks.snapshot().get("ok").copied().unwrap_or(0) * 2, drain_for).await;
+    drain(&counters, sent.load(Ordering::Relaxed), 2, drain_for).await;
     let _ = stop_tx.send(true);
     for reader in readers {
         let _ = reader.await;
@@ -524,7 +527,7 @@ pub async fn dm(target: &Target, users: &[User], pairs: usize, messages: u64, dr
         "dm",
         json!({
             "pairs": pairs, "messages_per_side": messages, "sent": sent.load(Ordering::Relaxed), "send_seconds": send_seconds,
-            "answers": counters.acks.snapshot(), "accepted": accepted, "deliveries_expected": accepted * 2, "delivered": delivered,
+            "answers": counters.acks.snapshot(), "unanswered": sent.load(Ordering::Relaxed).saturating_sub(counters.acks.total()), "accepted": accepted, "deliveries_expected": accepted * 2, "delivered": delivered,
             "lost": (accepted * 2).saturating_sub(delivered), "latency": counters.latency.summary(),
             "errors": errors.snapshot(), "closes": counters.closes.snapshot(),
         }),

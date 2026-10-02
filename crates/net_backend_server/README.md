@@ -739,7 +739,7 @@ pushes that handler makes to its own socket wait for its answer (up to `outbox_f
   `bevy_net_backend`'s heartbeat (a ping every 15 s, dead after 45 s of silence).
 - **Memory:** an 8 KiB read buffer per socket (`ws.read_buffer_bytes`), no write buffering;
   measured about 15 KiB of server heap per idle authenticated socket (tungstenite's defaults would
-  add ~120 KiB). Behind Caddy, the proxy needs far more per socket (~100 KiB measured): it, not the
+  add ~120 KiB). Behind Caddy, the proxy needs far more per socket (~120 KiB measured): it, not the
   hub, bounds the socket count on a small box.
 - **Hooks** (`ws::events`): `BeforeWsConnect` (refuse a player: 403 at the handshake, else
   `auth.failed` + 4001; a 5xx / 429 refusal is temporary; it carries the handshake's `Origin`: an app
@@ -1213,7 +1213,7 @@ the framework with `Auth`, `Storage` and `Chat`, configured from `config.toml`, 
 command (exit 0 when `/readyz` answers 200) for containers without a shell. Your own server binary has the
 same command line and drops into the same files. The guide also covers the configuration, capacity numbers
 measured on a 2 vCPU machine, the limits to raise together (open files, `ws.max_connections`, Caddy's
-~100 KiB per proxied WebSocket), an
+~120 KiB per proxied WebSocket), an
 [SSH hardening guide](https://github.com/warmar94/net_backend/blob/main/deploy/ssh-hardening.md) and the
 [`load_test`](https://github.com/warmar94/net_backend/tree/main/crates/load_test) tool for sizing a machine.
 

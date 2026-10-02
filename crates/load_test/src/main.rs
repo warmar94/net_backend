@@ -96,7 +96,8 @@ enum Command {
         /// Messages per member.
         #[arg(long, default_value_t = 50)]
         messages: u64,
-        #[arg(long, default_value_t = 15)]
+        /// Seconds to wait for every answer and delivery after the burst was sent.
+        #[arg(long, default_value_t = 60)]
         drain: u64,
     },
     /// First saves of many players at the same moment (`if_absent` writes).
