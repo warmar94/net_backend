@@ -1,0 +1,118 @@
+# net_backend_server with Docker Compose: the server, a one-shot migration run and Caddy (HTTPS + WSS).
+# The database comes from an overlay chosen at install time (setup.sh writes COMPOSE_FILE into .env):
+#   compose.yaml:compose.mysql.yaml      MySQL 8.4
+#   compose.yaml:compose.postgres.yaml   PostgreSQL 16
+# Run everything from this folder: `docker compose up -d --build`. Needs Docker Engine 27 or newer
+# (ip6tables on by default: IPv6 clients reach Caddy with their own address).
+
+name: net-backend
+
+services:
+  # Applies pending migrations, then exits; the server starts only after it succeeded.
+  migrate:
+    image: net-backend-server:local
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    command: ["migrate"]
+    environment: &server-env
+      NBS_CONFIG: /etc/net-backend/config.toml
+      NBS__SERVER__BIND: 0.0.0.0:8080
+      NBS__DATABASE__URL_FILE: /run/secrets/database_url
+      # Exactly Caddy's two addresses: only its X-Forwarded-For is believed (not the network's
+      # gateway, through which host processes would reach the server).
+      NBS__HTTP__TRUSTED_PROXIES: ${CADDY_IPV4:-172.30.250.10},${CADDY_IPV6:-fd00:6e62:73::10}
+    volumes: &server-volumes
+      - ./config.toml:/etc/net-backend/config.toml:ro
+      - ./migrations:/etc/net-backend/migrations:ro
+    secrets: [database_url]
+    networks: [backend]
+    restart: "no"
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+
+  server:
+    image: net-backend-server:local
+    # Built once by the `migrate` service (same image).
+    pull_policy: never
+    command: ["serve"]
+    environment: *server-env
+    volumes: *server-volumes
+    secrets: [database_url]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    networks: [backend, edge]
+    # Not published on the host: Caddy is the only way in.
+    expose: ["8080"]
+    restart: unless-stopped
+    # Covers server.shutdown_grace_secs (20 s) + up to 10 s per module shutdown (3 modules) + the
+    # pool close (5 s), with room to spare.
+    stop_grace_period: 90s
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/net-backend-server", "healthcheck"]
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    logging: &logging
+      driver: json-file
+      options: { max-size: "50m", max-file: "5" }
+
+  caddy:
+    # A pinned minor version: the Caddyfile needs 2.8 or newer; CI validates it with this image.
+    image: caddy:2.11
+    depends_on:
+      server:
+        condition: service_healthy
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      edge:
+        ipv4_address: ${CADDY_IPV4:-172.30.250.10}
+        ipv6_address: ${CADDY_IPV6:-fd00:6e62:73::10}
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    # Caddy holds two sockets per proxied WebSocket.
+    ulimits:
+      nofile: { soft: 1048576, hard: 1048576 }
+    logging: *logging
+
+networks:
+  # The database and the server (and the migrate / backup runs). Not reachable from outside.
+  backend:
+    internal: true
+  # Caddy and the server, IPv4 + IPv6: with IPv6 on this network Docker forwards IPv6 clients to Caddy
+  # with their real address (otherwise they all arrive from the IPv4 gateway and share one address).
+  edge:
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: ${EDGE_SUBNET:-172.30.250.0/24}
+        - subnet: ${EDGE_SUBNET6:-fd00:6e62:73::/64}
+
+volumes:
+  caddy_data:
+  caddy_config:
+
+secrets:
+  # The full database URL with the password (mysql://nbs:…@db:3306/nbs), written by setup.sh.
+  database_url:
+    file: ./secrets/database_url

@@ -254,6 +254,7 @@ jobs:
             fi
           }
           check -p net_backend_client
+          check -p load_test
           for f in "--all-features" "" "--no-default-features --features sqlite" "--no-default-features --features postgres" "--no-default-features --features sqlite,steam,smtp" "--no-default-features --features mysql,storage,chat"; do
             check -p net_backend_server $f
             # `-i tokio` can print the same version several times (one block per target set): count VERSIONS.
@@ -281,3 +282,54 @@ jobs:
               grep -qx "$f" files-$c.txt || { echo "$f missing from the $c package"; exit 1; }
             done
           done
+
+  # The load generator (crates/load_test, never published): builds cleanly.
+  load_test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p load_test --locked --all-targets
+      - run: cargo clippy -p load_test --locked --all-targets -- -D warnings
+
+  # The deployment files (deploy/): shell scripts, the Compose files, both Caddyfiles, the production
+  # configuration (checked by the reference server itself) and the Docker image build.
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck -S warning deploy/docker/setup.sh deploy/systemd/install.sh deploy/systemd/net-backend-cli deploy/backup/*.sh
+      - name: compose files
+        run: |
+          cd deploy/docker
+          mkdir -p secrets
+          for f in database_url db_password db_root_password; do echo test > "secrets/$f"; done
+          for db in mysql postgres; do
+            DOMAIN=api.example.com ACME_EMAIL=admin@example.com docker compose -f compose.yaml -f "compose.$db.yaml" config -q
+          done
+      - name: Caddyfiles (the image compose.yaml pins)
+        run: |
+          mkdir -p /tmp/caddy/sites
+          sed -e 's/API_DOMAIN/api.example.com/' -e 's/ACME_EMAIL/admin@example.com/' -e 's|/var/log/caddy/net-backend.log|/tmp/caddy-test.log|' \
+            deploy/systemd/net-backend.caddy > /tmp/caddy/sites/net-backend.caddy
+          cp deploy/systemd/Caddyfile /tmp/caddy/Caddyfile
+          docker run --rm -v /tmp/caddy:/etc/caddy:ro caddy:2.11 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          docker run --rm -e DOMAIN=api.example.com -e ACME_EMAIL=admin@example.com -v "$PWD/deploy/docker/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2.11 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+      - uses: Swatinem/rust-cache@v2
+      - name: the production configuration is valid
+        run: |
+          printf 'sqlite:%s/nbs.db' "$RUNNER_TEMP" > "$RUNNER_TEMP/database_url"
+          NBS_CONFIG=deploy/config/config.toml NBS__DATABASE__URL_FILE="$RUNNER_TEMP/database_url" cargo run -p net_backend_server --locked --example server --no-default-features --features sqlite,storage,chat -- config check --connect
+          NBS_CONFIG=deploy/config/config.toml NBS__DATABASE__URL_FILE="$RUNNER_TEMP/database_url" cargo run -p net_backend_server --locked --example server --no-default-features --features sqlite,storage,chat -- migrate
+      - name: Docker image
+        run: docker build -f deploy/docker/Dockerfile -t net-backend-server:ci .

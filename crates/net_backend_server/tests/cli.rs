@@ -120,6 +120,32 @@ async fn config_check_connect() {
     assert!(out.contains("reachable"), "{out}");
 }
 
+/// `config check` builds the server (without touching the database), so every registered module
+/// parses its own section: an unknown key under `[modules.auth]` fails the check, as it would fail
+/// `serve` / `migrate`.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn config_check_reads_module_settings() {
+    async fn check(config: &Config) -> (Result<(), Error>, String) {
+        let mut output = Vec::new();
+        let server = NetBackendServer::new(config.clone()).module(net_backend_server::Auth::new());
+        let result = server.run_with_output(["game-server", "config", "check"], &mut output).await;
+        (result, String::from_utf8_lossy(&output).into_owned())
+    }
+    let mut config = sqlite_config("cli-module-settings");
+    let mut auth = toml::Table::new();
+    auth.insert("app_name".into(), toml::Value::String("Test Game".into()));
+    config.modules.insert("auth".into(), toml::Value::Table(auth.clone()));
+    let (result, out) = check(&config).await;
+    assert!(result.is_ok() && out.contains("Configuration OK."), "{result:?} {out}");
+
+    auth.insert("app_nmae".into(), toml::Value::String("typo".into()));
+    config.modules.insert("auth".into(), toml::Value::Table(auth));
+    let (result, out) = check(&config).await;
+    assert!(matches!(&result, Err(Error::Config(p)) if p.iter().any(|p| p.contains("app_nmae"))), "{result:?}");
+    assert!(!out.contains("Configuration OK."), "{out}");
+}
+
 #[tokio::test]
 async fn openapi_export_needs_no_database() {
     // A MySQL / PostgreSQL URL towards a closed port: export must not connect.

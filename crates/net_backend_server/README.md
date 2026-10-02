@@ -28,7 +28,7 @@ Your client (Rust)                          Your server (Rust binary)
            ▲                                                   │
            └──── net_backend_protocol (shared message types) ──┘
 
-Not Rust? Use the HTTP / WebSocket API directly (OpenAPI + WebSocket reference).
+Not Rust? Use the HTTP / WebSocket API directly (see API.md).
 ```
 
 ## Clients
@@ -40,7 +40,7 @@ The server does not care which client connects; the JSON on the wire is the cont
 | a **Rust** app (tool, bot, CLI, other engine) | [`net_backend_client`](https://github.com/warmar94/net_backend/tree/main/crates/net_backend_client) for the connection (HTTP, WebSocket, SSH / SFTP) + [`net_backend_protocol`](https://github.com/warmar94/net_backend/tree/main/crates/net_backend_protocol) for the message types. |
 | a **Bevy** game | [`bevy_net_backend`](https://github.com/warmar94/bevy_net_backend) for the connection (HTTP, WebSocket, SSH / SFTP) + [`net_backend_protocol`](https://github.com/warmar94/net_backend/tree/main/crates/net_backend_protocol) for the message types. |
 | **other** | [`net_backend_protocol`](https://github.com/warmar94/net_backend/tree/main/crates/net_backend_protocol) + any HTTP / WebSocket library (for example reqwest, ureq, tokio-tungstenite). |
-| **not Rust** (C#, GDScript, JavaScript, …) | The API directly: the OpenAPI document at `/v1/openapi.json` describes every HTTP route and can generate typed clients; the AsyncAPI document at `/v1/asyncapi.json` and the [WebSocket](#websocket) section describe every WebSocket frame. |
+| **not Rust** (C#, GDScript, JavaScript, …) | The API directly: [API.md](https://github.com/warmar94/net_backend/blob/main/API.md) is the complete HTTP + WebSocket reference with examples; the OpenAPI document at `/v1/openapi.json` describes every HTTP route and can generate typed clients; the AsyncAPI document at `/v1/asyncapi.json` and the [WebSocket](#websocket) section describe every WebSocket frame. |
 
 ## Contents
 
@@ -63,6 +63,7 @@ The server does not care which client connects; the JSON on the wire is the cont
 - [Errors](#errors)
 - [OpenAPI, health and metrics](#openapi-health-and-metrics)
 - [Graceful shutdown](#graceful-shutdown)
+- [Deployment](#deployment)
 - [Roadmap](#roadmap)
 - [Limits](#limits)
 - [Compatibility](#compatibility)
@@ -1193,6 +1194,33 @@ At the deadline the remaining connections are closed and their handlers are drop
 so no handler runs on after the modules and the pool are gone. Set systemd's `TimeoutStopSec`
 above the grace period plus the module shutdown time.
 
+## Deployment
+
+The repository's [`deploy/`](https://github.com/warmar94/net_backend/tree/main/deploy) folder installs a server on one
+Linux machine (Ubuntu 24.04), with the install path chosen once:
+
+| | Docker Compose | systemd |
+|---|---|---|
+| The server | a distroless, non-root, read-only container with a health check | a service of a dedicated user with systemd's sandboxing (`NoNewPrivileges`, `ProtectSystem=strict`, …), `LimitNOFILE=262144` |
+| Database | MySQL 8.4 or PostgreSQL 16 in a container | MySQL, PostgreSQL or SQLite on the machine (`install.sh` creates the database and its account) |
+| Migrations | a one-shot `migrate` service before the server starts | `ExecStartPre=… migrate` before every start |
+| HTTPS + WSS | Caddy: automatic certificates, `request_body max_size 5MB` (the 4 MiB batch put), access logs without tokens, the server trusting only Caddy's `X-Forwarded-For` | the same |
+| Backups | a daily systemd timer: `mysqldump --single-transaction`, `pg_dump -Fc` or SQLite's online backup, checked, kept 14 days; `net-backend-restore` puts one back (safety backup, migrate, readiness wait) | the same |
+
+Both install the **reference server**,
+[`examples/server.rs`](https://github.com/warmar94/net_backend/blob/main/crates/net_backend_server/examples/server.rs):
+the framework with `Auth`, `Storage` and `Chat`, configured from `config.toml`, plus a `healthcheck`
+command (exit 0 when `/readyz` answers 200) for containers without a shell. Your own server binary has the
+same command line and drops into the same files. The guide also covers the configuration, capacity numbers
+measured on a 2 vCPU machine, the limits to raise together (open files, `ws.max_connections`, Caddy's
+~100 KiB per proxied WebSocket), an
+[SSH hardening guide](https://github.com/warmar94/net_backend/blob/main/deploy/ssh-hardening.md) and the
+[`load_test`](https://github.com/warmar94/net_backend/tree/main/crates/load_test) tool for sizing a machine.
+
+```text
+cargo build --release --locked -p net_backend_server --example server --no-default-features --features mysql,storage,chat,smtp
+```
+
 ## Roadmap
 
 0.1.0 contains:
@@ -1228,7 +1256,7 @@ optional SeaORM layer, multi-instance pub/sub, payment connectors.
   all three databases.
 - One process; multi-instance deployments arrive with the pub/sub seam.
 - No response compression and no TLS in the process: terminate TLS in the reverse proxy.
-- Capacity numbers are not published until they are measured.
+- Capacity depends on the machine: the [deployment guide](https://github.com/warmar94/net_backend/tree/main/deploy#capacity-limits-and-load-testing) lists the numbers measured on a 2 vCPU machine and the `load_test` tool measures yours.
 
 ## Compatibility
 

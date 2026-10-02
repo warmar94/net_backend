@@ -106,6 +106,12 @@ futures-util = { version = "0.3.31", default-features = false, features = ["std"
 [[example]]
 name = "minimal"
 
+# The reference server (Auth + Storage + Chat from the configuration) that the repository's
+# deployment files install.
+[[example]]
+name = "server"
+required-features = ["storage", "chat"]
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

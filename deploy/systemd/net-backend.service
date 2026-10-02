@@ -1,0 +1,65 @@
+# net_backend_server as a systemd service (installed by deploy/systemd/install.sh as
+# /etc/systemd/system/net-backend.service). Pending migrations run before every start.
+[Unit]
+Description=net_backend_server game backend
+Documentation=https://github.com/warmar94/net_backend/tree/main/deploy
+After=network-online.target mysql.service mariadb.service postgresql.service
+Wants=network-online.target
+# Give up after 5 failed starts within 10 minutes (then `systemctl reset-failed` + start).
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=nbs
+Group=nbs
+Environment=NBS_CONFIG=/etc/net-backend/config.toml
+WorkingDirectory=/var/lib/net-backend
+ExecStartPre=/usr/local/bin/net-backend-server migrate
+ExecStart=/usr/local/bin/net-backend-server serve
+Restart=on-failure
+RestartSec=5s
+# SIGTERM starts the graceful shutdown: server.shutdown_grace_secs (20 s), then up to 10 s per module
+# shutdown (3 modules) and the pool close (5 s); 90 s leaves room.
+KillSignal=SIGTERM
+TimeoutStopSec=90s
+# Migrations on a big database may take a while; the start itself is quick.
+TimeoutStartSec=300s
+
+# Many WebSockets: one file descriptor each (keep ws.max_connections below this).
+LimitNOFILE=262144
+
+# Hardening: a dedicated user, a read-only system, no privileges, no devices.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+UMask=0077
+# The only writable place (SQLite database, if used).
+ReadWritePaths=/var/lib/net-backend
+StateDirectory=net-backend
+StateDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,14 @@
+# The image build (deploy/docker/Dockerfile) needs the sources, Cargo.toml / Cargo.lock and nothing else.
+target/
+**/target/
+.git/
+.github/
+**/NOTES.md
+**/docs/
+deploy/docker/secrets/
+deploy/docker/config.toml
+deploy/docker/config.toml.bak
+deploy/docker/migrations/
+deploy/docker/.env
+**/.env
+**/.env.*

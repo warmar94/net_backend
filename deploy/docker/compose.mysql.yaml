@@ -1,0 +1,48 @@
+# The MySQL 8.4 database for compose.yaml (COMPOSE_FILE=compose.yaml:compose.mysql.yaml in .env).
+# The app's account `nbs` owns only the database `nbs` (not root).
+
+services:
+  db:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: nbs
+      MYSQL_USER: nbs
+      MYSQL_PASSWORD_FILE: /run/secrets/db_password
+      MYSQL_ROOT_PASSWORD_FILE: /run/secrets/db_root_password
+    secrets: [db_password, db_root_password]
+    volumes:
+      - db_data:/var/lib/mysql
+    networks: [backend]
+    restart: unless-stopped
+    stop_grace_period: 60s
+    healthcheck:
+      # TCP ping without credentials: no password on a command line. During the first start the
+      # image's temporary init server runs without networking, so this succeeds only once the real
+      # server listens.
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--silent"]
+      interval: 10s
+      timeout: 5s
+      start_period: 60s
+      retries: 10
+    logging:
+      driver: json-file
+      options: { max-size: "50m", max-file: "5" }
+
+  migrate:
+    depends_on:
+      db:
+        condition: service_healthy
+
+  server:
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  db_data:
+
+secrets:
+  db_password:
+    file: ./secrets/db_password
+  db_root_password:
+    file: ./secrets/db_root_password

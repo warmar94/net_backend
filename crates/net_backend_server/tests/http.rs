@@ -604,6 +604,21 @@ async fn cors_and_request_ids() {
     let (status, headers, _) = call(&router, request).await;
     assert!(status.is_success(), "{status}");
     assert_eq!(headers.get("access-control-allow-origin").and_then(|v| v.to_str().ok()), Some("https://example.com"));
+    // Conditional storage writes from a page: the preflight allows `If-Match` / `If-None-Match`, and
+    // answers expose `ETag` / `Retry-After`.
+    let request = Request::options(routes::INFO)
+        .header("origin", "https://example.com")
+        .header("access-control-request-method", "PUT")
+        .header("access-control-request-headers", "if-match,if-none-match,content-type,authorization")
+        .body(Body::empty())
+        .expect("request");
+    let (status, headers, _) = call(&router, request).await;
+    assert!(status.is_success(), "{status}");
+    let allowed = headers.get("access-control-allow-headers").and_then(|v| v.to_str().ok()).unwrap_or_default().to_ascii_lowercase();
+    assert!(allowed.contains("if-match") && allowed.contains("if-none-match"), "{allowed}");
+    let request = Request::get(routes::INFO).header("origin", "https://example.com").body(Body::empty()).expect("request");
+    let exposed = call(&router, request).await.1.get("access-control-expose-headers").and_then(|v| v.to_str().ok()).unwrap_or_default().to_ascii_lowercase();
+    assert!(exposed.contains("etag") && exposed.contains("retry-after"), "{exposed}");
     let request = Request::get(routes::INFO).header("origin", "https://evil.example").body(Body::empty()).expect("request");
     assert!(call(&router, request).await.1.get("access-control-allow-origin").is_none());
     let request = Request::get(routes::HEALTH).header("x-request-id", "client-id-1").body(Body::empty()).expect("request");

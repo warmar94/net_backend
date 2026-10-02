@@ -1,0 +1,34 @@
+[package]
+name = "load_test"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "A load generator for servers built with net_backend_server: accounts, WebSocket sockets, chat fan-out, DMs, storage saves and HTTP rates, over HTTP(S) / WS(S). Never published."
+license.workspace = true
+repository.workspace = true
+# A tool, not a library: never packaged or published.
+publish = false
+
+[[bin]]
+name = "load_test"
+path = "src/main.rs"
+
+[dependencies]
+# The wire types: every request is the protocol's own typed call.
+net_backend_protocol = { path = "../net_backend_protocol" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }
+# HTTP/1.1 client connections (keep-alive per worker) and WebSockets over our own TCP / TLS stream.
+hyper = { version = "1.6", features = ["client", "http1"] }
+hyper-util = { version = "0.1.10", default-features = false, features = ["tokio"] }
+http = "1.3"
+http-body-util = "0.1.3"
+bytes = "1.10"
+tokio-tungstenite = { version = "0.29.0", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3.31", default-features = false, features = ["std", "sink"] }
+# TLS with rustls + ring and the webpki roots (no OpenSSL, no aws-lc).
+rustls = { version = "0.23.31", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26.2", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1.0"
+clap = { version = "4.5", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context"] }

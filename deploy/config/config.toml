@@ -1,0 +1,84 @@
+# net_backend_server: production configuration of the reference server (Auth + Storage + Chat).
+#
+# Both install paths use this file:
+#   systemd:        /etc/net-backend/config.toml           (the installer copies it once)
+#   Docker Compose: deploy/docker/config.toml               (setup.sh copies it once; mounted read-only)
+# Docker overrides the address, the database URL file and the trusted proxies through NBS__* variables
+# in compose.yaml; everything else is read from here. Unknown keys are errors: check a change with
+#   net-backend-server config check --connect
+#
+# Secrets never go into this file: the database URL is read from `database.url_file`, the SMTP password
+# from `modules.auth.smtp_password_file`, the Steam key from `modules.auth.steam_web_api_key_file`.
+
+[server]
+# Behind Caddy on the same machine: loopback only (Docker: NBS__SERVER__BIND=0.0.0.0:8080).
+bind = "127.0.0.1:8080"
+# In-flight requests and closing WebSockets get this long after SIGTERM; then each module gets up to
+# server.module_shutdown_timeout_secs (10 s), one after the other. systemd's TimeoutStopSec and
+# Compose's stop_grace_period (90 s each) cover grace + 3 modules + the pool close.
+shutdown_grace_secs = 20
+
+[database]
+# A file holding the URL (mysql://… / postgres://… / sqlite:…), written by the installer.
+# Docker: NBS__DATABASE__URL_FILE=/run/secrets/database_url.
+url_file = "/etc/net-backend/database_url"
+max_connections = 20
+# Production runs `migrate` as a deploy step (systemd ExecStartPre, the Compose `migrate` service).
+migrate_on_start = false
+# Published module migrations and the app's own (`migrations publish <module>` writes here).
+migrations_dir = "/etc/net-backend/migrations"
+
+[http]
+# The proxy in front (Caddy on the same machine). Docker: the Compose network's subnet
+# (NBS__HTTP__TRUSTED_PROXIES). Needed for per-address rate limits and WebSocket caps.
+trusted_proxies = ["127.0.0.1", "::1"]
+
+[log]
+level = "info"
+format = "json"
+
+[metrics]
+# Prometheus text on its own loopback listener (never through Caddy).
+enabled = false
+bind = "127.0.0.1:9100"
+
+[openapi]
+# /v1/openapi.json and /v1/asyncapi.json for client generators; set false to hide them.
+enabled = true
+title = "Game backend API"
+
+[ws]
+# Keep the token out of URLs (reverse proxies log URLs): clients send the Authorization header or
+# the first-message `auth`.
+query_token = false
+# Below the open-file limit (LimitNOFILE / ulimits nofile: 262144) with room for the database pool.
+max_connections = 10000
+
+[modules.auth]
+app_name = "My Game"
+# The log mailer writes only the recipient (masked) and the subject. For real mail (feature `smtp`):
+# mailer = "smtp"
+# mail_from = "My Game <no-reply@example.com>"
+# smtp_host = "smtp.example.com"
+# smtp_username = "no-reply@example.com"
+# smtp_password_file = "/etc/net-backend/smtp_password"
+# verify_url = "https://example.com/verify?token={token}"
+# reset_url = "https://example.com/reset?token={token}"
+#
+# Steam login (feature `steam`):
+# steam_app_id = 480
+# steam_identity = "my-game"
+# steam_web_api_key_file = "/etc/net-backend/steam_web_api_key"
+
+[modules.storage]
+# Defaults: 256 KiB per object, 1000 objects and 4 MiB per player, 60 writes per minute per player.
+# max_object_bytes = 262144
+
+[modules.chat]
+# Defaults: 500 characters per message, a burst of 5 messages then one every 2 s, history kept 30 days.
+history_retention_days = 30
+
+[[modules.chat.rooms]]
+key = "world"
+name = "World"
+max_members = 200

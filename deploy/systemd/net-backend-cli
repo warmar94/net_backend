@@ -1,0 +1,8 @@
+#!/bin/sh
+# net-backend-cli: runs a command of the installed server as its service user with its configuration,
+# e.g. `sudo net-backend-cli user:create admin@example.com --admin` or `sudo net-backend-cli migrate status`.
+# Installed as /usr/local/bin/net-backend-cli by install.sh.
+set -eu
+cd /var/lib/net-backend
+exec setpriv --reuid=nbs --regid=nbs --init-groups --no-new-privs \
+	env NBS_CONFIG=/etc/net-backend/config.toml /usr/local/bin/net-backend-server "$@"

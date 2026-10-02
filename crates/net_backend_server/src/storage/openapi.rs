@@ -17,7 +17,7 @@ pub(crate) struct StorageObject {
     /// The owner's user id.
     owner: i64,
     /// The value (any JSON).
-    #[schema(value_type = Object)]
+    #[schema(value_type = Value)]
     value: serde_json::Value,
     /// The version: 1 after the first write, +1 on every write (also the `ETag`).
     version: i64,
@@ -70,7 +70,7 @@ pub(crate) struct ObjectAck {
 #[derive(Serialize, ToSchema)]
 pub(crate) struct PutObject {
     /// The value (any JSON, at most `max_object_bytes`).
-    #[schema(value_type = Object)]
+    #[schema(value_type = Value)]
     value: serde_json::Value,
     /// Only write if the stored version is this one (0: only if new); 409 `version_conflict`
     /// otherwise. Without it the last write wins.
@@ -108,7 +108,7 @@ pub(crate) struct BatchPutItem {
     /// The key.
     key: String,
     /// The value.
-    #[schema(value_type = Object)]
+    #[schema(value_type = Value)]
     value: serde_json::Value,
     /// Only write if the stored version is this one.
     if_version: Option<i64>,
@@ -132,7 +132,7 @@ pub(crate) struct BatchAcks {
 #[derive(Serialize, ToSchema)]
 pub(crate) struct AdminPutObject {
     /// The value.
-    #[schema(value_type = Object)]
+    #[schema(value_type = Value)]
     value: serde_json::Value,
     /// Only write if the stored version is this one.
     if_version: Option<i64>,

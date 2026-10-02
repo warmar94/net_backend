@@ -14,6 +14,7 @@ Thumbs.db
 # Secrets — never in the repo
 .env
 .env.*
+!.env.example
 *.pem
 *.key
 credentials.toml
@@ -24,3 +25,9 @@ credentials.toml
 
 # Private design docs — local only (at any depth)
 **/docs/
+
+# A Docker Compose install's local files (deploy/docker/setup.sh writes them)
+deploy/docker/secrets/
+deploy/docker/config.toml
+deploy/docker/config.toml.bak
+deploy/docker/migrations/

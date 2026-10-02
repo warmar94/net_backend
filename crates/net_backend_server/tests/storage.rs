@@ -639,6 +639,9 @@ async fn wiring_and_documents() {
         assert!(spec["paths"][route.path][method.as_str()].is_object(), "{} {}", route.method, route.path);
     }
     assert!(spec["components"]["schemas"]["StorageObject"].is_object());
+    // A value is any JSON (the protocol's `serde_json::Value`), not only an object.
+    let value = &spec["components"]["schemas"]["StorageObject"]["properties"]["value"];
+    assert!(value.is_object() && value["type"] != json!("object"), "{value}");
     let info: Value = {
         let (_, _, body) = common::call(&prepared.router(), common::get(routes::INFO)).await;
         body

@@ -12,7 +12,7 @@ use axum::middleware::{from_fn, from_fn_with_state};
 use axum::response::IntoResponse;
 use axum::routing::{get, MethodRouter};
 use axum::Router;
-use http::header::{AUTHORIZATION, CONTENT_TYPE};
+use http::header::{AUTHORIZATION, CONTENT_TYPE, ETAG, IF_MATCH, IF_NONE_MATCH, RETRY_AFTER};
 use http::{HeaderName, HeaderValue, Method};
 use net_backend_protocol::{routes as proto_routes, PROTOCOL_HEADER};
 use tokio::net::TcpListener;
@@ -438,8 +438,10 @@ fn cors_layer(config: &Config) -> Option<CorsLayer> {
         CorsLayer::new()
             .allow_origin(allow)
             .allow_methods([Method::GET, Method::POST, Method::PUT, Method::PATCH, Method::DELETE])
-            .allow_headers([AUTHORIZATION, CONTENT_TYPE, protocol.clone(), request_id.clone()])
-            .expose_headers([protocol, request_id])
+            // `If-Match` / `If-None-Match` for the storage module's conditional writes; `ETag` (an
+            // object's version) and `Retry-After` (429 / 503) readable by the page.
+            .allow_headers([AUTHORIZATION, CONTENT_TYPE, IF_MATCH, IF_NONE_MATCH, protocol.clone(), request_id.clone()])
+            .expose_headers([protocol, request_id, ETAG, RETRY_AFTER])
             .max_age(Duration::from_secs(config.cors.max_age_secs)),
     )
 }

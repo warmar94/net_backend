@@ -6,7 +6,7 @@
 //! | `migrate` / `migrate up` | apply pending migrations |
 //! | `migrate status` | list every migration and its state |
 //! | `migrations publish <module> [--dialect <d>] [--force]` | copy a module's SQL into the app (it then owns it) |
-//! | `config check [--connect]` | validate the configuration (and try the database) |
+//! | `config check [--connect]` | validate the configuration, every module's settings included (and try the database) |
 //! | `openapi export [--output <file>]` | write or print the OpenAPI document (no database needed) |
 //! | `asyncapi export [--output <file>]` | write or print the AsyncAPI document of the WebSocket endpoint (no database needed) |
 //!
@@ -233,11 +233,20 @@ where
             if !unknown.is_empty() {
                 return Err(Error::Config(unknown.iter().map(|name| format!("[modules.{name}]: no module named `{name}` is registered (a typo?)")).collect()));
             }
+            // Every module reads and checks its own `[modules.<name>]` section while the server is
+            // built: build it once with a lazy pool (no database contact), so a typo in a module's
+            // settings fails here and not at the next start.
+            let config = config.clone();
+            let modules = server.module_names().join(", ");
+            let mut probe = server;
+            probe.config.database.connect_lazy = true;
+            let prepared = probe.build().await?;
+            prepared.state().db().close().await;
             let dialect = config.database.dialect().map_or("unknown", |d| d.display_name());
             out(w, "Configuration OK.")?;
             out(w, format!("  bind            {}", config.server.bind))?;
             out(w, format!("  database        {dialect} (URL hidden), pool {}", config.database.max_connections))?;
-            out(w, format!("  modules         {}", server.module_names().join(", ")))?;
+            out(w, format!("  modules         {modules}"))?;
             out(w, format!("  body limit      {} bytes, timeout {} s", config.http.body_limit_bytes, config.http.request_timeout_secs))?;
             out(w, format!("  openapi         {}, ui {}", config.openapi.enabled, config.openapi.ui))?;
             out(w, format!("  metrics         {}", config.metrics.enabled))?;

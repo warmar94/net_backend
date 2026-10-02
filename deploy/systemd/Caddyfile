@@ -1,0 +1,16 @@
+# net-backend: the main Caddyfile written by deploy/systemd/install.sh when this machine had no
+# Caddyfile of its own (or Caddy's package default). Global options here; every site in
+# /etc/caddy/sites/*.caddy (the API: net-backend.caddy). Your own edits are kept: install.sh rewrites
+# only its site file. Check with `caddy validate --config /etc/caddy/Caddyfile`, apply with
+# `systemctl reload caddy`.
+
+{
+	servers {
+		timeouts {
+			read_header 15s
+			idle 2m
+		}
+	}
+}
+
+import /etc/caddy/sites/*.caddy

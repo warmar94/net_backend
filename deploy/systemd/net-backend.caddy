@@ -1,0 +1,53 @@
+# The net_backend_server site for Caddy (systemd install): HTTPS + WSS, certificates from
+# Let's Encrypt / ZeroSSL automatically (ports 80 and 443 must reach this machine).
+# install.sh writes it to /etc/caddy/sites/net-backend.caddy with your host name and email; the main
+# /etc/caddy/Caddyfile imports /etc/caddy/sites/*.caddy (install.sh adds that line once and leaves
+# the rest of the main file alone). Check a change with `caddy validate --config /etc/caddy/Caddyfile`,
+# apply it with `systemctl reload caddy`.
+
+API_DOMAIN {
+	# The address for certificate expiry notices.
+	tls ACME_EMAIL
+
+	# The storage module's batch put carries up to ~4.2 MB (4 MiB of values plus JSON). A site-wide
+	# limit applies to every route, so it must allow the largest one.
+	request_body {
+		max_size 5MB
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	# Access log without credentials: Authorization / Cookie headers removed, a `token` query
+	# parameter deleted (the server's `ws.query_token` is off; this guards against clients that send
+	# it anyway).
+	log {
+		output file /var/log/caddy/net-backend.log {
+			roll_size 50MiB
+			roll_keep 10
+		}
+		format filter {
+			wrap json
+			request>headers>Authorization delete
+			request>headers>Cookie delete
+			request>uri query {
+				delete token
+			}
+		}
+	}
+
+	# HTTP and WebSocket (/v1/ws) to the server on loopback. Caddy adds X-Forwarded-For with the
+	# client's address; the server trusts it from 127.0.0.1 / ::1 (http.trusted_proxies).
+	reverse_proxy 127.0.0.1:8080 {
+		# A configuration reload keeps open WebSockets for up to 5 minutes instead of closing them
+		# all at once.
+		stream_close_delay 5m
+		transport http {
+			dial_timeout 5s
+		}
+	}
+}

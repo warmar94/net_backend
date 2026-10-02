@@ -9,6 +9,19 @@ change or a key dependency bump).
 
 ### Added
 
+- `config check` builds the server without touching the database, so every registered module reads and
+  checks its own `[modules.<name>]` section: a typo there fails the check instead of the next start.
+- CORS (when `cors.allowed_origins` is set) allows the request headers `If-Match` / `If-None-Match` and
+  exposes `ETag` / `Retry-After`, so pages on another origin can use conditional storage writes and read
+  versions and wait times from the headers.
+- The OpenAPI document describes a storage `value` as any JSON value (it was an object), as the protocol
+  defines it.
+- The reference server `examples/server.rs` (`Auth`, `Storage` and `Chat` from the configuration, plus a
+  `healthcheck` command that asks `/readyz`) and the repository's deployment files: Docker Compose
+  (distroless non-root image, a one-shot `migrate` service, MySQL 8.4 or PostgreSQL 16, Caddy) or a
+  hardened systemd service (`ExecStartPre` migrations, `LimitNOFILE`, sandboxing), Caddy with HTTPS + WSS,
+  a 5 MB body limit and token-free access logs, daily backups with a restore command, an SSH hardening
+  guide and the `load_test` load generator.
 - Typed routes (`http::call`): the extractor `Call<C>` (path parameters + JSON body or query of a
   protocol `HttpCall`, shape-checked), the answer `Reply<C>` / `CallResult<C>` (with headers), the
   handler marker `CallHandler`, `documented` / `undocumented` / `method_router`, the macro

@@ -25,7 +25,7 @@ Your client (Rust)                          Your server (Rust binary)
            ▲                                                   │
            └──── net_backend_protocol (shared message types) ──┘
 
-Not Rust? Use the HTTP / WebSocket API directly (OpenAPI + WebSocket reference).
+Not Rust? Use the HTTP / WebSocket API directly (see API.md).
 ```
 
 ## The crates
@@ -47,7 +47,7 @@ The server does not care which client connects; the JSON on the wire is the cont
 | a **Rust** app (tool, bot, CLI, other engine) | [`net_backend_client`](crates/net_backend_client/README.md) for the connection (HTTP, WebSocket, SSH / SFTP) + [`net_backend_protocol`](crates/net_backend_protocol/README.md) for the message types. |
 | a **Bevy** game | [`bevy_net_backend`](https://github.com/warmar94/bevy_net_backend) for the connection (HTTP, WebSocket, SSH / SFTP) + [`net_backend_protocol`](crates/net_backend_protocol/README.md) for the message types. |
 | **other** | [`net_backend_protocol`](crates/net_backend_protocol/README.md) + any HTTP / WebSocket library (for example reqwest, ureq, tokio-tungstenite). |
-| **not Rust** (C#, GDScript, JavaScript, …) | The API directly: the server's OpenAPI document describes every HTTP route and can generate typed clients; its AsyncAPI document (`/v1/asyncapi.json`) and README describe every WebSocket frame. |
+| **not Rust** (C#, GDScript, JavaScript, …) | The API directly: [API.md](API.md) is the complete HTTP + WebSocket reference with examples; the server's OpenAPI document describes every HTTP route and can generate typed clients; its AsyncAPI document (`/v1/asyncapi.json`) and README describe every WebSocket frame. |
 
 ## Repository layout
 
@@ -56,7 +56,9 @@ crates/
 ├── net_backend_server/     the server framework
 ├── net_backend_protocol/   the shared message types
 ├── net_backend_client/     the Rust client
-└── e2e_tests/              end-to-end tests with the Bevy client (never published)
+├── e2e_tests/              end-to-end tests with the Bevy client (never published)
+└── load_test/              a load generator for HTTP(S) / WS(S) (never published)
+deploy/                     Docker Compose or systemd, Caddy, migrations, backups, SSH hardening
 ```
 
 One Cargo workspace with one lockfile and one CI workflow. Releases are per crate: each crate has
@@ -67,6 +69,13 @@ cargo test -p net_backend_protocol
 cargo test -p net_backend_server --no-default-features --features sqlite
 cargo test -p e2e_tests          # the server driven by bevy_net_backend in a headless app
 ```
+
+## Deployment
+
+[`deploy/`](deploy/) runs a server on one Linux machine, with the install path chosen once: **Docker
+Compose** (server, MySQL or PostgreSQL, Caddy) or **systemd** (a hardened service, MySQL / PostgreSQL /
+SQLite). Both get HTTPS + WSS through Caddy, migrations on every deploy, daily backups with a restore
+command, and an SSH hardening guide. The [deployment guide](deploy/README.md) walks through both.
 
 ## License
 

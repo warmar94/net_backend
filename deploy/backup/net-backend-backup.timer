@@ -1,0 +1,13 @@
+# Daily database backup of net_backend_server at about 03:30 (local time), caught up after downtime.
+# Installed as /etc/systemd/system/net-backend-backup.timer; enable with
+#   systemctl enable --now net-backend-backup.timer
+[Unit]
+Description=Daily net_backend_server database backup
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

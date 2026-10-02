@@ -1,0 +1,46 @@
+# The PostgreSQL 16 database for compose.yaml (COMPOSE_FILE=compose.yaml:compose.postgres.yaml in .env).
+# The superuser is `postgres` (its own password); the app's role `nbs` is a plain login role that owns
+# the database `nbs` (created by postgres-init.sql on the first start), so the server never runs as a
+# superuser.
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_root_password
+    secrets: [db_password, db_root_password]
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./postgres-init.sql:/docker-entrypoint-initdb.d/10-nbs.sql:ro
+    networks: [backend]
+    restart: unless-stopped
+    stop_grace_period: 60s
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U nbs -d nbs"]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 10
+    logging:
+      driver: json-file
+      options: { max-size: "50m", max-file: "5" }
+
+  migrate:
+    depends_on:
+      db:
+        condition: service_healthy
+
+  server:
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  db_data:
+
+secrets:
+  db_password:
+    file: ./secrets/db_password
+  db_root_password:
+    file: ./secrets/db_root_password

@@ -1,0 +1,17 @@
+# One database backup of net_backend_server (started daily by net-backend-backup.timer).
+# Installed as /etc/systemd/system/net-backend-backup.service; settings in /etc/net-backend/backup.env.
+[Unit]
+Description=net_backend_server database backup
+Documentation=https://github.com/warmar94/net_backend/tree/main/deploy
+After=network-online.target mysql.service mariadb.service postgresql.service docker.service
+# A failed run leaves this unit `failed` (systemctl status net-backend-backup). To be alerted, add a
+# unit of your own, e.g. OnFailure=backup-alert.service (mail, a webhook).
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/net-backend/backup.env
+ExecStart=/usr/local/bin/net-backend-backup
+Nice=10
+IOSchedulingClass=idle
+PrivateTmp=yes
+NoNewPrivileges=yes
