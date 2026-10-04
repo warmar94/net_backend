@@ -157,7 +157,8 @@ fn rustfmt_check(project: &Path) {
     let config = project.join("..").join("rustfmt-defaults.toml");
     fs::write(&config, "").unwrap();
     let output = Command::new("rustfmt").args(["--check", "--edition", "2024", "--config-path"]).arg(&config).args(&files).output().unwrap();
-    assert!(output.status.success(), "rustfmt --check in {}:\n{}", project.display(), String::from_utf8_lossy(&output.stdout));
+    let (stdout, stderr) = (String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "rustfmt --check in {}:\n{stdout}{stderr}", project.display());
 }
 
 /// Kills the process when dropped (a failing assertion never leaves a server running).
