@@ -1,7 +1,7 @@
 //! Prints the JSON of every WebSocket frame and a few HTTP bodies, as they go over the wire.
 //!
 //! ```text
-//! cargo run --example print_frames
+//! cargo run -p net_backend_protocol --example print_frames
 //! ```
 
 use net_backend_protocol::auth::{Account, AuthSession, LoginRequest, TokenPair};

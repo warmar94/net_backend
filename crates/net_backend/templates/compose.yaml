@@ -1,17 +1,21 @@
 # The {{name}} server in Docker, built from this folder:
 #   docker compose up -d --build
-# It answers on http://127.0.0.1:8080 (this machine only); the SQLite database lives in the volume
-# `data` and survives rebuilds. The configuration is config.docker.toml (built into the image).
+# It answers on http://127.0.0.1:8080 (this machine only); the SQLite database (and the players'
+# files, with the files module) live in the volume `data` and survive rebuilds. The configuration is
+# config.docker.toml (built into the image).
 # Logs: docker compose logs -f. Stop: docker compose down.
 services:
   server:
     build: .
+    # The image built from this folder.
+    image: {{image}}:local
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
       - data:/data
     restart: unless-stopped
-    # In-flight requests and open WebSockets get time to finish (server.shutdown_grace_secs).
+    # In-flight requests and open WebSockets get time to finish (server.shutdown_grace_secs, 20 s),
+    # then the modules shut down (up to 10 s, all at once) and the pool closes (5 s).
     stop_grace_period: 60s
     # Nothing but /data (and a /tmp in memory, for SQLite's temporary files) is writable; no privileges.
     read_only: true

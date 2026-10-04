@@ -17,7 +17,7 @@ net_backend_server = { path = "../net_backend_server", default-features = false,
 # server's own builds (`-p net_backend_server`) never see it.
 net_backend_protocol = { path = "../net_backend_protocol", features = ["bevy_net_backend"] }
 # The published client, by version (never a path): what games really use.
-bevy_net_backend = { version = "0.1.0", features = ["ws"] }
+bevy_net_backend = { version = "0.2.0", features = ["ws"] }
 # A headless app: MinimalPlugins, no window. Exactly 0.19.0 (one Bevy in the lockfile).
 bevy = { version = "=0.19.0", default-features = false, features = ["std"] }
 tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "net", "time"] }

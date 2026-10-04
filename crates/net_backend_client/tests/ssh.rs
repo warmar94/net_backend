@@ -549,45 +549,54 @@ mod transfers {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_cancel_or_timeout_midway_closes_the_remote_handle_and_leaves_no_file() {
-        // 8 MiB at 15 ms per read on a server that answers one read at a time: about 2 s.
-        let setup = Setup::with(None, MockOptions { sftp_read_delay: Some(Duration::from_millis(15)), ..MockOptions::default() });
+        // Reads from 1 MiB on (beyond the 16 reads of 64 KiB the client sends first; the mock
+        // answers in order) wait until the test releases them: the download is midway for as long
+        // as the test needs (no timing).
+        let setup = Setup::new();
         setup.mock.put_file_owned("slow.bin", content(8 * MIB));
         setup.mock.put_file_owned("small.bin", content(1000));
+        setup.mock.hold_reads_from(Some(MIB as u64));
         let ssh = SshSession::connect(setup.target()).await.expect("connect");
         // Cancel (drop the task) after the first progress report.
         let local = setup.dir.join("cancelled.bin");
         let mut task = ssh.start_download_file("slow.bin", &local);
         let first = tokio::time::timeout(WAIT, task.next_progress()).await.expect("progress").expect("a report");
-        assert!(first.done > 0 && first.done < 8 * MIB as u64, "{first:?}");
+        assert!(first.done > 0 && first.done <= MIB as u64, "{first:?}");
         drop(task);
+        // The server answers the held reads, then the close.
+        setup.mock.hold_reads_from(None);
         until("the handle of the cancelled download closed", || setup.mock.stats().sftp_handles.load(Ordering::SeqCst) == 0).await;
         until("the part file removed", || part_files(&setup.dir) == 0).await;
         assert!(!local.exists());
         // The same session downloads again afterwards.
         assert!(same_as_content(ssh.download("small.bin").await.expect("small").as_slice(), 1000));
         // A timeout midway: the operation's deadline (and each request's) is the SFTP timeout.
+        setup.mock.hold_reads_from(Some(MIB as u64));
         let short = SshSession::connect(setup.target().with_sftp_timeout(Duration::from_millis(400))).await.expect("connect");
         let local = setup.dir.join("timed-out.bin");
         let error = short.download_file("slow.bin", &local).await.expect_err("timeout");
         assert!(matches!(error, Error::Timeout { sent: None, .. }), "{error:?}");
+        setup.mock.hold_reads_from(None);
         until("the handle of the timed-out download closed", || setup.mock.stats().sftp_handles.load(Ordering::SeqCst) == 0).await;
         until("the part file removed", || part_files(&setup.dir) == 0).await;
         assert!(!local.exists());
-        // The timed-out session's SFTP channel still works (a listing has no read delay).
+        // The timed-out session's SFTP channel still works.
         assert!(short.list_dir(".").await.expect("list after a timeout").iter().any(|e| e.name == "small.bin"));
         assert!(same_as_content(ssh.download("small.bin").await.expect("small").as_slice(), 1000));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_connection_lost_midway_ends_a_transfer_disconnected_and_leaves_no_file() {
-        // 8 MiB at 15 ms per read on a server that answers one read at a time: about 2 s.
-        let setup = Setup::with(None, MockOptions { sftp_read_delay: Some(Duration::from_millis(15)), ..MockOptions::default() });
+        // Reads from 1 MiB on are never answered: the connection is lost midway, whatever the
+        // machine's load.
+        let setup = Setup::new();
         setup.mock.put_file_owned("slow.bin", content(8 * MIB));
+        setup.mock.hold_reads_from(Some(MIB as u64));
         let ssh = SshSession::connect(setup.target()).await.expect("connect");
         let local = setup.dir.join("lost.bin");
         let mut task = ssh.start_download_file("slow.bin", &local);
         let first = tokio::time::timeout(WAIT, task.next_progress()).await.expect("progress").expect("a report");
-        assert!(first.done > 0 && first.done < 8 * MIB as u64, "{first:?}");
+        assert!(first.done > 0 && first.done <= MIB as u64, "{first:?}");
         setup.mock.drop_connections();
         let error = tokio::time::timeout(WAIT, task.finish()).await.expect("result").expect_err("the connection was lost");
         // The server answered part of it: sent, like a command that had started; never `Ssh`.
@@ -598,35 +607,39 @@ mod transfers {
         until("the session closed", || ssh.state() == SshState::Closed).await;
         let after = ssh.list_dir(".").await.expect_err("closed");
         assert!(matches!(after, Error::Disconnected { sent: Some(false), .. }), "{after:?}");
+        setup.mock.hold_reads_from(None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_file_cut_short_during_the_download_is_an_error_and_leaves_no_file() {
-        // 8 MiB at 15 ms per read on a server that answers one read at a time: about 2 s.
-        let setup = Setup::with(None, MockOptions { sftp_read_delay: Some(Duration::from_millis(15)), ..MockOptions::default() });
+        // Reads from 1 MiB on wait while the test truncates the server's file.
+        let setup = Setup::new();
         setup.mock.put_file_owned("cut.bin", content(8 * MIB));
+        setup.mock.hold_reads_from(Some(MIB as u64));
         let ssh = SshSession::connect(setup.target()).await.expect("connect");
         let local = setup.dir.join("cut.bin");
         let mut task = ssh.start_download_file("cut.bin", &local);
         let first = tokio::time::timeout(WAIT, task.next_progress()).await.expect("progress").expect("a report");
-        assert!(first.done > 0 && first.done < 8 * MIB as u64, "{first:?}");
-        // The server's file is truncated midway (as `truncate -s` would).
+        assert!(first.done > 0 && first.done <= MIB as u64, "{first:?}");
+        // The server's file is truncated midway (as `truncate -s` would), then reads go on.
         setup.mock.put_file_owned("cut.bin", content(4 * MIB));
+        setup.mock.hold_reads_from(None);
         let error = tokio::time::timeout(WAIT, task.finish()).await.expect("result").expect_err("cut short");
-        assert!(
-            matches!(&error, Error::Ssh(why) if why.contains("changed size during the download") && why.contains(&format!("expected {} bytes", 8 * MIB)) && why.contains("received ")),
-            "{error:?}"
-        );
+        let counts = format!("(expected {} bytes, its size when it was opened; received {})", 8 * MIB, 4 * MIB);
+        assert!(matches!(&error, Error::Ssh(why) if *why == format!("SFTP: the remote file was cut short during the download {counts}")), "{error:?}");
         assert!(!local.exists(), "no final file");
         until("the part file removed", || part_files(&setup.dir) == 0).await;
         until("the handle closed", || setup.mock.stats().sftp_handles.load(Ordering::SeqCst) == 0).await;
         // Into memory too.
         setup.mock.put_file_owned("cut.bin", content(8 * MIB));
+        setup.mock.hold_reads_from(Some(MIB as u64));
         let mut task = ssh.start_download("cut.bin");
         tokio::time::timeout(WAIT, task.next_progress()).await.expect("progress").expect("a report");
-        setup.mock.put_file_owned("cut.bin", content(MIB));
+        setup.mock.put_file_owned("cut.bin", content(2 * MIB));
+        setup.mock.hold_reads_from(None);
         let error = tokio::time::timeout(WAIT, task.finish()).await.expect("result").expect_err("cut short");
-        assert!(matches!(&error, Error::Ssh(why) if why.contains("changed size during the download")), "{error:?}");
+        let counts = format!("(expected {} bytes, its size when it was opened; received {})", 8 * MIB, 2 * MIB);
+        assert!(matches!(&error, Error::Ssh(why) if why.contains("cut short during the download") && why.ends_with(&counts)), "{error:?}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -639,7 +652,7 @@ mod transfers {
         let local = setup.dir.join("short.bin");
         let error = ssh.download_file("short.bin", &local).await.expect_err("shorter than reported");
         let counts = format!("expected {} bytes, its size when it was opened; received {SIZE}", 5 * MIB);
-        assert!(matches!(&error, Error::Ssh(why) if why.contains("changed size during the download") && why.contains(&counts)), "{error:?}");
+        assert!(matches!(&error, Error::Ssh(why) if why.contains("cut short during the download") && why.contains(&counts)), "{error:?}");
         assert!(!local.exists(), "no final file");
         until("the part file removed", || part_files(&setup.dir) == 0).await;
         let error = ssh.download("short.bin").await.expect_err("shorter than reported");

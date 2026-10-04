@@ -63,6 +63,27 @@ id_type!(
     /// A chat message id. Ids grow over time within a server, so a newer message has a larger id.
     MessageId
 );
+id_type!(
+    /// A notification id. Ids grow over time within a server, so a newer notification has a larger id.
+    NotificationId
+);
+id_type!(
+    /// A group (guild, clan) id.
+    GroupId
+);
+id_type!(
+    /// A lobby id.
+    LobbyId
+);
+id_type!(
+    /// A matchmaking ticket id (a random positive number, unique on the server while the ticket
+    /// lives).
+    TicketId
+);
+id_type!(
+    /// A stored file id.
+    FileId
+);
 
 #[cfg(test)]
 mod tests {

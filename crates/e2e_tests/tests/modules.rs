@@ -1,4 +1,4 @@
-//! The storage and chat modules driven by the published `bevy_net_backend` 0.1.0 client in
+//! The storage and chat modules driven by the published `bevy_net_backend` client in
 //! headless Bevy apps (one app per player), over loopback:
 //! - storage over HTTP, every call built from the protocol's `HttpCall` (method, path, payload):
 //!   create, read with the `ETag`, a stale conditional write answered 409 with the protocol's

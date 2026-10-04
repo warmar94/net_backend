@@ -4,7 +4,8 @@
 //! The stack, outermost first: CORS (only when configured) → request id → client address
 //! ([`ClientIp`], `http.trusted_proxies`) → tracing → protocol
 //! header and version check → error normalising (every 4xx / 5xx is the protocol's error body; an
-//! unexpected 5xx never shows its body) → request timeout → panic catching → hard body cap
+//! unexpected 5xx never shows its body) → request timeout (routes with [`upload_timeout`] get the
+//! upload limits while their body arrives) → panic catching → hard body cap
 //! (`http.max_body_bytes`) → body limit → (matched routes only) metrics → rate limit before
 //! authentication → authentication → rate limit after authentication → the handler. Below all of
 //! it the connection loop enforces the header-read timeout and the shutdown deadline.
@@ -17,10 +18,12 @@
 
 pub mod call;
 pub(crate) mod client_ip;
+pub(crate) mod deadline;
 pub(crate) mod middleware;
 pub(crate) mod routes;
 
 pub use client_ip::{ClientIp, FORWARDED_FOR_HEADER};
+pub use deadline::{upload_timeout, UploadTimeout, UploadTimeoutLayer};
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};

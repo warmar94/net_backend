@@ -9,10 +9,10 @@ API_DOMAIN {
 	# The address for certificate expiry notices.
 	tls ACME_EMAIL
 
-	# The storage module's batch put carries up to ~4.2 MB (4 MiB of values plus JSON). A site-wide
-	# limit applies to every route, so it must allow the largest one.
+	# The largest request is a file upload: the files module's max_file_bytes (16 MiB) plus 64 KiB.
+	# A site-wide limit applies to every route, so it must allow the largest one.
 	request_body {
-		max_size 5MB
+		max_size 17MB
 	}
 
 	header {
@@ -22,9 +22,9 @@ API_DOMAIN {
 		-Server
 	}
 
-	# Access log without credentials: Authorization / Cookie headers removed, a `token` query
-	# parameter deleted (the server's `ws.query_token` is off; this guards against clients that send
-	# it anyway).
+	# Access log without credentials: Authorization / Cookie headers removed, the `token` and
+	# `access_token` query parameters deleted (the server's `ws.query_token` is off; this guards
+	# against clients that send them anyway).
 	log {
 		output file /var/log/caddy/net-backend.log {
 			roll_size 50MiB
@@ -36,6 +36,7 @@ API_DOMAIN {
 			request>headers>Cookie delete
 			request>uri query {
 				delete token
+				delete access_token
 			}
 		}
 	}

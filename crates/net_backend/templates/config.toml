@@ -1,28 +1,17 @@
 # The {{name}} server's configuration (development). `cargo run` reads it from the current folder.
 # Every key is described in the net_backend_server guide: https://docs.rs/net_backend_server
 # (Configuration). An environment variable NBS__<SECTION>__<KEY> overrides a key, e.g.
-# NBS__SERVER__BIND=0.0.0.0:8080. The Docker image uses its own file, config.docker.toml.
+# NBS__SERVER__BIND=0.0.0.0:8080.
 
 [server]
 bind = "127.0.0.1:8080"
 
 [database]
-# A SQLite file in the current folder, created on the first start.
-url = "sqlite:game.db"
+{{database}}
 # Apply the migrations of the modules (and your own, in ./migrations) at every start.
 migrate_on_start = true
 
 [log]
 level = "info"
 format = "pretty"
-
-[modules.auth]
-app_name = "{{name}}"
-# Development: the log shows whole mails (verification and password-reset links). Mail through SMTP:
-# the feature `smtp` and mailer = "smtp" (see the guide).
-log_mailer_show_links = true
-
-[modules.chat]
-[[modules.chat.rooms]]
-key = "world"
-name = "World"
+{{module_sections}}

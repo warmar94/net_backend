@@ -49,8 +49,11 @@ const KEEP_ENDED_SESSIONS_MS: i64 = 30 * 24 * 3600 * 1000;
 const KNOWN_NETWORK_MS: u64 = 30 * 24 * 3600 * 1000;
 /// A Steam ticket is refused when it comes again within this time (replay).
 const STEAM_TICKET_MEMORY_MS: u64 = 10 * 60 * 1000;
-/// The revocation poll re-reads this much before its last position (commit delays).
-const POLL_OVERLAP_MS: i64 = 2_000;
+/// The revocation poll re-reads this much before the newest revocation it saw: a revoking
+/// transaction stamps `revoked_at` before it commits (and instances' clocks differ a little), so a
+/// commit can become visible after newer ones. Each poll re-reads this window (page by page; the
+/// sessions already broadcast are remembered by id and skipped).
+const POLL_OVERLAP_MS: i64 = 30_000;
 
 /// Where a request came from (for sessions, audit entries and hooks).
 #[derive(Clone, Debug, Default)]
@@ -159,6 +162,9 @@ struct Inner {
     known_networks: RecentSet<(String, Option<IpAddr>)>,
     /// SHA-256 of recently accepted Steam tickets.
     steam_tickets: RecentSet<String>,
+    /// `(session, last_used_at read)` of the `last_used_at` updates started recently: one UPDATE
+    /// per session and read value, however many requests of the session arrive at once.
+    touched: RecentSet<(i64, i64)>,
     mails: KeyedBuckets<String>,
     background: Arc<Semaphore>,
     v6_prefix: u8,
@@ -202,6 +208,7 @@ impl AuthService {
         let account_failures = KeyedBuckets::new(config.account_failures_per_hour, Duration::from_secs(3600), 100_000);
         let known_networks = RecentSet::new(Duration::from_millis(KNOWN_NETWORK_MS), 100_000);
         let steam_tickets = RecentSet::new(Duration::from_millis(STEAM_TICKET_MEMORY_MS), 100_000);
+        let touched = RecentSet::new(Duration::from_millis(TOUCH_EVERY_MS as u64), 100_000);
         let mails = KeyedBuckets::new(config.mails_per_account_per_hour, Duration::from_secs(3600), 100_000);
         let v6_prefix = config.rate_limit_ipv6_prefix;
         let (revocations, _) = broadcast::channel(1024);
@@ -219,6 +226,7 @@ impl AuthService {
             account_failures,
             known_networks,
             steam_tickets,
+            touched,
             mails,
             background: Arc::new(Semaphore::new(256)),
             v6_prefix,
@@ -228,6 +236,14 @@ impl AuthService {
     /// The settings.
     pub fn config(&self) -> &AuthConfig {
         &self.0.config
+    }
+
+    /// Whether Steam login is on (a [`SteamVerifier`] is set; setup then requires
+    /// `steam_identity`): the condition of `POST /v1/auth/steam`, also used by the friends
+    /// module's Steam ID lookup (its only caller).
+    #[cfg(feature = "friends")]
+    pub(crate) fn steam_enabled(&self) -> bool {
+        self.0.steam.is_some() && self.0.config.steam_identity.is_some()
     }
 
     /// Receive every revocation from now on (logout, password change, ban, admin, refresh-token
@@ -276,33 +292,56 @@ impl AuthService {
         Ok(roles)
     }
 
-    /// Every session revoked at or after `since` (by any process), oldest first, at most 1000:
-    /// `(revoked at, revocation of that one session)`. The revocation poll is built on it; a hub may
-    /// call it itself after a restart or a `Lagged`.
+    /// Every session revoked at or after `since` (by any process), oldest first (by revocation
+    /// time, then session id), at most [`REVOCATIONS_PAGE`](Self::REVOCATIONS_PAGE):
+    /// `(revoked at, revocation of that one session)`. A full page may have more after it: read on
+    /// with [`revocations_after`](Self::revocations_after) from its last entry. The revocation
+    /// poll is built on these; a hub may call them itself after a restart or a `Lagged`.
     pub async fn revocations_since(&self, state: &AppState, since: UnixMillis) -> Result<Vec<(UnixMillis, Revocation)>, AppError> {
-        let rows = state.db().fetch_all::<store::RevokedRow, _>(&store::revoked_since(since.get(), 1000)).await?;
+        self.revocations_after(state, since, i64::MIN).await
+    }
+
+    /// The page after the entry `(at, session_id)` of [`revocations_since`](Self::revocations_since)
+    /// (sessions revoked later, or at the same time with a larger id), at most
+    /// [`REVOCATIONS_PAGE`](Self::REVOCATIONS_PAGE).
+    pub async fn revocations_after(&self, state: &AppState, at: UnixMillis, session_id: i64) -> Result<Vec<(UnixMillis, Revocation)>, AppError> {
+        let rows = state.db().fetch_all::<store::RevokedRow, _>(&store::revoked_after(at.get(), session_id, Self::REVOCATIONS_PAGE as u64)).await?;
         Ok(rows
             .into_iter()
             .map(|r| {
                 let reason = RevocationReason::from_name(r.revoke_reason.as_deref().unwrap_or(""));
-                (UnixMillis(r.revoked_at.unwrap_or(since.get())), Revocation::new(UserId(r.user_id), RevokedSessions::One(r.id), reason))
+                (UnixMillis(r.revoked_at.unwrap_or(at.get())), Revocation::new(UserId(r.user_id), RevokedSessions::One(r.id), reason))
             })
             .collect())
     }
 
-    /// One revocation poll: broadcast sessions revoked since the cursor that were not seen yet, and
-    /// forget the rotation nonces whose grace window ended. Returns how many were broadcast.
+    /// The most entries [`revocations_since`](Self::revocations_since) and
+    /// [`revocations_after`](Self::revocations_after) return at once.
+    pub const REVOCATIONS_PAGE: usize = 1000;
+
+    /// One revocation poll: broadcast sessions revoked since the cursor (minus the overlap for late
+    /// commits) that were not seen yet, page by page until a page is not full (any number of
+    /// sessions revoked at the same instant), and forget the rotation nonces whose grace window
+    /// ended. Returns how many were broadcast.
     pub(crate) async fn poll_revocations(&self, state: &AppState, cursor: &mut PollCursor, broadcast: bool) -> Result<usize, AppError> {
         let mut sent = 0;
         if broadcast {
-            let from = cursor.since.saturating_sub(POLL_OVERLAP_MS);
-            for (at, revocation) in self.revocations_since(state, UnixMillis(from)).await? {
-                let RevokedSessions::One(id) = revocation.sessions else { continue };
-                if cursor.seen.insert(id, at.get()).is_none() {
-                    self.publish_revocation(revocation);
-                    sent += 1;
+            let mut position = (UnixMillis(cursor.since.saturating_sub(POLL_OVERLAP_MS)), i64::MIN);
+            loop {
+                let page = self.revocations_after(state, position.0, position.1).await?;
+                let full = page.len() >= Self::REVOCATIONS_PAGE;
+                for (at, revocation) in page {
+                    let RevokedSessions::One(id) = revocation.sessions else { continue };
+                    position = (at, id);
+                    if cursor.seen.insert(id, at.get()).is_none() {
+                        self.publish_revocation(revocation);
+                        sent += 1;
+                    }
+                    cursor.since = cursor.since.max(at.get());
                 }
-                cursor.since = cursor.since.max(at.get());
+                if !full {
+                    break;
+                }
             }
             let keep_from = cursor.since.saturating_sub(POLL_OVERLAP_MS);
             cursor.seen.retain(|_, at| *at >= keep_from);
@@ -362,7 +401,7 @@ impl AuthService {
             return Err(AppError::new(codes::TOKEN_EXPIRED, "the access token expired; refresh it"));
         }
         let roles = db.fetch_all::<store::RoleRow, _>(&store::roles_of(&[row.user_id])).await?.into_iter().map(|r| r.role).collect();
-        if now - row.session_last_used_at > TOUCH_EVERY_MS {
+        if now - row.session_last_used_at > TOUCH_EVERY_MS && self.0.touched.insert((row.session_id, row.session_last_used_at)) {
             let db = db.clone();
             let session = row.session_id;
             tokio::spawn(async move {
@@ -614,34 +653,57 @@ impl AuthService {
         // The lockout policy (see docs): failures count per (address, client network) - a stranger
         // cannot lock the owner out from elsewhere - and per address from everywhere; above that
         // looser account-wide ceiling only networks that logged in to the account before may try.
+        // Every attempt takes its failure tokens BEFORE the hash (parallel guesses cannot all pass a
+        // check made before any of them failed); a success or an error that is not a wrong
+        // password gives them back.
         let limits = self.0.config.rate_limits;
         let pair = (normalized.clone(), info.ip.map(|ip| ip_key(ip, self.0.v6_prefix)));
+        let mut charged_account = false;
         if limits {
-            if let RateDecision::Deny { retry_after_ms } = self.0.login_failures.peek(&pair) {
+            if let RateDecision::Deny { retry_after_ms } = self.0.login_failures.check(pair.clone()) {
                 return Err(AppError::rate_limited(retry_after_ms));
             }
-            if let RateDecision::Deny { retry_after_ms } = self.0.account_failures.peek(&normalized) {
-                if !self.0.known_networks.contains(&pair) {
-                    return Err(AppError::rate_limited(retry_after_ms));
+            match self.0.account_failures.check(normalized.clone()) {
+                RateDecision::Allow => charged_account = true,
+                RateDecision::Deny { retry_after_ms } => {
+                    if !self.0.known_networks.contains(&pair) {
+                        self.0.login_failures.refund(&pair);
+                        return Err(AppError::rate_limited(retry_after_ms));
+                    }
                 }
             }
         }
+        let refund = || {
+            if limits {
+                self.0.login_failures.refund(&pair);
+                if charged_account {
+                    self.0.account_failures.refund(&normalized);
+                }
+            }
+        };
         // ONE query (account + hash) and one hash (a dummy without an account), whether or not the
         // address has an account: the same awaited work on both failure paths.
         let db = state.db();
-        let row = db.fetch_optional::<store::LoginRow, _>(&store::login_by_email(&normalized)).await?;
-        let (user, stored) = match row {
-            Some(row) => (Some(row.user), row.password_hash),
-            None => (None, None),
+        let checked = async {
+            let row = db.fetch_optional::<store::LoginRow, _>(&store::login_by_email(&normalized)).await?;
+            let (user, stored) = match row {
+                Some(row) => (Some(row.user), row.password_hash),
+                None => (None, None),
+            };
+            let matches = self.0.hasher.verify(password.clone(), stored.clone()).await?;
+            Ok::<_, AppError>((user, stored, matches))
+        }
+        .await;
+        let (user, stored, matches) = match checked {
+            Ok(checked) => checked,
+            Err(error) => {
+                refund();
+                return Err(error);
+            }
         };
-        let matches = self.0.hasher.verify(password.clone(), stored.clone()).await?;
         let now = Self::now(state);
         let known = user.as_ref().map(|u| u.id);
         let (Some(user), true) = (user, matches) else {
-            if limits {
-                let _ = self.0.login_failures.check(pair.clone());
-                let _ = self.0.account_failures.check(normalized.clone());
-            }
             // Failures on existing accounts are audited, in the background (never awaited here:
             // the answer must not take longer for a known address). Unknown addresses are not
             // audited: no enumeration through the log, and no row per guess.
@@ -652,6 +714,9 @@ impl AuthService {
             }
             return Err(invalid_credentials());
         };
+        if charged_account {
+            self.0.account_failures.refund(&normalized);
+        }
         self.0.login_failures.reset(&pair);
         self.0.known_networks.insert(pair);
         if user.is_banned(now) {
@@ -661,7 +726,10 @@ impl AuthService {
             return Err(AppError::new(codes::EMAIL_NOT_VERIFIED, "confirm your email address first"));
         }
         let ctx = Self::ctx(state, info);
-        state.hooks().run_before(&ctx, BeforeLogin { user_id: UserId(user.id), method: LoginMethod::Password, steam: None, ip: info.ip }).await?;
+        state
+            .hooks()
+            .run_before(&ctx, BeforeLogin { user_id: UserId(user.id), method: LoginMethod::Password, steam: None, identity: None, ip: info.ip })
+            .await?;
         if stored.as_deref().is_some_and(|s| self.0.hasher.needs_rehash(s)) {
             match self.0.hasher.hash(password).await {
                 Ok(hash) => {
@@ -687,12 +755,21 @@ impl AuthService {
         let now = Self::now(state);
         let mut tx = state.db().begin().await?;
         let (session, tokens) = self.issue_session(&mut tx, user, method, info, now).await?;
+        // The per-account session cap: the oldest live sessions over it are revoked.
+        let keep = u64::from(self.0.config.max_sessions_per_user.max(1));
+        let over: Vec<i64> = tx.fetch_all::<store::SessionIdRow, _>(&store::sessions_over_cap(user, now, keep)).await?.into_iter().map(|r| r.id).collect();
+        if !over.is_empty() {
+            tx.execute(&store::revoke_session_ids(&over, RevocationReason::SessionLimit.as_str(), now)).await?;
+        }
         let mut record = AuditRecord::new(action).actor(Some(UserId(user))).target_user(UserId(user)).ip(info.ip).request_id(info.request_id.as_ref());
         if let Some(data) = data {
             record = record.data(data);
         }
         audit::record_tx(&mut tx, UnixMillis(now), &record).await?;
         tx.commit().await?;
+        for id in over {
+            self.notify(state, info, Revocation::new(UserId(user), RevokedSessions::One(id), RevocationReason::SessionLimit)).await;
+        }
         state.hooks().run_after(&Self::ctx(state, info), Arc::new(AfterLogin { user_id: UserId(user), session_id: session, method, ip: info.ip })).await;
         Ok(AuthSession::new(self.account(state, UserId(user)).await?, tokens))
     }
@@ -768,7 +845,7 @@ impl AuthService {
         if user.is_banned(now) {
             return Err(banned(user));
         }
-        let event = BeforeLogin { user_id: UserId(user.id), method: LoginMethod::Steam, steam: Some(steam.clone()), ip: info.ip };
+        let event = BeforeLogin { user_id: UserId(user.id), method: LoginMethod::Steam, steam: Some(steam.clone()), identity: None, ip: info.ip };
         state.hooks().run_before(&Self::ctx(state, info), event).await.map(|_| ())
     }
 
@@ -891,6 +968,139 @@ impl AuthService {
         Self::user(db, UserId(user)).await
     }
 
+    /// A login through a provider account another module verified (the `oauth` module: an
+    /// OpenID Connect ID token): log in the account linked to `provider` + `subject`, link it to
+    /// the caller's account (`current`: needs a recent login; one account of a provider per
+    /// account), or create an account. A provider account linked to ANOTHER account than the
+    /// caller's answers 409: two existing accounts are never merged. `label` names the provider in
+    /// mails (`Google`); `data` goes into the audit entry.
+    #[cfg_attr(not(feature = "oauth"), allow(dead_code))]
+    pub(crate) async fn identity_login(
+        &self,
+        state: &AppState,
+        info: &ReqInfo,
+        current: Option<AuthContext>,
+        identity: &LinkedIdentity,
+        label: &str,
+        data: serde_json::Value,
+    ) -> Result<AuthSession, AppError> {
+        let db = state.db();
+        let now = Self::now(state);
+        let existing = db.fetch_optional::<UserRow, _>(&store::user_by_identity(&identity.provider, &identity.subject)).await?;
+        let user = match (existing, current) {
+            (Some(user), Some(current)) if user.id != current.user_id.get() => {
+                return Err(AppError::conflict(format!("this {label} account is linked to another account")));
+            }
+            (Some(user), _) => {
+                self.check_identity_login(state, info, &user, identity, now).await?;
+                user
+            }
+            (None, Some(current)) => self.link_identity(state, info, &current, identity, label, now).await?,
+            (None, None) => {
+                let user = self.create_identity_account(state, info, identity).await?;
+                self.check_identity_login(state, info, &user, identity, now).await?;
+                user
+            }
+        };
+        self.start_session(state, info, user.id, LoginMethod::OpenId, "auth.oauth_login", Some(data)).await
+    }
+
+    /// The ban and the `BeforeLogin` hook for a provider login.
+    #[cfg_attr(not(feature = "oauth"), allow(dead_code))]
+    async fn check_identity_login(&self, state: &AppState, info: &ReqInfo, user: &UserRow, identity: &LinkedIdentity, now: i64) -> Result<(), AppError> {
+        if user.is_banned(now) {
+            return Err(banned(user));
+        }
+        let event = BeforeLogin { user_id: UserId(user.id), method: LoginMethod::OpenId, steam: None, identity: Some(identity.clone()), ip: info.ip };
+        state.hooks().run_before(&Self::ctx(state, info), event).await.map(|_| ())
+    }
+
+    /// Link a provider account to the logged-in account (the rules of [`link_steam`](Self::link_steam)).
+    #[cfg_attr(not(feature = "oauth"), allow(dead_code))]
+    async fn link_identity(
+        &self,
+        state: &AppState,
+        info: &ReqInfo,
+        current: &AuthContext,
+        identity: &LinkedIdentity,
+        label: &str,
+        now: i64,
+    ) -> Result<UserRow, AppError> {
+        if !current.is_recent_login(UnixMillis(now), secs_to_ms(self.0.config.link_reauth_secs)) {
+            return Err(reauth_required());
+        }
+        let db = state.db();
+        let user = Self::user(db, current.user_id).await?;
+        if db.fetch_one::<store::CountRow, _>(&store::count_identities(user.id, Some(&identity.provider))).await?.n > 0 {
+            return Err(AppError::conflict(format!("this account already has a {label} account linked; unlink it first")));
+        }
+        self.check_identity_login(state, info, &user, identity, now).await?;
+        match db.execute(&store::insert_identity(user.id, &identity.provider, &identity.subject, now)?).await {
+            Ok(_) => {}
+            Err(error) if error.is_unique_violation() => return Err(AppError::conflict(format!("this {label} account is linked to another account"))),
+            Err(error) => return Err(error.into()),
+        }
+        let record = AuditRecord::new("auth.identity_linked")
+            .actor(Some(current.user_id))
+            .target_user(current.user_id)
+            .ip(info.ip)
+            .request_id(info.request_id.as_ref())
+            .data(json!({ "provider": identity.provider, "subject": identity.subject }));
+        audit::record_logged(db, UnixMillis(now), &record).await;
+        if let (true, Some(email)) = (self.0.config.notify_on_link, &user.email) {
+            let config = &self.0.config;
+            let text = format!(
+                "A {label} account was linked to your {app} account. You can now log in with it.
+
+If this was not you, change your password (or reset it) and unlink {label} in the game.
+",
+                app = config.app_name
+            );
+            self.0.mail.enqueue(Mail::new(email.clone(), format!("{}: {label} account linked", config.app_name), text));
+        }
+        Ok(user)
+    }
+
+    /// A new account for a provider account (the `BeforeRegister` / `AfterRegister` hooks run; a
+    /// parallel first login that created it a moment earlier wins).
+    #[cfg_attr(not(feature = "oauth"), allow(dead_code))]
+    async fn create_identity_account(&self, state: &AppState, info: &ReqInfo, identity: &LinkedIdentity) -> Result<UserRow, AppError> {
+        let ctx = Self::ctx(state, info);
+        let event = BeforeRegister { email: None, display_name: None, identity: Some(identity.clone()), ip: info.ip };
+        let event = state.hooks().run_before(&ctx, event).await?;
+        if let Some(name) = &event.display_name {
+            UpdateAccountRequest::new().with_display_name(name.clone()).validate()?;
+        }
+        let db = state.db();
+        let now = Self::now(state);
+        let mut tx = db.begin().await?;
+        let user = tx.insert_id(&store::insert_user(None, None, event.display_name.as_deref(), None, now)?, "id").await?;
+        match tx.execute(&store::insert_identity(user, &identity.provider, &identity.subject, now)?).await {
+            Ok(_) => {}
+            Err(error) if error.is_unique_violation() => {
+                let _ = tx.rollback().await;
+                return db
+                    .fetch_optional::<UserRow, _>(&store::user_by_identity(&identity.provider, &identity.subject))
+                    .await?
+                    .ok_or_else(|| AppError::conflict("retry the login"));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let record = AuditRecord::new("auth.register")
+            .actor(Some(UserId(user)))
+            .target_user(UserId(user))
+            .ip(info.ip)
+            .request_id(info.request_id.as_ref())
+            .data(json!({ "provider": identity.provider, "subject": identity.subject }));
+        audit::record_tx(&mut tx, UnixMillis(now), &record).await?;
+        tx.commit().await?;
+        state
+            .hooks()
+            .run_after(&ctx, Arc::new(AfterRegister { user_id: UserId(user), email: None, display_name: event.display_name, identity: Some(identity.clone()) }))
+            .await;
+        Self::user(db, UserId(user)).await
+    }
+
     /// `POST /v1/auth/logout`: with the access token, or with the session's refresh token.
     pub(crate) async fn logout(&self, state: &AppState, info: &ReqInfo, current: Option<AuthContext>, request: LogoutRequest) -> Result<(), AppError> {
         let (user, session) = match current.as_ref().and_then(|c| c.session_id.map(|s| (c.user_id, s))) {
@@ -949,17 +1159,24 @@ impl AuthService {
         request.validate()?;
         let db = state.db();
         let key = (format!("user:{}", current.user_id.get()), None);
-        if self.0.config.rate_limits {
-            if let crate::rate_limit::RateDecision::Deny { retry_after_ms } = self.0.login_failures.peek(&key) {
+        // The failure token is taken before the hash (parallel guesses are counted) and given back
+        // when the password was right or the check failed for another reason.
+        let limits = self.0.config.rate_limits;
+        if limits {
+            if let crate::rate_limit::RateDecision::Deny { retry_after_ms } = self.0.login_failures.check(key.clone()) {
                 return Err(AppError::rate_limited(retry_after_ms));
             }
         }
-        let stored = db.fetch_optional::<store::CredentialRow, _>(&store::credentials(current.user_id.get())).await?.map(|c| c.password_hash);
         let current_password = nfc_password(request.current_password.into_inner());
-        if current_password.len() > PASSWORD_MAX_BYTES || !self.0.hasher.verify(current_password, stored).await? {
-            if self.0.config.rate_limits {
-                let _ = self.0.login_failures.check(key);
-            }
+        let checked = async {
+            let stored = db.fetch_optional::<store::CredentialRow, _>(&store::credentials(current.user_id.get())).await?.map(|c| c.password_hash);
+            Ok::<_, AppError>(current_password.len() <= PASSWORD_MAX_BYTES && self.0.hasher.verify(current_password, stored).await?)
+        }
+        .await;
+        if limits && !matches!(checked, Ok(false)) {
+            self.0.login_failures.refund(&key);
+        }
+        if !checked? {
             return Err(AppError::new(codes::INVALID_CREDENTIALS, "the current password is wrong"));
         }
         let hash = self.0.hasher.hash(nfc_password(request.new_password.into_inner())).await?;
@@ -1471,5 +1688,62 @@ mod tests {
         assert_eq!(AuthService::page_limit(None), u64::from(DEFAULT_PAGE_LIMIT));
         assert!(AuthService::cursor_id(Some(&Cursor::new("x"))).is_err());
         assert_eq!(AuthService::cursor_id(Some(&Cursor::new("12"))).ok().flatten(), Some(12));
+    }
+
+    /// B1: 1500 sessions of one user revoked at one instant by "another process" all reach the
+    /// revocation receivers through the poll (more than one page at the same time), and so does a
+    /// later revocation; a second poll sends nothing again.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn the_revocation_poll_pages_through_one_instant() {
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+
+        const T0: i64 = 1_800_000_000_000;
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target").join("tmp").join(format!("unit-poll-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let mut config = crate::Config::default();
+        config.database.url = crate::SecretString::new("sqlite::memory:");
+        config.database.migrations_dir = dir.clone();
+        let auth = AuthConfig { argon2_memory_kib: 64, argon2_iterations: 1, purge_interval_secs: 0, max_sessions_per_user: 10_000, ..AuthConfig::default() };
+        let clock = Arc::new(crate::ManualClock::new(UnixMillis(T0)));
+        let server = crate::NetBackendServer::new(config).clock(clock.clone()).module(super::super::Auth::new().with_config(auth));
+        let prepared = server.build().await.expect("build");
+        prepared.migrate().await.expect("migrate");
+        let state = prepared.state().clone();
+        let service = state.get::<AuthService>().expect("service");
+        let info = ReqInfo::default();
+        let ada = service.register(&state, &info, RegisterRequest::new("ada@example.com", "correct horse battery")).await.expect("register").account.id;
+        let mut sql = String::from("INSERT INTO auth_sessions (user_id, method, created_at, last_used_at, expires_at) VALUES ");
+        let rows: Vec<String> = (0..1499).map(|_| format!("({}, 'password', {T0}, {T0}, {})", ada.get(), T0 + 86_400_000)).collect();
+        sql.push_str(&rows.join(", "));
+        state.db().execute_script(sql).await.expect("sessions");
+
+        let seen: Arc<Mutex<Vec<i64>>> = Arc::default();
+        let sink = seen.clone();
+        service.add_revocation_sink(Arc::new(move |revocation: &Revocation| {
+            if let RevokedSessions::One(id) = revocation.sessions {
+                sink.lock().unwrap_or_else(|p| p.into_inner()).push(id);
+            }
+        }));
+        let mut cursor = PollCursor::starting_at(T0);
+        assert_eq!(service.poll_revocations(&state, &mut cursor, true).await.expect("poll"), 0);
+
+        // "Another process": one UPDATE, one `revoked_at` for all 1500 rows.
+        clock.advance(1_000);
+        let revoked = state.db().execute(&store::revoke_sessions(ada.get(), None, None, "admin", T0 + 1_000)).await.expect("revoke");
+        assert_eq!(revoked, 1500);
+        clock.advance(1_000);
+        assert_eq!(service.poll_revocations(&state, &mut cursor, true).await.expect("poll"), 1500);
+        // One more revocation, later (another user).
+        let bob = service.register(&state, &info, RegisterRequest::new("bob@example.com", "correct horse battery")).await.expect("register").account.id;
+        clock.advance(1_000);
+        state.db().execute(&store::revoke_sessions(bob.get(), None, None, "admin", T0 + 3_000)).await.expect("revoke");
+        assert_eq!(service.poll_revocations(&state, &mut cursor, true).await.expect("poll"), 1);
+        assert_eq!(service.poll_revocations(&state, &mut cursor, true).await.expect("poll"), 0, "nothing twice");
+        let seen = seen.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert_eq!(seen.len(), 1501);
+        assert_eq!(seen.iter().collect::<HashSet<_>>().len(), 1501, "every session once");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

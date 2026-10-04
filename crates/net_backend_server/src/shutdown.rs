@@ -4,7 +4,8 @@
 //! [`serve_with_shutdown`](crate::PreparedServer::serve_with_shutdown)) the server stops accepting
 //! connections, `/readyz` answers 503, in-flight requests get `server.shutdown_grace_secs` to
 //! finish (then their connections are closed and the handlers dropped), then modules' `shutdown`
-//! (reverse order, each bounded) and the shutdown hooks run and the database pool is closed.
+//! (all at the same time, within `server.module_shutdown_timeout_secs` together) and the shutdown
+//! hooks run and the database pool is closed.
 
 use std::sync::Arc;
 

@@ -179,3 +179,30 @@ fn a_cancelled_send_is_answered_cancelled_with_an_honest_sent() {
     reply.cancel();
     assert_eq!(info.protocol, net_backend_client::protocol::PROTOCOL_VERSION);
 }
+
+#[test]
+fn blocking_calls_with_their_own_deadline() {
+    use net_backend_client::protocol::GetServerInfo;
+
+    let (base, _) = silent_server();
+    // The builder's 100 ms does not cut a call that has its own longer deadline.
+    let client = Client::from_builder(net_backend_client::Client::builder(&base).timeout(Duration::from_millis(100))).expect("client");
+    let started = Instant::now();
+    let error = client.call_with_timeout(&GetServerInfo::new(), Duration::from_millis(600)).expect_err("timeout");
+    assert!(matches!(error, Error::Timeout { .. }), "{error:?}");
+    assert!(started.elapsed() >= Duration::from_millis(550), "{:?}", started.elapsed());
+    // Polled from a loop: a short own deadline answers `Timeout` without blocking the frame.
+    let slow = Client::new(&base).expect("client");
+    let started = Instant::now();
+    let mut reply = slow.send_with_timeout(GetServerInfo::new(), Duration::from_millis(200));
+    let error = take(&mut reply).expect_err("timeout");
+    assert!(matches!(error, Error::Timeout { sent: None, .. }), "{error:?}");
+    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    // Against the real server both answer normally.
+    let server = Server::start();
+    let client = Client::new(&server.base).expect("client");
+    let session = client.register(RegisterRequest::new(email("ida"), PASSWORD)).expect("register");
+    assert_eq!(client.call_with_timeout(&GetAccount::new(), Duration::from_secs(30)).expect("me").id, session.account.id);
+    let mut reply = client.send_with_timeout(GetAccount::new(), Duration::from_secs(30));
+    assert_eq!(take(&mut reply).expect("me").id, session.account.id);
+}

@@ -101,6 +101,7 @@ pub(crate) async fn put(
         value: call.put.value,
         if_version,
         write: call.put.write,
+        visibility: call.put.visibility,
         writer: Writer::Admin(admin.0.user_id),
     };
     let ack = service.write(&state, &HookCtx::new(state.clone(), Some(request_id)), request, Some(entry)).await?;

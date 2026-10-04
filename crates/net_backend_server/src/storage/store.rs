@@ -23,6 +23,7 @@ pub(crate) struct ObjectRow {
     pub(crate) value: Vec<u8>,
     pub(crate) version: i64,
     pub(crate) write_access: String,
+    pub(crate) visibility: String,
     pub(crate) updated_at: i64,
 }
 
@@ -32,6 +33,7 @@ pub(crate) struct InfoRow {
     pub(crate) object_key: String,
     pub(crate) version: i64,
     pub(crate) write_access: String,
+    pub(crate) visibility: String,
     pub(crate) size_bytes: i64,
     pub(crate) updated_at: i64,
 }
@@ -64,7 +66,10 @@ fn identity(user: i64, collection: &str, key: &str) -> Cond {
 /// One object with its value.
 pub(crate) fn object(user: i64, collection: &str, key: &str) -> SelectStatement {
     let mut select = Query::select();
-    select.columns(["collection", "object_key", "value", "version", "write_access", "updated_at"]).from(OBJECTS).cond_where(identity(user, collection, key));
+    select
+        .columns(["collection", "object_key", "value", "version", "write_access", "visibility", "updated_at"])
+        .from(OBJECTS)
+        .cond_where(identity(user, collection, key));
     select
 }
 
@@ -76,7 +81,7 @@ pub(crate) fn objects(user: i64, names: &[(&str, &str)]) -> SelectStatement {
     }
     let mut select = Query::select();
     select
-        .columns(["collection", "object_key", "value", "version", "write_access", "updated_at"])
+        .columns(["collection", "object_key", "value", "version", "write_access", "visibility", "updated_at"])
         .from(OBJECTS)
         .cond_where(Cond::all().add(Expr::col("user_id").eq(user)).add(any));
     select
@@ -90,14 +95,18 @@ pub(crate) fn state(user: i64, collection: &str, key: &str) -> SelectStatement {
     select
 }
 
-/// A page of one collection, ordered by key, after `after` (the previous page's last key).
-pub(crate) fn list(user: i64, collection: &str, after: Option<&str>, limit: u64) -> SelectStatement {
+/// A page of one collection, ordered by key, after `after` (the previous page's last key); with
+/// `visible`, only objects of those visibilities (another player's view).
+pub(crate) fn list(user: i64, collection: &str, after: Option<&str>, limit: u64, visible: Option<&[&str]>) -> SelectStatement {
     let mut select = Query::select();
     select
-        .columns(["object_key", "version", "write_access", "size_bytes", "updated_at"])
+        .columns(["object_key", "version", "write_access", "visibility", "size_bytes", "updated_at"])
         .from(OBJECTS)
         .and_where(Expr::col("user_id").eq(user))
         .and_where(Expr::col("collection").eq(collection));
+    if let Some(visible) = visible {
+        select.and_where(Expr::col("visibility").is_in(visible.iter().copied()));
+    }
     if let Some(after) = after {
         select.and_where(Expr::col("object_key").gt(after));
     }
@@ -148,6 +157,8 @@ pub(crate) struct Update<'a> {
     pub(crate) owner_only: bool,
     /// Set the lock (server / admin writes).
     pub(crate) write: Option<&'a str>,
+    /// Set the visibility.
+    pub(crate) visibility: Option<&'a str>,
 }
 
 /// Overwrite an object and bump its version (0 rows: absent, another version, or locked).
@@ -164,6 +175,9 @@ pub(crate) fn update(u: Update<'_>) -> UpdateStatement {
     if let Some(write) = u.write {
         update.value("write_access", write);
     }
+    if let Some(visibility) = u.visibility {
+        update.value("visibility", visibility);
+    }
     if let Some(version) = u.if_version {
         update.and_where(Expr::col("version").eq(version));
     }
@@ -174,13 +188,14 @@ pub(crate) fn update(u: Update<'_>) -> UpdateStatement {
 }
 
 /// A new object, version 1.
-pub(crate) fn insert(user: i64, collection: &str, key: &str, value: Vec<u8>, write: &str, now: i64) -> Result<InsertStatement, DbError> {
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn insert(user: i64, collection: &str, key: &str, value: Vec<u8>, write: &str, visibility: &str, now: i64) -> Result<InsertStatement, DbError> {
     let size = i64::try_from(value.len()).unwrap_or(i64::MAX);
     let mut insert = Query::insert();
     insert
         .into_table(OBJECTS)
-        .columns(["user_id", "collection", "object_key", "value", "version", "write_access", "size_bytes", "created_at", "updated_at"])
-        .values([user.into(), collection.into(), key.into(), value.into(), 1i64.into(), write.into(), size.into(), now.into(), now.into()])
+        .columns(["user_id", "collection", "object_key", "value", "version", "write_access", "visibility", "size_bytes", "created_at", "updated_at"])
+        .values([user.into(), collection.into(), key.into(), value.into(), 1i64.into(), write.into(), visibility.into(), size.into(), now.into(), now.into()])
         .map_err(build)?;
     Ok(insert)
 }
@@ -205,8 +220,17 @@ mod tests {
 
     #[test]
     fn statements_render_everywhere() {
-        let update =
-            update(Update { user: 1, collection: "saves", key: "a", value: b"{}".to_vec(), now: 5, if_version: Some(3), owner_only: true, write: None });
+        let update = update(Update {
+            user: 1,
+            collection: "saves",
+            key: "a",
+            value: b"{}".to_vec(),
+            now: 5,
+            if_version: Some(3),
+            owner_only: true,
+            write: None,
+            visibility: Some("public"),
+        });
         let sql = render_statement(&update, Dialect::Postgres);
         assert!(sql.contains("\"version\" = \"version\" + 1") && sql.contains("\"version\" = 3") && sql.contains("\"write_access\" = 'owner'"), "{sql}");
         let lock = render_statement(&lock_user(1, Dialect::MySql), Dialect::MySql);
@@ -220,7 +244,9 @@ mod tests {
         assert!(used.contains("CAST(COALESCE(SUM(\"size_bytes\"), 0) AS BIGINT)"), "{used}");
         let many = render_statement(&objects(1, &[("s", "a"), ("s", "b")]), Dialect::Sqlite);
         assert!(many.contains(" OR "), "{many}");
-        let page = render_statement(&list(1, "s", Some("k"), 11), Dialect::MySql);
+        let page = render_statement(&list(1, "s", Some("k"), 11, None), Dialect::MySql);
         assert!(page.contains("`object_key` > 'k'") && page.contains("ORDER BY `object_key` ASC") && page.contains("LIMIT 11"), "{page}");
+        let shown = render_statement(&list(1, "s", None, 11, Some(&["public", "friends"])), Dialect::Postgres);
+        assert!(shown.contains("\"visibility\" IN ('public', 'friends')"), "{shown}");
     }
 }

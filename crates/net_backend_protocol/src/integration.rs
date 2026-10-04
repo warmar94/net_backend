@@ -5,12 +5,20 @@
 use bevy_net_backend::{BearerToken, Credentials, OutgoingRequest, WsPushMessage, WsRequest};
 
 use crate::auth::AccessToken;
-use crate::chat::{ChatHistory, ChatMessage, JoinRoom, LeaveRoom, ListMembers, MessageDeleted, Presence, SendMessage};
+use crate::chat::{
+    ChatHistory, ChatMessage, EditMessage, JoinRoom, LeaveRoom, ListMembers, ListReceipts, MarkRead, MessageDeleted, MessageEdited, Presence, ReadReceipt,
+    RoomUpdate, SendMessage, SetTyping, TypingUpdate, UnreadQuery,
+};
 use crate::envelope::{ServerPush, WsCall};
+use crate::friends::FriendPresence;
+use crate::lobbies::{LobbyMemberUpdate, LobbyUpdate};
+use crate::matchmaking::{MatchFound, TicketExpired};
+use crate::notifications::{CountNotifications, DeleteNotification, MarkNotifications, Notification, NotificationQuery};
 
 /// `WsRequest` from this crate's [`WsCall`]: the same kind and answer type. No request asks to be
-/// resent after a reconnect (the client's default): chat membership ends with the connection, and
-/// a resent `chat.send` could post a message twice.
+/// resent after a reconnect (the client's default): chat membership ends with the connection, a
+/// resent `chat.send` could post a message twice, and a resent `notify.*` request is answered by
+/// asking again.
 macro_rules! ws_requests {
     ($($request:ty),* $(,)?) => {
         $(
@@ -32,8 +40,37 @@ macro_rules! ws_pushes {
     };
 }
 
-ws_requests!(JoinRoom, LeaveRoom, SendMessage, ChatHistory, ListMembers);
-ws_pushes!(ChatMessage, MessageDeleted, Presence);
+ws_requests!(
+    JoinRoom,
+    LeaveRoom,
+    SendMessage,
+    ChatHistory,
+    ListMembers,
+    EditMessage,
+    MarkRead,
+    ListReceipts,
+    UnreadQuery,
+    SetTyping,
+    NotificationQuery,
+    CountNotifications,
+    MarkNotifications,
+    DeleteNotification
+);
+ws_pushes!(
+    ChatMessage,
+    MessageDeleted,
+    Presence,
+    MessageEdited,
+    ReadReceipt,
+    TypingUpdate,
+    RoomUpdate,
+    Notification,
+    FriendPresence,
+    LobbyMemberUpdate,
+    LobbyUpdate,
+    MatchFound,
+    TicketExpired
+);
 
 /// `Authorization: Bearer <token>` on every HTTP request and WebSocket handshake (the client's
 /// `BearerToken` does the work, including the sensitive-header flag and the refusal of a token

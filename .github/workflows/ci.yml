@@ -16,6 +16,7 @@ env:
 
 # Rust is pinned to the dev version (never @stable): a newer Rust's new clippy lints must not turn CI red on
 # unchanged code. Upgrading Rust = bump this in every job, run clippy, fix. Users are unaffected (rust-version).
+# Every action is pinned by its commit (the comment names its tag or branch), as in docker.yml.
 #
 # One workspace, one lockfile. Every job selects its crate with `-p`, so only that crate's features are enabled
 # (resolver 2): the server is never built with the protocol's `bevy_net_backend` feature.
@@ -25,8 +26,8 @@ jobs:
     # A hang fails the job instead of eating CI time (the ws tests also abort themselves).
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: "1.96.0"
           components: rustfmt
@@ -46,18 +47,18 @@ jobs:
     # A hang fails the job instead of eating CI time (the ws tests also abort themselves).
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: "1.96.0"
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build -p net_backend_protocol --locked --all-targets ${{ matrix.features }}
       - run: cargo clippy -p net_backend_protocol --locked --all-targets ${{ matrix.features }} -- -D warnings
       - run: cargo test -p net_backend_protocol --locked ${{ matrix.features }}
       - run: cargo doc -p net_backend_protocol --locked --no-deps ${{ matrix.features }}
 
-  # net_backend_server: each database backend alone, the default, the modules (storage, chat) alone and together,
+  # net_backend_server: each database backend alone, the default, the modules (storage, chat, leaderboards, notifications, friends, groups, oauth, lobbies, matchmaking, files) alone and together,
   # and everything (build, clippy, tests, docs). SQLite runs in process; the MySQL / PostgreSQL suites are ignored
   # here and run in `databases`.
   server:
@@ -71,18 +72,26 @@ jobs:
           - ""
           - "--no-default-features --features sqlite,storage"
           - "--no-default-features --features sqlite,chat"
+          - "--no-default-features --features sqlite,leaderboards"
+          - "--no-default-features --features sqlite,notifications"
+          - "--no-default-features --features sqlite,friends"
+          - "--no-default-features --features sqlite,groups"
+          - "--no-default-features --features sqlite,oauth"
+          - "--no-default-features --features sqlite,files"
+          - "--no-default-features --features sqlite,lobbies"
+          - "--no-default-features --features sqlite,matchmaking"
           - "--no-default-features --features mysql,storage,chat"
           - "--all-features"
     runs-on: ubuntu-latest
     # A hang fails the job instead of eating CI time (the ws tests also abort themselves).
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: "1.96.0"
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build -p net_backend_server --locked --all-targets ${{ matrix.features }}
       - run: cargo clippy -p net_backend_server --locked --all-targets ${{ matrix.features }} -- -D warnings
       # Diagnostic (CI hang 2026-10-02): if a test binary of the ws suite runs over 2 minutes (it normally takes
@@ -136,37 +145,37 @@ jobs:
     # A hang fails the job instead of eating CI time (the ws tests also abort themselves).
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: "1.96.0"
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build -p net_backend_client --locked --lib ${{ matrix.features }}
       - run: cargo build -p net_backend_client --locked --all-targets ${{ matrix.features }}
       - run: cargo clippy -p net_backend_client --locked --all-targets ${{ matrix.features }} -- -D warnings
       - run: cargo test -p net_backend_client --locked ${{ matrix.features }}
       - run: cargo doc -p net_backend_client --locked --no-deps ${{ matrix.features }}
 
-  # End to end: the server's WebSocket hub, storage and chat driven by the published Bevy client (`bevy_net_backend`
-  # 0.1.0) in a headless app over loopback. Bevy (and the protocol's `bevy_net_backend` feature) is only in this
+  # End to end: the server's WebSocket hub, storage and chat driven by the published Bevy client (`bevy_net_backend`)
+  # in a headless app over loopback. Bevy (and the protocol's `bevy_net_backend` feature) is only in this
   # unpublished crate (`crates/e2e_tests`), never in the server's own builds (`-p net_backend_server`).
   e2e:
     runs-on: ubuntu-latest
     # A hang fails the job instead of eating CI time (the ws tests also abort themselves).
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: "1.96.0"
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build -p e2e_tests --locked --all-targets
       - run: cargo clippy -p e2e_tests --locked --all-targets -- -D warnings
       - run: cargo test -p e2e_tests --locked
 
-  # The server's database, auth, storage and chat suites against real MySQL 8.4, MariaDB 11.4 and PostgreSQL 16 (each
+  # The server's database, auth, storage, chat, leaderboards, notifications, friends, groups, oauth, lobbies, files and storage-visibility suites against real MySQL 8.4, MariaDB 11.4 and PostgreSQL 16 (each
   # test creates and drops its own database).
   databases:
     runs-on: ubuntu-latest
@@ -204,16 +213,16 @@ jobs:
       NBS_TEST_MYSQL_URL: mysql://root:nbs-ci-password@127.0.0.1:3306/nbs
       NBS_TEST_POSTGRES_URL: postgres://postgres:nbs-ci-password@127.0.0.1:5432/nbs
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: "1.96.0"
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p net_backend_server --locked --all-features --test db --test auth --test storage --test chat -- --include-ignored
-      - run: cargo test -p net_backend_server --locked --no-default-features --features mysql,storage,chat --test db --test auth --test storage --test chat -- --include-ignored
-      - run: cargo test -p net_backend_server --locked --no-default-features --features postgres,storage,chat --test db --test auth --test storage --test chat -- --include-ignored
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo test -p net_backend_server --locked --all-features --test db --test auth --test storage --test chat --test chat_extras --test leaderboards --test notifications --test friends --test friends_presence_cost --test friends_steam --test groups --test oauth --test lobbies --test files --test storage_visibility -- --include-ignored
+      - run: cargo test -p net_backend_server --locked --no-default-features --features mysql,storage,chat,leaderboards,notifications,friends,groups,oauth,lobbies,files --test db --test auth --test storage --test chat --test chat_extras --test leaderboards --test notifications --test friends --test friends_presence_cost --test friends_steam --test groups --test oauth --test lobbies --test files --test storage_visibility -- --include-ignored
+      - run: cargo test -p net_backend_server --locked --no-default-features --features postgres,storage,chat,leaderboards,notifications,friends,groups,oauth,lobbies,files --test db --test auth --test storage --test chat --test chat_extras --test leaderboards --test notifications --test friends --test friends_presence_cost --test friends_steam --test groups --test oauth --test lobbies --test files --test storage_visibility -- --include-ignored
       - name: MariaDB (through the mysql feature)
-        run: cargo test -p net_backend_server --locked --no-default-features --features mysql,storage,chat --test db --test auth --test storage --test chat -- --include-ignored
+        run: cargo test -p net_backend_server --locked --no-default-features --features mysql,storage,chat,leaderboards,notifications,friends,groups,oauth,lobbies,files --test db --test auth --test storage --test chat --test chat_extras --test leaderboards --test notifications --test friends --test friends_presence_cost --test friends_steam --test groups --test oauth --test lobbies --test files --test storage_visibility -- --include-ignored
         env:
           NBS_TEST_MYSQL_URL: mysql://root:nbs-ci-password@127.0.0.1:3307/nbs
 
@@ -223,11 +232,11 @@ jobs:
     # A hang fails the job instead of eating CI time (the ws tests also abort themselves).
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: "1.95.0"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build -p net_backend_protocol --locked --no-default-features
       - run: cargo build -p net_backend_protocol --locked --all-features
       - run: cargo build -p net_backend_server --locked --no-default-features --features sqlite,storage,chat
@@ -241,8 +250,8 @@ jobs:
     # A hang fails the job instead of eating CI time (the ws tests also abort themselves).
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: "1.96.0"
       # Protocol: no engine, async runtime or I/O crate without the feature.
@@ -256,7 +265,8 @@ jobs:
       # Protocol with the client feature: every bevy* crate at 0.19.0 (the client's exact pin), exactly one bevy_ecs.
       - name: one Bevy, 0.19.0
         run: |
-          if grep -A1 -E '^name = "bevy' Cargo.lock | grep -E '^version' | grep -v '"0.19.0"' | grep -v -E '"0\.1\.[0-9]+"'; then
+          # The Bevy client itself (bevy_net_backend) has its own version; every other bevy* crate is Bevy.
+          if awk '/^name = "bevy/ { name = $3; getline; if (name != "\"bevy_net_backend\"" && $3 != "\"0.19.0\"") { print name, $3; found = 1 } } END { exit !found }' Cargo.lock; then
             echo "a bevy* crate other than 0.19.0 is in Cargo.lock"; exit 1
           fi
           if [ "$(cargo tree -p net_backend_protocol --locked --all-features -e normal -i bevy_ecs --depth 0 --prefix none | wc -l)" != "1" ]; then
@@ -291,8 +301,8 @@ jobs:
     # A hang fails the job instead of eating CI time (the ws tests also abort themselves).
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: "1.96.0"
       - run: |
@@ -310,12 +320,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: "1.96.0"
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build -p load_test --locked --all-targets
       - run: cargo clippy -p load_test --locked --all-targets -- -D warnings
 
@@ -327,12 +337,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: "1.96.0"
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build -p net_backend --locked --all-targets
       - run: cargo clippy -p net_backend --locked --all-targets -- -D warnings
       - run: cargo test -p net_backend --locked
@@ -347,7 +357,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: shellcheck
         run: shellcheck -S warning deploy/systemd/install.sh deploy/systemd/net-backend-cli deploy/backup/*.sh
       - name: compose files
@@ -374,14 +384,14 @@ jobs:
               docker run --rm -v /tmp/caddy-docker:/etc/caddy:ro caddy:2.11 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
             done
           done
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: "1.96.0"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: the production configurations are valid (systemd's file, the compose files' inline one, the image's)
         run: |
           printf 'sqlite:%s/nbs.db' "$RUNNER_TEMP" > "$RUNNER_TEMP/database_url"
-          run() { cargo run -q -p net_backend_server --locked --example server --no-default-features --features sqlite,storage,chat -- "$@"; }
+          run() { cargo run -q -p net_backend_server --locked --example server --no-default-features --features sqlite,storage,chat,leaderboards,notifications,friends,groups,oauth,lobbies,matchmaking,files -- "$@"; }
           NBS_CONFIG=deploy/config/config.toml NBS__DATABASE__URL_FILE="$RUNNER_TEMP/database_url" run config check --connect
           NBS_CONFIG=deploy/config/config.toml NBS__DATABASE__URL_FILE="$RUNNER_TEMP/database_url" run migrate
           DOMAIN=api.example.com docker compose -f deploy/docker/compose.postgres.yaml config --format json | jq -r '."x-nbs-config"' > "$RUNNER_TEMP/compose.toml"
@@ -393,7 +403,7 @@ jobs:
         run: |
           docker run -d --name nbs-trial -p 127.0.0.1:8080:8080 net-backend-server:ci
           for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8080/v1/info && break; sleep 1; done
-          curl -fsS http://127.0.0.1:8080/v1/info | grep -q '"chat"' || { docker logs nbs-trial; exit 1; }
+          curl -fsS http://127.0.0.1:8080/v1/info | grep -q '"auth","chat","files","friends","groups","leaderboards","lobbies","matchmaking","notifications","oauth","storage"' || { docker logs nbs-trial; exit 1; }
           docker rm -f nbs-trial
       - name: the compose stacks (DOMAIN=localhost, Caddy's local certificate)
         run: |

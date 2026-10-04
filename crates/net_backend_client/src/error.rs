@@ -151,6 +151,11 @@ pub enum Error {
     /// An SSH protocol error (feature `ssh`): no common algorithm, a refused channel or subsystem,
     /// the Terrapin refusal, an SFTP error status, … (the dependency's or the server's words).
     Ssh(String),
+    /// The sign-in at an identity provider did not finish (feature `oauth`): the player declined
+    /// or the provider answered an error (its `error` code), the browser never came back before
+    /// the time limit, or the provider's token answer had no ID token. Nothing reached the game's
+    /// server.
+    OAuth(String),
 }
 
 /// Why an SSH host key was refused ([`Error::HostKey`]).
@@ -186,7 +191,7 @@ impl Error {
     pub fn was_sent(&self) -> Option<bool> {
         match self {
             Error::InvalidRequest(_) | Error::NotLoggedIn | Error::RequestTooLarge { .. } | Error::Tls(_) => Some(false),
-            Error::HostKey { .. } | Error::AuthFailed(_) => Some(false),
+            Error::HostKey { .. } | Error::AuthFailed(_) | Error::OAuth(_) => Some(false),
             Error::Network { sent, .. } | Error::Timeout { sent, .. } | Error::Disconnected { sent, .. } | Error::Cancelled { sent } => *sent,
             Error::Api { .. } | Error::Status { .. } | Error::Decode { .. } | Error::BodyTooLarge { .. } => Some(true),
             _ => None,
@@ -311,6 +316,7 @@ impl fmt::Debug for Error {
             }
             Error::AuthFailed(why) => f.debug_tuple("AuthFailed").field(why).finish(),
             Error::Ssh(why) => f.debug_tuple("Ssh").field(why).finish(),
+            Error::OAuth(why) => f.debug_tuple("OAuth").field(why).finish(),
         }
     }
 }
@@ -344,6 +350,7 @@ impl fmt::Display for Error {
             Error::HostKey { host, fingerprint, problem } => write!(f, "SSH host key check failed for `{host}`: {problem} ({fingerprint})"),
             Error::AuthFailed(why) => write!(f, "SSH authentication failed: {why}"),
             Error::Ssh(why) => write!(f, "SSH error: {why}"),
+            Error::OAuth(why) => write!(f, "the sign-in at the identity provider did not finish: {why}"),
         }
     }
 }

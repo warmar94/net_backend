@@ -23,8 +23,8 @@
 //! }
 //! ```
 //!
-//! **What is inside:** the core: the app builder and module
-//! system ([`NetBackendServer`], [`Module`], [`hooks`]), configuration ([`Config`]), the error
+//! **What is inside:** the core: the app builder and module system ([`NetBackendServer`],
+//! [`Module`], [`hooks`]), configuration ([`Config`]), the error
 //! model ([`AppError`]), the database layer ([`db`]) and migrations ([`migrate`]), the HTTP basics
 //! ([`http`]: health, info, body limits, request ids, client addresses, timeouts, panic safety,
 //! CORS), OpenAPI, metrics, the command line ([`cli`], [`command`]) and graceful shutdown; and the
@@ -33,12 +33,23 @@
 //! limits ([`rate_limit`])); and the WebSocket hub ([`ws`]: `/v1/ws` with the protocol's envelope,
 //! handlers by kind, pushes, rooms, caps, close codes, an AsyncAPI document at
 //! [`ASYNCAPI_PATH`]); typed routes mounted from the protocol's `HttpCall` ([`http::call`]); and
-//! the modules `storage` (per-user JSON objects with versions) and `chat` (rooms, direct
-//! messages, history, presence, moderation), each behind its cargo feature.
+//! the modules `storage` (per-user JSON objects with versions), `chat` (rooms, direct
+//! messages, history, presence, moderation), `leaderboards` (boards, scores, ranks),
+//! `notifications` (stored per player, pushed live), `friends` (requests, blocks, online state) and
+//! `groups` (guilds / clans with roles, invitations and a chat room), each behind its cargo feature.
+//! The module `oauth` (cargo feature `oauth`) logs players in with an OpenID Connect provider's ID
+//! token (Google as a preset), linked to the accounts. The modules `lobbies` (lobbies with join
+//! codes, ready flags, metadata and a search) and `matchmaking` (queues and matches by the game's
+//! rules) coordinate players before a match. The module `files` (cargo feature `files`) stores
+//! players' binary files (quotas, a SHA-256, a visibility: private, public, friends or shared with
+//! accounts) in a local folder or an app's store.
 //!
-//! Cargo features: `mysql` (default), `postgres`, `sqlite` (additive, any combination compiles,
+//! Cargo features: `postgres` (default), `mysql`, `sqlite` (additive, any combination compiles,
 //! at least one is needed to run a server); `steam` (the built-in Steam ticket check) and `smtp`
-//! (the SMTP mailer); `storage` and `chat` (the modules; off by default).
+//! (the SMTP mailer); `storage`, `chat`, `leaderboards`, `notifications`, `friends` and `groups` (the
+//! modules; off by default); `oauth` (the OpenID Connect login module, with an HTTPS client for the
+//! providers' keys); `lobbies` and `matchmaking` (the lobby and matchmaking modules); `files` (the
+//! file storage module).
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -52,11 +63,36 @@ pub mod command;
 pub mod config;
 pub mod db;
 pub mod error;
+#[cfg(feature = "files")]
+#[cfg_attr(docsrs, doc(cfg(feature = "files")))]
+pub mod files;
+#[cfg(feature = "friends")]
+#[cfg_attr(docsrs, doc(cfg(feature = "friends")))]
+pub mod friends;
+#[cfg(feature = "groups")]
+#[cfg_attr(docsrs, doc(cfg(feature = "groups")))]
+pub mod groups;
 pub mod hooks;
 pub mod http;
+#[cfg(feature = "leaderboards")]
+#[cfg_attr(docsrs, doc(cfg(feature = "leaderboards")))]
+pub mod leaderboards;
+#[cfg(feature = "lobbies")]
+#[cfg_attr(docsrs, doc(cfg(feature = "lobbies")))]
+pub mod lobbies;
 pub mod mail;
+#[cfg(feature = "matchmaking")]
+#[cfg_attr(docsrs, doc(cfg(feature = "matchmaking")))]
+pub mod matchmaking;
 pub mod migrate;
 pub mod module;
+#[cfg(feature = "notifications")]
+#[cfg_attr(docsrs, doc(cfg(feature = "notifications")))]
+pub mod notifications;
+#[cfg(feature = "oauth")]
+#[cfg_attr(docsrs, doc(cfg(feature = "oauth")))]
+pub mod oauth;
+pub mod permissions;
 pub mod rate_limit;
 pub mod shutdown;
 pub mod state;
@@ -90,9 +126,22 @@ pub use sqlx;
 pub use utoipa;
 pub use utoipa_axum;
 
-/// The README's Rust blocks, compiled as doctests (they show the storage and chat modules too, so
-/// they run with both features).
-#[cfg(all(doctest, feature = "storage", feature = "chat"))]
+/// The README's Rust blocks, compiled as doctests (they show the storage, chat, leaderboards,
+/// notifications, friends, groups, oauth, lobbies, matchmaking and files modules too, so they run
+/// with those features).
+#[cfg(all(
+    doctest,
+    feature = "storage",
+    feature = "chat",
+    feature = "leaderboards",
+    feature = "notifications",
+    feature = "friends",
+    feature = "groups",
+    feature = "oauth",
+    feature = "lobbies",
+    feature = "matchmaking",
+    feature = "files"
+))]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
 

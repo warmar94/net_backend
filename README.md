@@ -23,10 +23,12 @@ Your client (Rust)                          Your server (Rust binary)
 │        │                    │             │        │                      │
 │ HTTP + WebSocket client ────┼─ HTTP / WS ▶│ net_backend_server            │
 │  · Rust: net_backend_client │             │  core: auth, sessions, WS hub │
-│  · Bevy: bevy_net_backend   │             │  modules: storage, chat       │
-│  · Other: any HTTP/WS lib   │             └───────────────────────────────┘
-└─────────────────────────────┘                                ▲
-           ▲                                                   │
+│  · Bevy: bevy_net_backend   │             │  modules: storage, chat,      │
+│  · Other: any HTTP/WS lib   │             │  leaderboards, notifications, │
+└─────────────────────────────┘             │  friends, groups, oauth,      │
+                                            │  lobbies, matchmaking, files  │
+           ▲                                └───────────────────────────────┘
+           │                                                   ▲
            └──── net_backend_protocol (shared message types) ──┘
 
 Not Rust? Use the HTTP / WebSocket API directly (see API.md).
@@ -40,13 +42,24 @@ With [Rust](https://rustup.rs) installed, the same commands in PowerShell, cmd, 
 cargo install net_backend
 net-backend new mygame
 cd mygame
-cargo run              # the server on http://127.0.0.1:8080: accounts, saves, chat on SQLite
-cargo run -p client    # in a second terminal: a client that logs in, saves and chats
+cargo run              # the server on http://127.0.0.1:8080, on SQLite
+cargo run -p demo      # in a second terminal: the demo window, a panel per module
 ```
 
-`net-backend new` writes a workspace with the server, the client, a development `config.toml`, a
+In a terminal, `net-backend new` asks how your game talks to the server (Rust client, Bevy plugin,
+your own client, pure API), the database (SQLite, PostgreSQL, MySQL), the server modules (accounts,
+saves, chat, leaderboards, notifications, friends, groups, OpenID Connect logins, lobbies,
+matchmaking, files; all but OpenID Connect ticked), whether to add a demo app and whether to start
+it. Every question is a flag, and it prints the one-line command that writes the same project:
+
+```text
+net-backend new mygame --client rust --db sqlite --modules auth,storage,chat,leaderboards --demo --run
+```
+
+The project is a workspace with the server, the client, the demo, a development `config.toml`, a
 `Dockerfile` and a `compose.yaml`; `net-backend new-server` and `net-backend new-client` write one
-side alone. The [`net_backend` README](crates/net_backend/README.md) describes the generated files.
+side alone. The [`net_backend` README](crates/net_backend/README.md) describes the questions, the
+flags and the generated files.
 
 Without the generator, add the framework to your own project (here with SQLite and the storage and
 chat modules):
@@ -63,10 +76,10 @@ database features, the configuration, the modules).
 
 | Crate | What | Version |
 |---|---|---|
-| [`net_backend_server`](crates/net_backend_server/README.md) | The game-backend framework: tokio + axum, modules with hooks, accounts and sessions, a WebSocket hub, storage (saves) and chat, MySQL / PostgreSQL / SQLite, migrations, OpenAPI + AsyncAPI. A library you build your own server binary with. | 0.1.1 · [crates.io](https://crates.io/crates/net_backend_server) · [docs](https://docs.rs/net_backend_server) |
-| [`net_backend_protocol`](crates/net_backend_protocol/README.md) | The shared message types: plain Rust + serde data types and pure helpers. Used by the server and by Rust clients. | 0.1.1 · [crates.io](https://crates.io/crates/net_backend_protocol) · [docs](https://docs.rs/net_backend_protocol) |
-| [`net_backend_client`](crates/net_backend_client/README.md) | A small Rust client for apps that do not use Bevy, built on the protocol. | 0.1.1 · [crates.io](https://crates.io/crates/net_backend_client) · [docs](https://docs.rs/net_backend_client) |
-| [`net_backend`](crates/net_backend/README.md) | The project generator: the `net-backend` command (`new`, `new-server`, `new-client`) writes a server and a client that run at once. Its version is the version of the crates it generates for. | 0.1.1 · [crates.io](https://crates.io/crates/net_backend) |
+| [`net_backend_server`](crates/net_backend_server/README.md) | The game-backend framework: tokio + axum, accounts and sessions, a WebSocket hub, modules with hooks (storage, chat, leaderboards, notifications, friends, groups, lobbies, matchmaking, files, OpenID Connect logins), MySQL / PostgreSQL / SQLite, migrations, OpenAPI + AsyncAPI. A library you build your own server binary with. | 0.2.0 · [crates.io](https://crates.io/crates/net_backend_server) · [docs](https://docs.rs/net_backend_server) |
+| [`net_backend_protocol`](crates/net_backend_protocol/README.md) | The shared message types: plain Rust + serde data types and pure helpers. Used by the server and by Rust clients. | 0.2.0 · [crates.io](https://crates.io/crates/net_backend_protocol) · [docs](https://docs.rs/net_backend_protocol) |
+| [`net_backend_client`](crates/net_backend_client/README.md) | A small Rust client for apps that do not use Bevy, built on the protocol. | 0.2.0 · [crates.io](https://crates.io/crates/net_backend_client) · [docs](https://docs.rs/net_backend_client) |
+| [`net_backend`](crates/net_backend/README.md) | The project generator: the `net-backend` command (`new`, `new-server`, `new-client`) writes a server and a client that run at once. Its version is the version of the crates it generates for. | 0.2.0 · [crates.io](https://crates.io/crates/net_backend) |
 
 Each crate has its own version, changelog and README (the full manual).
 
@@ -78,7 +91,7 @@ The server does not care which client connects; the JSON on the wire is the cont
 |---|---|
 | a **Rust** app (tool, bot, CLI, other engine) | [`net_backend_client`](crates/net_backend_client/README.md) for the connection (HTTP, WebSocket, SSH / SFTP) + [`net_backend_protocol`](crates/net_backend_protocol/README.md) for the message types. |
 | a **Bevy** game | [`bevy_net_backend`](https://github.com/warmar94/bevy_net_backend) for the connection (HTTP, WebSocket, SSH / SFTP) + [`net_backend_protocol`](crates/net_backend_protocol/README.md) for the message types. |
-| **other** | [`net_backend_protocol`](crates/net_backend_protocol/README.md) + any HTTP / WebSocket library (for example reqwest, ureq, tokio-tungstenite). |
+| **other Rust** code | [`net_backend_protocol`](crates/net_backend_protocol/README.md) + any HTTP / WebSocket library (for example reqwest, ureq, tokio-tungstenite). |
 | **not Rust** (C#, GDScript, JavaScript, …) | The API directly: [API.md](API.md) is the complete HTTP + WebSocket reference with examples; the server's OpenAPI document describes every HTTP route and can generate typed clients; its AsyncAPI document (`/v1/asyncapi.json`) and README describe every WebSocket frame. |
 
 ## Repository layout
@@ -101,7 +114,8 @@ its own version and tags named `<crate>-X.Y.Z`.
 cargo test -p net_backend_protocol
 cargo test -p net_backend_server --no-default-features --features sqlite
 cargo test -p e2e_tests          # the server driven by bevy_net_backend in a headless app
-cargo test -p net_backend -- --include-ignored --skip published   # the generator, then its projects built and run
+cargo test -p net_backend                         # the generator
+cargo test -p net_backend --test e2e -- --ignored  # its projects built and run
 ```
 
 ## Deployment

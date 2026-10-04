@@ -1,17 +1,22 @@
 # The configuration baked into the image (/etc/net-backend/config.toml): a complete server with no
 # setup at all, for trying it on one machine.
 #
-#   docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/warmar94/net_backend_server:0.1
+#   docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/warmar94/net_backend_server:0.2
 #
 # SQLite in /data (add `-v nbs-data:/data` to keep it), migrations applied on start, accounts,
-# storage and chat with a `world` room. The Compose files replace this file with their own
-# production configuration.
+# storage, chat with a `world` room, a `highscore` leaderboard, notifications, friends, groups, the
+# OpenID Connect module (no provider configured), lobbies, matchmaking with a `duel` queue and
+# players' files in /data/files. The Compose files replace this file with their own production
+# configuration.
 
 [server]
 bind = "0.0.0.0:8080"
 
 [database]
 url = "sqlite:/data/nbs.db"
+# "normal": a power loss can lose the last moments of writes, never corrupts the file;
+# "full": every commit waits for the disk (far fewer writes per second).
+sqlite_synchronous = "normal"
 migrate_on_start = true
 migrations_dir = "/data/migrations"
 
@@ -30,3 +35,27 @@ app_name = "My Game"
 key = "world"
 name = "World"
 max_members = 200
+
+[modules.leaderboards]
+
+[[modules.leaderboards.boards]]
+key = "highscore"
+name = "High score"
+
+[modules.notifications]
+
+[modules.friends]
+
+[modules.groups]
+
+[modules.oauth]
+
+[modules.lobbies]
+
+[modules.matchmaking]
+[[modules.matchmaking.queues]]
+key = "duel"
+players = 2
+
+[modules.files]
+dir = "/data/files"

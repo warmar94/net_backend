@@ -145,15 +145,29 @@ pub enum DbError {
     },
 }
 
+/// MySQL's `Duplicate entry '<value>' for key '<index>'` without the value.
+fn hide_duplicate_value(message: &str) -> String {
+    if let Some(rest) = message.strip_prefix("Duplicate entry '") {
+        if let Some(at) = rest.rfind("' for key") {
+            return format!("Duplicate entry '<hidden>{}", &rest[at..]);
+        }
+    }
+    message.to_string()
+}
+
 impl DbError {
     /// A one-line description for operators: for a database error the server's message and code
-    /// (SQLSTATE / MySQL error number), without the driver's decorations.
+    /// (SQLSTATE / MySQL error number), without the driver's decorations. MySQL's duplicate-key
+    /// message names the duplicate value (an email address, a name): it is replaced by `<hidden>`.
     pub fn describe(&self) -> String {
         match self {
-            DbError::Sqlx(sqlx::Error::Database(e)) => match e.code() {
-                Some(code) => format!("{} (code {code})", e.message()),
-                None => e.message().to_string(),
-            },
+            DbError::Sqlx(sqlx::Error::Database(e)) => {
+                let message = hide_duplicate_value(e.message());
+                match e.code() {
+                    Some(code) => format!("{message} (code {code})"),
+                    None => message,
+                }
+            }
             other => other.to_string(),
         }
     }
@@ -426,6 +440,23 @@ pub(crate) fn check_values(values: &sea_query::Values) -> Result<(), DbError> {
     Ok(())
 }
 
+/// `database.statement_timeout_secs` on a new MySQL / MariaDB connection: MySQL's
+/// `max_execution_time` (milliseconds; read-only `SELECT`s), else MariaDB's `max_statement_time`
+/// (seconds; every statement).
+#[cfg(feature = "mysql")]
+async fn mysql_statement_timeout(conn: &mut sqlx::MySqlConnection, secs: u64) -> Result<(), sqlx::Error> {
+    // Only a number goes into the text.
+    let mysql = format!("SET SESSION max_execution_time = {}", secs.saturating_mul(1000));
+    match sqlx::raw_sql(sqlx::AssertSqlSafe(mysql)).execute(&mut *conn).await {
+        Ok(_) => Ok(()),
+        Err(sqlx::Error::Database(_)) => {
+            let mariadb = format!("SET SESSION max_statement_time = {secs}");
+            sqlx::raw_sql(sqlx::AssertSqlSafe(mariadb)).execute(&mut *conn).await.map(|_| ())
+        }
+        Err(other) => Err(other),
+    }
+}
+
 /// Opens one plain connection with the pool's options (an honest first error; probes).
 #[allow(unused_macros)]
 macro_rules! direct_connection {
@@ -453,6 +484,9 @@ impl Db {
                     .max_connections(config.max_connections.max(1))
                     .min_connections(config.min_connections)
                     .acquire_timeout(acquire);
+                let limit = config.statement_timeout_secs;
+                let pool =
+                    if limit > 0 { pool.after_connect(move |conn, _| Box::pin(async move { mysql_statement_timeout(conn, limit).await })) } else { pool };
                 if !config.connect_lazy {
                     // One plain connection first: the pool would only report "timed out" for a
                     // refused port or a wrong password.
@@ -464,7 +498,10 @@ impl Db {
             #[cfg(feature = "postgres")]
             Dialect::Postgres => {
                 use std::str::FromStr;
-                let options = sqlx::postgres::PgConnectOptions::from_str(url)?;
+                let mut options = sqlx::postgres::PgConnectOptions::from_str(url)?;
+                if config.statement_timeout_secs > 0 {
+                    options = options.options([("statement_timeout", format!("{}s", config.statement_timeout_secs))]);
+                }
                 let pool = sqlx::postgres::PgPoolOptions::new()
                     .max_connections(config.max_connections.max(1))
                     .min_connections(config.min_connections)
@@ -479,8 +516,16 @@ impl Db {
             Dialect::Sqlite => {
                 use std::str::FromStr;
                 let in_memory = url.contains(":memory:") || url.contains("mode=memory");
-                let mut options =
-                    sqlx::sqlite::SqliteConnectOptions::from_str(url)?.create_if_missing(true).foreign_keys(true).busy_timeout(Duration::from_secs(5));
+                // One setting for both waits: a free pooled connection, and SQLite's write lock.
+                let synchronous = match config.sqlite_synchronous {
+                    crate::config::SqliteSynchronous::Full => sqlx::sqlite::SqliteSynchronous::Full,
+                    crate::config::SqliteSynchronous::Normal => sqlx::sqlite::SqliteSynchronous::Normal,
+                };
+                let mut options = sqlx::sqlite::SqliteConnectOptions::from_str(url)?
+                    .create_if_missing(true)
+                    .foreign_keys(true)
+                    .busy_timeout(acquire)
+                    .synchronous(synchronous);
                 let mut pool = sqlx::sqlite::SqlitePoolOptions::new().acquire_timeout(acquire);
                 if in_memory {
                     // Every connection to `:memory:` is its own empty database: keep exactly one,
@@ -1048,6 +1093,16 @@ impl DbTx {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicate_values_are_hidden() {
+        assert_eq!(
+            hide_duplicate_value("Duplicate entry 'ada@example.com' for key 'auth_users.email_normalized'"),
+            "Duplicate entry '<hidden>' for key 'auth_users.email_normalized'"
+        );
+        assert_eq!(hide_duplicate_value("Duplicate entry 'it' for key 's' for key 'k'"), "Duplicate entry '<hidden>' for key 'k'");
+        assert_eq!(hide_duplicate_value("UNIQUE constraint failed: auth_users.email"), "UNIQUE constraint failed: auth_users.email");
+    }
 
     #[test]
     fn dialects() {

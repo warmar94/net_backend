@@ -1,6 +1,6 @@
 //! Portable column types for framework and module tables, built with sea-query's schema builder.
 //!
-//! The rule (owner decision): ids are `BIGINT` (auto-increment primary keys), timestamps are
+//! The rule: ids are `BIGINT` (auto-increment primary keys), timestamps are
 //! `BIGINT` unix milliseconds ([`UnixMillis`](net_backend_protocol::UnixMillis)), JSON and binary
 //! payloads are bytes (`LONGBLOB` / `BYTEA` / `BLOB`), strings are `VARCHAR(n)` (`utf8mb4` with the
 //! case-sensitive `utf8mb4_bin` collation on MySQL, see [`render_table`]). No native timestamp, JSON or enum types: the same row decodes the same way everywhere.

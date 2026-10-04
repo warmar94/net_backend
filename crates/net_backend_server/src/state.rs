@@ -19,6 +19,7 @@ use crate::config::Config;
 use crate::db::Db;
 use crate::hooks::Hooks;
 use crate::http::client_ip::IpNet;
+use crate::http::routes::Readiness;
 use crate::shutdown::Shutdown;
 use crate::ws::Hub;
 
@@ -95,6 +96,7 @@ struct Inner {
     shutdown: Shutdown,
     trusted_proxies: Vec<IpNet>,
     ws: Hub,
+    readiness: Readiness,
 }
 
 /// The shared state. Cheap to clone.
@@ -120,7 +122,7 @@ impl AppState {
         ws: Hub,
     ) -> Self {
         let trusted_proxies = config.http.trusted_proxies.iter().filter_map(|p| IpNet::parse(p)).collect();
-        Self(Arc::new(Inner { config, db, clock, hooks, extensions, modules, shutdown, trusted_proxies, ws }))
+        Self(Arc::new(Inner { config, db, clock, hooks, extensions, modules, shutdown, trusted_proxies, ws, readiness: Readiness::default() }))
     }
 
     /// The configuration.
@@ -171,6 +173,11 @@ impl AppState {
     /// The shutdown signal (background tasks wait on it; `/readyz` reports 503 once it fired).
     pub fn shutdown(&self) -> &Shutdown {
         &self.0.shutdown
+    }
+
+    /// The cached readiness probe of `/readyz`.
+    pub(crate) fn readiness(&self) -> &Readiness {
+        &self.0.readiness
     }
 }
 

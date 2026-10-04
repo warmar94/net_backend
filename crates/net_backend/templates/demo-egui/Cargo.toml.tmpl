@@ -1,0 +1,21 @@
+[package]
+name = "{{package}}"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+# Steam (`cargo run -p demo --features steam`, Steam running): a Steam panel through steamworks
+# (Steam friends who play here, "Join Game" and invites for a lobby, joins from Steam). Off by
+# default: without it nothing of Steam is built or linked.
+steam = ["dep:steamworks"]
+
+[dependencies]
+# The Rust client with the WebSocket (feature `ws`); its blocking interface fits a UI loop.
+net_backend_client = { version = "{{version}}", features = ["ws"] }
+# A small window: egui through eframe on OpenGL (glow).
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+serde_json = "1"
+# The Steam SDK (feature `steam`); its redistributable library is linked at start-up. The raw
+# bindings: the demo's guards against steamworks' panics when Steam quits (`src/steam.rs`).
+steamworks = { version = "=0.12.2", features = ["raw-bindings"], optional = true }

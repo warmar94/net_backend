@@ -6,8 +6,8 @@
 //! keep 16 reads of 64 KiB in flight (at most 1 MiB asked for or waiting to be written, whatever
 //! the file size) and write them in file order; uploads keep 16 writes of 32 KiB in flight. A
 //! download whose remote file ends before the size the server reported when it was opened fails
-//! with [`Error::Ssh`] ("… changed size during the download", with the expected and the received
-//! byte counts), and a download to a file then leaves no file; a file that reports a size of 0, or
+//! with [`Error::Ssh`] ("SFTP: the remote file was cut short during the download (expected N
+//! bytes, its size when it was opened; received M)"), and a download to a file then leaves no file; a file that reports a size of 0, or
 //! none, is read to its end. Transfers report their progress ([`SftpTask`]). The remote file handle is closed after every
 //! transfer, also one that was cancelled or timed out. Local file I/O runs on tokio's blocking
 //! pool. Remote paths are the server's (relative paths start in the login directory).
@@ -368,10 +368,24 @@ impl SshSession {
                 Race::Done(Err(error)) => return Err(error),
                 Race::TimedOut | Race::Cancelled => return Err(Error::timeout(format!("not sent: not connected within {timeout:?}"), Some(false))),
             };
-            let session = sftp_session(&link, timeout).await;
-            let result = match session {
-                Ok(session) => work(session, max).await,
-                Err(error) => Err(error),
+            // A lost connection ends the operation at once. Requests in flight on a dead SFTP
+            // channel are not always answered (russh-sftp can keep a request sent while its
+            // channel was closing until the request timeout), so the link is watched too.
+            let working = AtomicBool::new(false);
+            let operation = async {
+                match sftp_session(&link, timeout).await {
+                    Ok(session) => {
+                        working.store(true, Ordering::Relaxed);
+                        work(session, max).await
+                    }
+                    Err(error) => Err(error),
+                }
+            };
+            let result = tokio::select! {
+                biased;
+                result = operation => result,
+                // Lost before the operation's first request: never sent.
+                () = link.gone() => Err(Error::disconnected(CHANNEL_LOST, (!working.load(Ordering::Relaxed)).then_some(false))),
             };
             match result {
                 Err(Error::Disconnected { sent, .. }) => {
@@ -863,7 +877,7 @@ async fn read_pipelined<R: ReadAt>(
     match end {
         Some(end) if end == written => match total {
             Some(total) if total > 0 && written < total => Err(Error::Ssh(format!(
-                "SFTP: the remote file changed size during the download (expected {total} bytes, its size when it was opened; received {written})"
+                "SFTP: the remote file was cut short during the download (expected {total} bytes, its size when it was opened; received {written})"
             ))),
             _ => Ok((written, peak)),
         },
@@ -1225,7 +1239,7 @@ mod tests {
                 } else {
                     let expected = format!("expected {} bytes, its size when it was opened; received 300000", total.unwrap_or(0));
                     assert!(
-                        matches!(&result, Err(Error::Ssh(why)) if why.contains("changed size during the download") && why.contains(&expected)),
+                        matches!(&result, Err(Error::Ssh(why)) if why.starts_with("SFTP: the remote file was cut short during the download (") && why.contains(&expected)),
                         "{result:?}"
                     );
                 }

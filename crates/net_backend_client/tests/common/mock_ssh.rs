@@ -3,8 +3,9 @@
 //! `fail` (exit 3), `sleep <ms>`, `hang`, `flood <bytes>`, `cat` (echoes stdin), `signal`, `refuse`),
 //! and SFTP works on an in-memory file system. Keys are generated at runtime; none is in the repository.
 //! Test controls: `drop_connections` (every open connection is cut, like a lost network),
-//! `set_refuse_logins`, and the SFTP options of `MockOptions` (short reads, a failing read offset, a
-//! delay per read); `Stats::sftp_handles` counts the SFTP handles open right now.
+//! `set_refuse_logins`, `hold_reads_from` (SFTP reads from an offset on wait until released), and
+//! the SFTP options of `MockOptions` (short reads, a failing read offset, a delay per read);
+//! `Stats::sftp_handles` counts the SFTP handles open right now.
 #![allow(dead_code)]
 
 use std::collections::HashMap;
@@ -80,6 +81,34 @@ pub struct Stats {
     /// SFTP file / directory handles open right now (opened and not closed by the client; handles
     /// of an SFTP session that ended are gone with it).
     pub sftp_handles: AtomicUsize,
+    /// SFTP reads at or after this offset wait until released (`hold_reads_from`); stored plus
+    /// one, 0 = no hold.
+    hold_reads: std::sync::atomic::AtomicU64,
+    /// Wakes held reads when the hold changes.
+    reads_released: tokio::sync::Notify,
+}
+
+impl Stats {
+    /// Whether a read at `offset` waits now.
+    fn holds(&self, offset: u64) -> bool {
+        match self.hold_reads.load(Ordering::SeqCst) {
+            0 => false,
+            from => offset >= from - 1,
+        }
+    }
+
+    /// Wait until a read at `offset` may be answered.
+    async fn read_gate(&self, offset: u64) {
+        loop {
+            let released = self.reads_released.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+            if !self.holds(offset) {
+                return;
+            }
+            released.await;
+        }
+    }
 }
 
 /// How a test mock behaves (all off by default: key login only, strict key exchange, the default
@@ -253,6 +282,13 @@ impl MockSshServer {
     /// What it saw.
     pub fn stats(&self) -> &Stats {
         &self.stats
+    }
+
+    /// SFTP reads at or after `offset` wait (unanswered) until the hold is lifted with `None` or
+    /// moved past them; a test controls exactly how far a download gets (no timing).
+    pub fn hold_reads_from(&self, offset: Option<u64>) {
+        self.stats.hold_reads.store(offset.map_or(0, |o| o.saturating_add(1)), Ordering::SeqCst);
+        self.stats.reads_released.notify_waiters();
     }
 
     /// Cut every open connection (the TCP sockets close, as after a lost network). New
@@ -796,6 +832,7 @@ mod sftp {
         }
 
         async fn read(&mut self, id: u32, handle: String, offset: u64, len: u32) -> Result<Data, Self::Error> {
+            self.stats.read_gate(offset).await;
             if let Some(delay) = self.behaviour.read_delay {
                 tokio::time::sleep(delay).await;
             }

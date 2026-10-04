@@ -1,5 +1,6 @@
 //! The real `net_backend_server` on loopback for the client's tests: SQLite in memory, Auth +
-//! Storage + Chat, a manual clock (tests move the server's time to expire tokens), an echo request
+//! Storage + Chat + Leaderboards + Notifications + Friends + Groups + OAuth + Lobbies + Matchmaking (a `duel` queue) + Files, Steam login
+//! through a fake verifier ([`STEAM_IDENTITY`], tickets from [`steam_ticket`]; no network), a manual clock (tests move the server's time to expire tokens), an echo request
 //! and a slow request. It runs on its own thread with its own runtime, so async and blocking tests
 //! can use it alike. Bounded: every wait in the tests has ONE overall deadline.
 #![allow(dead_code)]
@@ -9,14 +10,39 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use net_backend_client::protocol::{CloseCode, ServerPush, UnixMillis, UserId, WsCall};
+use net_backend_server::auth::steam::{FakeSteamVerifier, SteamIdentity};
 use net_backend_server::auth::{Auth, AuthConfig, AuthService};
 use net_backend_server::chat::{Chat, ChatConfig, RoomSpec};
+use net_backend_server::files::{Files, FilesConfig};
+use net_backend_server::friends::Friends;
+use net_backend_server::groups::Groups;
+use net_backend_server::leaderboards::{BoardSpec, Leaderboards, LeaderboardsConfig};
+use net_backend_server::lobbies::Lobbies;
 use net_backend_server::mail::MemoryMailer;
+use net_backend_server::matchmaking::{Matchmaking, MatchmakingConfig, QueueSpec};
+use net_backend_server::notifications::{NewNotification, NotificationService, Notifications};
+use net_backend_server::oauth::{OAuth, OAuthConfig};
 use net_backend_server::protocol::admin::BanRequest;
 use net_backend_server::storage::{Storage, StorageConfig};
 use net_backend_server::{AppState, Config, ManualClock, NetBackendServer, SecretString};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
+
+/// The identity string of the test servers' Steam login.
+pub const STEAM_IDENTITY: &str = "client-tests";
+
+/// An obviously made-up SteamID64 (account numbers above 4 000 000 000).
+pub const fn steam_id(n: u64) -> u64 {
+    76_561_197_960_265_728 + 4_000_000_000 + n
+}
+
+/// The ticket the test servers' fake Steam verifier accepts for `steam_id(n)` (n = 1 to 8).
+pub fn steam_ticket(n: u64) -> String {
+    format!("0b{n:02x}")
+}
+
+/// Numbers the test servers' file folders.
+static FILES_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// A password every test account uses.
 pub const PASSWORD: &str = "correct horse battery";
@@ -71,6 +97,10 @@ pub struct Setup {
     pub config: Config,
     pub auth: AuthConfig,
     pub storage: StorageConfig,
+    /// The OpenID Connect module's settings (no providers by default).
+    pub oauth: OAuthConfig,
+    /// The files module's settings (a folder under `target/tmp`).
+    pub files: FilesConfig,
 }
 
 pub struct Server {
@@ -108,16 +138,44 @@ impl Server {
                 auth.argon2_iterations = 1;
                 auth.purge_interval_secs = 0;
                 auth.rate_limits = false;
-                let mut setup = Setup { config, auth, storage: StorageConfig::default() };
+                auth.steam_identity = Some(STEAM_IDENTITY.into());
+                let mut files = FilesConfig::default();
+                files.dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("target").join("tmp").join(format!(
+                    "client-files-{}-{}",
+                    std::process::id(),
+                    FILES_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                ));
+                files.upload_rate = 0;
+                let mut setup = Setup { config, auth, storage: StorageConfig::default(), oauth: OAuthConfig::default(), files };
                 tweak(&mut setup);
                 let mut chat = ChatConfig::default();
                 chat.rooms = vec![RoomSpec::new("world").with_name("World")];
+                let mut boards = LeaderboardsConfig::default();
+                boards.boards = vec![BoardSpec::new("highscore").with_name("High score")];
                 let clock = Arc::new(ManualClock::new(UnixMillis::now()));
                 let prepared = NetBackendServer::new(setup.config)
                     .clock(Arc::clone(&clock))
-                    .module(Auth::new().with_config(setup.auth).mailer(MemoryMailer::new()))
+                    .module(Auth::new().with_config(setup.auth).mailer(MemoryMailer::new()).steam_verifier({
+                        let steam = FakeSteamVerifier::new(STEAM_IDENTITY);
+                        for n in 1..=8 {
+                            steam.add_ticket(steam_ticket(n), SteamIdentity::new(steam_id(n)));
+                        }
+                        steam
+                    }))
                     .module(Storage::new().with_config(setup.storage))
                     .module(Chat::new().with_config(chat))
+                    .module(Leaderboards::new().with_config(boards))
+                    .module(Notifications::new())
+                    .module(Friends::new())
+                    .module(Groups::new())
+                    .module(OAuth::new().with_config(setup.oauth))
+                    .module(Files::new().with_config(setup.files))
+                    .module(Lobbies::new())
+                    .module(Matchmaking::new().with_config({
+                        let mut matchmaking = MatchmakingConfig::default().with_queue(QueueSpec::new("duel", 2));
+                        matchmaking.interval_ms = 50;
+                        matchmaking
+                    }))
                     .ws_call::<Echo, _, _>(|ctx, echo: Echo| async move { Ok(Echoed { text: echo.text, user: ctx.auth.user_id.get() }) })
                     .ws_call::<Slow, _, _>(|_ctx, slow: Slow| async move {
                         SLOW_STARTED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -170,6 +228,16 @@ impl Server {
             let service = state.get::<AuthService>().expect("auth");
             service.ban_user(&state, user, BanRequest::new()).await.expect("ban");
         });
+    }
+
+    /// Send a notification as server code; its id.
+    pub fn notify(&self, user: UserId, kind: &str) -> i64 {
+        let state = self.state.clone();
+        let kind = kind.to_string();
+        self.run(async move {
+            let service = state.get::<NotificationService>().expect("notifications");
+            service.send(&state, user, NewNotification::new(kind).with_text("hello")).await.expect("send").id.get()
+        })
     }
 
     pub fn push(&self, user: UserId, note: Note) {

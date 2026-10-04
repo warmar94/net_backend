@@ -1,0 +1,11 @@
+[package]
+name = "{{package}}"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# The message types of the server (routes, requests, answers, WebSocket frames, error codes):
+# plain Rust + serde, no network. Add the HTTP / WebSocket library of your choice.
+net_backend_protocol = "{{version}}"
+serde_json = "1"

@@ -29,6 +29,8 @@ use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
+use tokio_tungstenite::tungstenite::protocol::frame::Frame;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
@@ -79,6 +81,9 @@ struct Probe {
     published: AtomicUsize,
 }
 
+/// How often `FlakyAuth` was asked about `Bearer counted`.
+static COUNTED: AtomicUsize = AtomicUsize::new(0);
+
 /// `Bearer flaky`: a temporary failure (the database is down); every other token: not mine.
 struct FlakyAuth;
 
@@ -87,6 +92,10 @@ impl Authenticator for FlakyAuth {
         Box::pin(async move {
             match parts.headers.get("authorization").and_then(|v| v.to_str().ok()) {
                 Some("Bearer flaky") => Err(AppError::unavailable("the database is restarting")),
+                Some("Bearer counted") => {
+                    COUNTED.fetch_add(1, Ordering::SeqCst);
+                    Ok(None)
+                }
                 _ => Ok(None),
             }
         })
@@ -938,7 +947,7 @@ async fn oversized_pushes_are_refused() {
 }
 
 /// S3: a ban landing while the socket authenticates (slow hook, no revocation poll) still closes it;
-/// a first-message `auth` is answered `auth.failed` `banned`, never `auth.ok` (0.1.1).
+/// a first-message `auth` is answered `auth.failed` `banned`, never `auth.ok`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bans_during_authentication_are_applied() {
     let mut auth = cheap_auth();
@@ -989,7 +998,7 @@ async fn bans_during_authentication_are_applied() {
     server.stop().await;
 }
 
-/// 0.1.1 review S2: a token checked longer ago than the hub's revocation memory (a slow connect
+/// Review S2: a token checked longer ago than the hub's revocation memory (a slow connect
 /// hook), or before a revocation the full memory evicted, is checked again before its socket is
 /// registered: a ban that landed meanwhile is never answered `auth.ok`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1158,5 +1167,68 @@ async fn rate_limited_auth_is_answered() {
     send(&mut ws, auth_frame(&token)).await;
     assert_eq!(recv(&mut ws).await["type"], "auth.ok");
     assert_eq!(recv(&mut ws).await["type"], "auth.ok");
+    server.stop().await;
+}
+
+/// NIT1: pongs count against the frame rate; a pong flood is closed with 1008.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pong_floods_are_closed() {
+    let server = start(|config| {
+        config.ws.frames_per_second = 1;
+        config.ws.frame_burst = 3;
+    })
+    .await;
+    let (_, token) = server.register("pongs@example.com").await;
+    let mut ws = connect(server.addr, Some(&token)).await;
+    for _ in 0..40 {
+        if ws.send(Message::Pong(b"p".to_vec().into())).await.is_err() {
+            break;
+        }
+    }
+    assert_eq!(close_code(&mut ws).await, Some(1008));
+    server.stop().await;
+}
+
+/// SF4: before `auth` a socket may send 16 KiB at most (close 1009 above); after `auth.ok` (first
+/// message or handshake) the limit is `ws.max_message_bytes`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_pre_auth_message_limit_is_small() {
+    let server = start(|config| config.ws.max_message_bytes = 256 * 1024).await;
+    let (_, token) = server.register("preauth@example.com").await;
+    let big = "y".repeat(20 * 1024);
+    // Anonymous: 20 KiB is refused.
+    let mut anonymous = connect(server.addr, None).await;
+    let _ = anonymous.send(Message::text(json!({"id": 1, "type": "test.echo", "data": big}).to_string())).await;
+    assert_eq!(close_code(&mut anonymous).await, Some(1009));
+    // In several frames too.
+    let mut fragmented = connect(server.addr, None).await;
+    let text = json!({"id": 1, "type": "test.echo", "data": big}).to_string();
+    let (a, b) = text.split_at(text.len() / 2);
+    let _ = fragmented.send(Message::Frame(Frame::message(a.as_bytes().to_vec(), OpCode::Data(Data::Text), false))).await;
+    let _ = fragmented.send(Message::Frame(Frame::message(b.as_bytes().to_vec(), OpCode::Data(Data::Continue), true))).await;
+    assert_eq!(close_code(&mut fragmented).await, Some(1009));
+    // First-message auth, then 20 KiB passes.
+    let mut first = connect(server.addr, None).await;
+    send(&mut first, auth_frame(&token)).await;
+    assert_eq!(recv(&mut first).await["type"], "auth.ok");
+    assert_eq!(call(&mut first, 2, "test.echo", json!(big)).await["data"], json!(big));
+    // Authenticated by the handshake: 20 KiB passes at once.
+    let mut header = connect(server.addr, Some(&token)).await;
+    assert_eq!(call(&mut header, 3, "test.echo", json!(big)).await["data"], json!(big));
+    server.stop().await;
+}
+
+/// NIT4: the per-address handshake limit applies before the authenticators look at the token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_handshake_limit_comes_before_the_authenticators() {
+    let server = start(|config| config.ws.handshakes_per_ip_per_minute = 2).await;
+    let before = COUNTED.load(Ordering::SeqCst);
+    for _ in 0..2 {
+        assert_eq!(refused(server.addr, Some("counted"), &[]).await.0, 401);
+    }
+    assert_eq!(COUNTED.load(Ordering::SeqCst), before + 2);
+    let (status, body) = refused(server.addr, Some("counted"), &[]).await;
+    assert_eq!((status, body["error"]["code"].as_str()), (429, Some(codes::RATE_LIMITED)));
+    assert_eq!(COUNTED.load(Ordering::SeqCst), before + 2, "the third handshake never reached the authenticators");
     server.stop().await;
 }

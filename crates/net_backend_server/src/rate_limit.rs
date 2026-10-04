@@ -137,6 +137,24 @@ impl<K: Hash + Eq + Clone> KeyedBuckets<K> {
         self.peek_at(key, self.now_ms())
     }
 
+    /// Give back one token taken for `key` (e.g. a failure counted up front that did not happen).
+    pub fn refund(&self, key: &K) {
+        self.refund_at(key, self.now_ms());
+    }
+
+    /// [`refund`](Self::refund) at an explicit time in milliseconds (tests).
+    pub fn refund_at(&self, key: &K, now_ms: u64) {
+        let mut map = self.lock();
+        if let Some(bucket) = map.get_mut(key) {
+            let tokens = self.refilled(*bucket, now_ms) + 1.0;
+            if tokens >= self.burst {
+                map.remove(key);
+            } else {
+                *bucket = Bucket { tokens, last_ms: now_ms.max(bucket.last_ms) };
+            }
+        }
+    }
+
     /// Forget `key` (its bucket is full again).
     pub fn reset(&self, key: &K) {
         self.lock().remove(key);
@@ -440,6 +458,14 @@ mod tests {
         buckets.reset(&"a");
         assert!(buckets.check_at("a", 5000).is_allow());
         assert!(buckets.check_at("a", 5000).is_allow());
+        // A refunded token is back; a full bucket is forgotten.
+        assert!(!buckets.peek_at(&"a", 5000).is_allow());
+        buckets.refund_at(&"a", 5000);
+        assert!(buckets.peek_at(&"a", 5000).is_allow());
+        let held = buckets.len();
+        buckets.refund_at(&"a", 5000);
+        assert_eq!(buckets.len(), held - 1, "full again: forgotten");
+        buckets.refund_at(&"never", 0);
     }
 
     #[test]

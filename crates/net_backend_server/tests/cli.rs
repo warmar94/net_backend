@@ -304,7 +304,7 @@ async fn app_commands() {
     assert!(out.contains("Check that the running server is ready"), "{out}");
 }
 
-/// `healthcheck` (0.1.1): exit 0 while the running server's `/readyz` answers 200 (also with an
+/// `healthcheck`: exit 0 while the running server's `/readyz` answers 200 (also with an
 /// unspecified bind address, which means loopback), an error otherwise; no database contact.
 #[cfg(feature = "sqlite")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -356,7 +356,7 @@ async fn healthcheck_asks_readyz() {
     assert!(matches!(&result, Err(Error::Cli(m)) if m.contains("503")), "{result:?}");
 }
 
-/// 0.1.1 live NIT 3: `--help`, `help`, `<built-in> --help` and `--version` need no configuration
+/// `--help`, `help`, `<built-in> --help` and `--version` need no configuration
 /// and no database (`run_main`); every other command loads the configuration first.
 #[tokio::test]
 async fn help_and_version_need_no_configuration() {

@@ -26,6 +26,9 @@ use crate::Error;
 pub struct Reply<T> {
     receiver: Option<oneshot::Receiver<Result<T, Error>>>,
     cancel: CancelHandle,
+    /// The answer comes from work on a current-thread runtime other than the client's own thread
+    /// (a blocking wait inside such a runtime is refused).
+    on_current_thread: bool,
 }
 
 impl<T> fmt::Debug for Reply<T> {
@@ -35,9 +38,23 @@ impl<T> fmt::Debug for Reply<T> {
 }
 
 impl<T> Reply<T> {
+    /// A reply answered through the sender by work spawned from here (on the current runtime).
     pub(crate) fn channel() -> (oneshot::Sender<Result<T, Error>>, Self) {
+        Self::channel_from(crate::runtime::spawns_on_current_thread_runtime())
+    }
+
+    /// A reply answered through the sender by work that runs on a current-thread runtime other
+    /// than the client's own thread when `on_current_thread` is set.
+    pub(crate) fn channel_from(on_current_thread: bool) -> (oneshot::Sender<Result<T, Error>>, Self) {
         let (sender, receiver) = oneshot::channel();
-        (sender, Self { receiver: Some(receiver), cancel: CancelHandle { hook: None } })
+        (sender, Self { receiver: Some(receiver), cancel: CancelHandle { hook: None }, on_current_thread })
+    }
+
+    /// This reply, answered by work on the client's own runtime thread (every other thread may
+    /// wait for it).
+    pub(crate) fn produced_on_client_thread(mut self) -> Self {
+        self.on_current_thread = false;
+        self
     }
 
     /// A reply that is already answered.
@@ -92,9 +109,20 @@ impl<T> Reply<T> {
 
     /// Block this thread until the answer arrives. Works on any thread (also tokio's
     /// `spawn_blocking` threads); in async code `.await` the reply instead (waiting there stalls that
-    /// worker). Refused (`InvalidRequest`, never a panic) only on the client's own runtime thread.
+    /// thread). Refused with `InvalidRequest` (never a panic, never a hang):
+    /// - on the client's own runtime thread (e.g. inside an SSH prompt responder);
+    /// - inside a current-thread tokio runtime (`flavor = "current_thread"`, a `block_on`) for an
+    ///   unanswered reply of the async [`Client`](crate::Client) whose work runs on a
+    ///   current-thread runtime: that work could not go on while this thread waits. `.await` it.
+    ///
+    /// A reply of the [`blocking::Client`](crate::blocking::Client) (its work runs on its own
+    /// thread) can be waited for anywhere else.
     pub fn wait(mut self) -> Result<T, Error> {
         crate::runtime::refuse_on_client_thread()?;
+        if let Some(answer) = self.try_take() {
+            return answer;
+        }
+        crate::runtime::refuse_wait(self.on_current_thread)?;
         match self.receiver.take() {
             Some(receiver) => crate::runtime::park_on(receiver).unwrap_or(Err(Error::Shutdown)),
             None => Err(Error::invalid("the answer was already taken")),

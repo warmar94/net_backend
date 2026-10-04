@@ -310,6 +310,56 @@ async fn a_failing_start_shuts_down_what_started() {
     assert!(matches!(&result, Err(Error::Startup(m)) if m.contains("start hook 0 failed")), "{result:?}");
 }
 
+/// A module whose shutdown takes `stop` (forever with `None`).
+struct Slow {
+    name: &'static str,
+    stop: Option<Duration>,
+    log: Log,
+}
+
+impl Module for Slow {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn shutdown<'a>(&'a self, _state: &'a AppState) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            match self.stop {
+                Some(time) => tokio::time::sleep(time).await,
+                None => std::future::pending().await,
+            }
+            push(&self.log, format!("shutdown {}", self.name));
+        })
+    }
+}
+
+#[tokio::test]
+async fn modules_shut_down_at_the_same_time_within_one_budget() {
+    let mut config = http_config();
+    config.server.module_shutdown_timeout_secs = 2;
+    let log: Log = Arc::default();
+    let slow = |name, stop| Slow { name, stop, log: log.clone() };
+    let one = Some(Duration::from_millis(1200));
+    let server = NetBackendServer::new(config).module(slow("a", one)).module(slow("b", one)).module(slow("c", one)).module(slow("stuck", None));
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let (stop, stopped) = oneshot::channel::<()>();
+    let running = tokio::spawn(server.serve_with_shutdown(listener, async move {
+        let _ = stopped.await;
+    }));
+    wait_until_up(addr).await;
+    let asked = Instant::now();
+    let _ = stop.send(());
+    let result = tokio::time::timeout(WAIT, running).await.expect("stopped").expect("task");
+    assert!(result.is_ok(), "{result:?}");
+    // One after the other: 3 × 1.2 s + the stuck module's 2 s; at the same time: the 2 s budget.
+    let took = asked.elapsed();
+    assert!(took >= Duration::from_secs(2) && took < Duration::from_millis(3500), "{took:?}");
+    let mut done = lines(&log);
+    done.sort();
+    assert_eq!(done, ["shutdown a", "shutdown b", "shutdown c"]);
+}
+
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn migrate_on_start() {
@@ -340,4 +390,43 @@ async fn migrate_on_start() {
     let db = net_backend_server::Db::connect(&config.database).await.expect("connect");
     db.execute_script("INSERT INTO notes (id, body) VALUES (1, 'x')").await.expect("the table exists");
     db.close().await;
+}
+
+/// Without `migrate_on_start`, `serve` refuses to start while a migration is pending (the error
+/// names it and says to run `migrate`); after `migrate` it serves.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn pending_migrations_stop_serve() {
+    struct Notes;
+    impl Module for Notes {
+        fn name(&self) -> &'static str {
+            "notes"
+        }
+        fn migrations(&self, _dialect: net_backend_server::Dialect) -> Vec<net_backend_server::Migration> {
+            vec![net_backend_server::Migration::new(1, "create_notes", "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)")]
+        }
+    }
+    let dir = common::temp_dir("serve-pending");
+    let url = format!("sqlite:{}", dir.join("game.db").display().to_string().replace('\\', "/"));
+    let mut config = http_config();
+    config.database.url = net_backend_server::SecretString::new(url);
+    config.database.migrate_on_start = false;
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let refused = tokio::time::timeout(WAIT, NetBackendServer::new(config.clone()).module(Notes).serve_with_shutdown(listener, std::future::pending()))
+        .await
+        .expect("refused in time");
+    let message = refused.err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(message.contains("notes 0001_create_notes") && message.contains("`migrate`"), "{message}");
+    let prepared = NetBackendServer::new(config.clone()).module(Notes).build().await.expect("build");
+    prepared.migrate().await.expect("migrate");
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let (stop, stopped) = oneshot::channel::<()>();
+    let running = tokio::spawn(prepared.serve_with_shutdown(listener, async move {
+        let _ = stopped.await;
+    }));
+    wait_until_up(addr).await;
+    let _ = stop.send(());
+    let result = tokio::time::timeout(WAIT, running).await.expect("stopped").expect("task");
+    assert!(result.is_ok(), "{result:?}");
 }

@@ -4,7 +4,10 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use futures_util::future::BoxFuture;
-use net_backend_protocol::chat::{DeleteMessage, ListDirects, ListMessages, ListRooms, OpenDirect};
+use net_backend_protocol::chat::{
+    CreateRoom, DeleteMessage, DeleteRoom, EditMessage, EditRoom, GetRoom, InviteToRoom, JoinChatRoom, KickFromRoom, LeaveChatRoom, ListDirects, ListMessages,
+    ListReceipts, ListRoomMembers, ListRooms, MarkRead, MyRooms, OpenDirect, PublicRooms, SetRoomRole, TransferRoom, UnreadQuery,
+};
 use utoipa_axum::router::OpenApiRouter;
 
 use super::config::ChatConfig;
@@ -17,6 +20,7 @@ use crate::error::Error;
 use crate::hooks::Hooks;
 use crate::migrate::Migration;
 use crate::module::{Module, Setup};
+use crate::permissions::Permission;
 use crate::state::AppState;
 use crate::ws::events::AfterWsDisconnect;
 use crate::ws::WsHandlers;
@@ -74,6 +78,10 @@ impl Module for Chat {
         migrations::all(dialect)
     }
 
+    fn permissions(&self) -> Vec<Permission> {
+        vec![super::MODERATE]
+    }
+
     fn setup(&self, setup: &mut Setup<'_>) -> Result<(), Error> {
         let from_file = setup.config().module_config::<ChatConfig>("chat")?;
         let config = match (&self.config, from_file) {
@@ -115,6 +123,23 @@ impl Module for Chat {
             .routes(call_route!(DeleteMessage, handlers::delete_message))
             .routes(call_route!(OpenDirect, handlers::open_dm))
             .routes(call_route!(ListDirects, handlers::dms))
+            .routes(call_route!(EditMessage, handlers::edit_message))
+            .routes(call_route!(MarkRead, handlers::mark_read_http))
+            .routes(call_route!(ListReceipts, handlers::receipts_http))
+            .routes(call_route!(UnreadQuery, handlers::unread_http))
+            .routes(call_route!(CreateRoom, handlers::create_room))
+            .routes(call_route!(MyRooms, handlers::my_rooms))
+            .routes(call_route!(PublicRooms, handlers::public_rooms))
+            .routes(call_route!(GetRoom, handlers::get_room))
+            .routes(call_route!(EditRoom, handlers::edit_room))
+            .routes(call_route!(DeleteRoom, handlers::delete_room))
+            .routes(call_route!(JoinChatRoom, handlers::join_room))
+            .routes(call_route!(LeaveChatRoom, handlers::leave_room))
+            .routes(call_route!(ListRoomMembers, handlers::room_members))
+            .routes(call_route!(InviteToRoom, handlers::invite))
+            .routes(call_route!(KickFromRoom, handlers::kick))
+            .routes(call_route!(SetRoomRole, handlers::set_role))
+            .routes(call_route!(TransferRoom, handlers::transfer))
     }
 
     fn start<'a>(&'a self, state: &'a AppState) -> BoxFuture<'a, Result<(), Error>> {
@@ -126,8 +151,10 @@ impl Module for Chat {
             for room in &service.config().rooms {
                 service.create_room(state, room).await.map_err(|e| Error::Startup(format!("chat: creating the room `{}`: {e}", room.key)))?;
             }
+            // The background task: the retention purge and the player rooms' upkeep (rooms whose
+            // owner's account was deleted).
             let every = service.config().purge_interval_secs;
-            if every == 0 || service.config().history_retention_days == 0 {
+            if every == 0 {
                 return Ok(());
             }
             let state = state.clone();
@@ -136,11 +163,18 @@ impl Module for Chat {
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
                     tokio::select! {
-                        _ = tick.tick() => match service.purge(&state).await {
-                            Ok(0) => {}
-                            Ok(n) => tracing::info!(messages = n, "chat: deleted messages past the retention"),
-                            Err(error) => tracing::warn!(%error, "chat: the retention purge failed"),
-                        },
+                        _ = tick.tick() => {
+                            match service.purge(&state).await {
+                                Ok(0) => {}
+                                Ok(n) => tracing::info!(messages = n, "chat: deleted messages past the retention"),
+                                Err(error) => tracing::warn!(%error, "chat: the retention purge failed"),
+                            }
+                            match service.room_upkeep(&state).await {
+                                Ok(0) => {}
+                                Ok(n) => tracing::info!(rooms = n, "chat: player rooms without an owner got one (or were deleted)"),
+                                Err(error) => tracing::warn!(%error, "chat: the player room upkeep failed"),
+                            }
+                        }
                         _ = state.shutdown().wait() => break,
                     }
                 }

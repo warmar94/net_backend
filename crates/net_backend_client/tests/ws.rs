@@ -56,6 +56,116 @@ async fn echo(ws: &WsConnection, text: &str) -> Result<i64, Error> {
     ws.request(&Echo { text: text.into() }).await.map(|e| e.user)
 }
 
+/// Notifications over the WebSocket: the `notify.new` push as the protocol's type, and the
+/// `notify.*` requests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn notifications_push_and_requests() {
+    use net_backend_client::protocol::notifications::{CountNotifications, MarkNotifications, Notification, NotificationQuery};
+    let server = Server::start();
+    let (client, user) = registered(&server, "nt-kim").await;
+    let ws = client.connect_ws(fast()).await.expect("connect");
+    let mut notifications = ws.subscribe::<Notification>();
+    let id = server.notify(user, "reward");
+    let pushed = tokio::time::timeout(WAIT, notifications.next()).await.expect("push").expect("open").expect("notification");
+    assert_eq!((pushed.id.get(), pushed.kind.as_str(), pushed.read), (id, "reward", false));
+    let page = ws.request(&NotificationQuery::new().unread_only()).await.expect("list");
+    assert_eq!(page.items.iter().map(|n| n.id.get()).collect::<Vec<_>>(), [id]);
+    let ack = ws.request(&MarkNotifications::all_read()).await.expect("mark");
+    assert_eq!((ack.changed, ack.unread), (1, 0));
+    let count = ws.request(&CountNotifications::new()).await.expect("count");
+    assert_eq!((count.unread, count.total), (0, 1));
+    ws.close();
+}
+
+/// `friends.presence` through `ws.subscribe`: a friend's socket opens and closes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn friend_presence_pushes() {
+    use net_backend_client::protocol::friends::{AcceptFriend, AddFriend, FriendPresence};
+    let server = Server::start();
+    let (ada, ada_id) = registered(&server, "fp-ada").await;
+    let (bo, bo_id) = registered(&server, "fp-bo").await;
+    bo.call(&AddFriend::by_id(ada_id)).await.expect("request");
+    ada.call(&AcceptFriend::new(bo_id)).await.expect("accept");
+    let ws = ada.connect_ws(fast()).await.expect("connect");
+    let mut presence = ws.subscribe::<FriendPresence>();
+    let bo_ws = bo.connect_ws(fast()).await.expect("connect Bo");
+    let online = tokio::time::timeout(WAIT, presence.next()).await.expect("push").expect("open").expect("presence");
+    assert_eq!((online.user, online.online), (bo_id, true));
+    bo_ws.close();
+    let offline = tokio::time::timeout(WAIT, presence.next()).await.expect("push").expect("open").expect("presence");
+    assert_eq!((offline.user, offline.online, offline.last_seen.is_some()), (bo_id, false, true));
+    ws.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lobby_and_match_pushes() {
+    use net_backend_client::protocol::lobbies::{CreateLobby, EditLobby, JoinLobby, LobbyChange, LobbyMemberUpdate, LobbyUpdate, MemberChange, UpdateLobby};
+    use net_backend_client::protocol::matchmaking::{CreateTicket, MatchFound};
+    let server = Server::start();
+    let (ada, _ada_id) = registered(&server, "lp-ada").await;
+    let (bo, bo_id) = registered(&server, "lp-bo").await;
+    let ws = ada.connect_ws(fast()).await.expect("connect");
+    let mut members = ws.subscribe::<LobbyMemberUpdate>();
+    let mut changes = ws.subscribe::<LobbyUpdate>();
+    let mut matches = ws.subscribe::<MatchFound>();
+    let lobby = ada.call(&CreateLobby::new(2)).await.expect("create");
+    bo.call(&JoinLobby::new(lobby.id)).await.expect("join");
+    let joined = tokio::time::timeout(WAIT, members.next()).await.expect("push").expect("open").expect("member");
+    assert_eq!((joined.lobby, joined.change, joined.member.user), (lobby.id, MemberChange::Joined, bo_id));
+    ada.call(&EditLobby::new(lobby.id, UpdateLobby::new().set_meta("map", "dust"))).await.expect("edit");
+    let changed = tokio::time::timeout(WAIT, changes.next()).await.expect("push").expect("open").expect("change");
+    assert_eq!((changed.changes, changed.lobby.metadata.get("map").cloned()), (vec![LobbyChange::Metadata], Some("dust".to_string())));
+    // Two tickets in the `duel` queue: the server's round matches them.
+    let bo_ws = bo.connect_ws(fast()).await.expect("connect Bo");
+    bo.call(&CreateTicket::new("duel")).await.expect("queue Bo");
+    ada.call(&CreateTicket::new("duel")).await.expect("queue Ada");
+    let found = tokio::time::timeout(WAIT, matches.next()).await.expect("push").expect("open").expect("match");
+    assert_eq!((found.queue.as_str(), found.players.len()), ("duel", 2));
+    assert!(found.players.contains(&bo_id));
+    bo_ws.close();
+    ws.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_extras_over_the_socket() {
+    use net_backend_client::protocol::chat::{
+        CreateRoom, EditMessage, InviteToRoom, MarkRead, MessageEdited, OpenDirect, ReadReceipt, RoomChange, RoomUpdate, RoomUser, SetTyping, TypingUpdate,
+        UnreadQuery,
+    };
+    let server = Server::start();
+    let (ada, _ada_id) = registered(&server, "cx-ada").await;
+    let (bo, bo_id) = registered(&server, "cx-bo").await;
+    let a = ada.connect_ws(fast()).await.expect("connect Ada");
+    let b = bo.connect_ws(fast()).await.expect("connect Bo");
+    let mut edits = b.subscribe::<MessageEdited>();
+    let mut typing = b.subscribe::<TypingUpdate>();
+    let mut reads = a.subscribe::<ReadReceipt>();
+    let mut rooms = b.subscribe::<RoomUpdate>();
+    let dm = ada.call(&OpenDirect::new(bo_id)).await.expect("dm");
+    let ack = a.request(&SendMessage::new(dm.id, "helo")).await.expect("send");
+    // Edit: the answer is the message, Bo gets chat.edited.
+    let edited = a.request(&EditMessage::new(dm.id, ack.message_id, "hello")).await.expect("edit");
+    assert_eq!((edited.text.as_str(), edited.edited_at.is_some()), ("hello", true));
+    let push = tokio::time::timeout(WAIT, edits.next()).await.expect("push").expect("open").expect("edited");
+    assert_eq!((push.id, push.text.as_str()), (ack.message_id, "hello"));
+    // Typing (no join in a DM) and the read marker.
+    a.request(&SetTyping::started(dm.id)).await.expect("typing");
+    let push = tokio::time::timeout(WAIT, typing.next()).await.expect("push").expect("open").expect("typing");
+    assert!(push.typing && push.expires_in_ms > 0);
+    let unread = b.request(&UnreadQuery::new(vec![dm.id])).await.expect("unread");
+    assert_eq!(unread.rooms[0].unread, 1);
+    b.request(&MarkRead::new(dm.id, ack.message_id)).await.expect("read");
+    let push = tokio::time::timeout(WAIT, reads.next()).await.expect("push").expect("open").expect("read");
+    assert_eq!((push.user, push.message), (bo_id, ack.message_id));
+    // A player room's invitation reaches the invited player.
+    let room = ada.call(&CreateRoom::new("Client Den")).await.expect("create");
+    ada.call(&InviteToRoom::new(room.id, RoomUser::new(bo_id))).await.expect("invite");
+    let push = tokio::time::timeout(WAIT, rooms.next()).await.expect("push").expect("open").expect("room");
+    assert_eq!((push.room, push.change, push.user), (room.id, RoomChange::Invited, Some(bo_id)));
+    a.close();
+    b.close();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn header_auth_requests_pushes_and_a_reconnect() {
     let server = Server::start();
@@ -127,6 +237,35 @@ async fn close_4001_gets_one_refresh_and_one_reconnect() {
     let error = closed_with(&mut events).await.expect("why");
     assert_eq!(error.close_code(), Some(CloseCode::UNAUTHORIZED), "{error:?}");
     assert_eq!(server.connections_of(user), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn close_4001_without_a_reconnect_policy_ends_at_once() {
+    let server = Server::start();
+    let (client, user) = registered(&server, "nell").await;
+    let ws = client.connect_ws(WsSettings::default().without_reconnect()).await.expect("connect");
+    let mut events = ws.events();
+    let before = client.tokens().expect("tokens");
+    until("the socket to be registered", || server.connections_of(user) == 1).await;
+    assert_eq!(server.close_user(user, CloseCode::UNAUTHORIZED), 1);
+    let error = closed_with(&mut events).await.expect("why");
+    assert_eq!(error.close_code(), Some(CloseCode::UNAUTHORIZED), "{error:?}");
+    assert_eq!(client.tokens().expect("tokens").access_token.expose(), before.access_token.expose(), "no refresh, no reconnect");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(server.connections_of(user), 0);
+}
+
+/// On a current-thread runtime the connection's task runs on this thread: a blocking `wait` for
+/// one of its replies is refused at once (it would never end); `.await` works.
+#[tokio::test(flavor = "current_thread")]
+async fn waiting_for_a_reply_on_a_current_thread_runtime_is_refused() {
+    let server = Server::start();
+    let (client, user) = registered(&server, "cora").await;
+    let ws = client.connect_ws(WsSettings::default()).await.expect("connect");
+    let refused = ws.request(&Echo { text: "wait".into() }).wait();
+    assert!(matches!(refused, Err(Error::InvalidRequest(_))), "{refused:?}");
+    assert_eq!(echo(&ws, "await").await.expect("echo"), user.get());
+    ws.close();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

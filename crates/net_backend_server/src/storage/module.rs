@@ -3,7 +3,9 @@
 use std::sync::OnceLock;
 
 use net_backend_protocol::admin::{GetUserObject, ListUserObjects, RemoveUserObject, WriteUserObject};
-use net_backend_protocol::storage::{BatchGet, BatchPut, GetObject, ListObjects, RemoveObject, WriteObject, BATCH_BODY_LIMIT_BYTES};
+use net_backend_protocol::storage::{
+    BatchGet, BatchPut, GetObject, GetPlayerObject, ListObjects, ListPlayerObjects, RemoveObject, WriteObject, BATCH_BODY_LIMIT_BYTES,
+};
 use utoipa_axum::router::{OpenApiRouter, UtoipaMethodRouter};
 
 use super::config::StorageConfig;
@@ -103,6 +105,8 @@ impl Module for Storage {
         let mut router = OpenApiRouter::new()
             .routes(call_route!(ListObjects, handlers::list))
             .routes(call_route!(GetObject, handlers::get))
+            .routes(call_route!(ListPlayerObjects, handlers::player_list))
+            .routes(call_route!(GetPlayerObject, handlers::player_get))
             .routes(limited(call_route!(WriteObject, handlers::put), put_limit))
             .routes(call_route!(RemoveObject, handlers::delete))
             .routes(call_route!(BatchGet, handlers::batch_get))

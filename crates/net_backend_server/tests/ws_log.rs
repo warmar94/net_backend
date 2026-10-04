@@ -89,6 +89,17 @@ async fn connect(addr: std::net::SocketAddr, token: Option<&str>) -> Ws {
     tokio::time::timeout(WAIT, tokio_tungstenite::connect_async(request)).await.expect("handshake in time").expect("handshake").0
 }
 
+/// The server ends the connection (a close frame, an error or the end of the stream; no answer).
+async fn refused(ws: &mut Ws) {
+    loop {
+        match tokio::time::timeout(WAIT, ws.next()).await.expect("the server ends the connection in time") {
+            None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
+            Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+            Some(Ok(other)) => panic!("expected the connection to end, got {other:?}"),
+        }
+    }
+}
+
 async fn echo(ws: &mut Ws, id: u64, text: &str) {
     send(ws, &json!({"id": id, "type": "test.echo", "data": text})).await;
     assert_eq!(recv(ws).await, json!({"id": id, "ok": true, "data": text}));
@@ -165,6 +176,17 @@ fn no_token_in_the_servers_trace_logs() {
         send(&mut ws, &auth).await;
         assert_eq!(recv(&mut ws).await["type"], "auth.ok");
         ws.close(None).await.expect("close");
+        // Frames the server refuses: an `auth` with RSV1 set (no compression was negotiated) ...
+        let mut ws = connect(addr, None).await;
+        let mut frame = Frame::message(auth.to_string().into_bytes(), OpCode::Data(Data::Text), true);
+        frame.header_mut().rsv1 = true;
+        ws.send(Message::Frame(frame)).await.expect("send");
+        refused(&mut ws).await;
+        // ... and an `auth` in one frame while a fragmented binary message is still open.
+        let mut ws = connect(addr, None).await;
+        ws.send(Message::Frame(Frame::message(vec![1, 2, 3], OpCode::Data(Data::Binary), false))).await.expect("send");
+        ws.send(Message::Frame(Frame::message(auth.to_string().into_bytes(), OpCode::Data(Data::Text), true))).await.expect("send");
+        refused(&mut ws).await;
     });
 
     server_runtime.block_on(async {

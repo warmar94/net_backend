@@ -17,13 +17,14 @@ and a hardened SSH login. For production you choose the install path once:
 | Backups | `net-backend-backup` (systemd timer) dumps inside the database container | the same timer, dumping directly |
 | Updates | `docker compose pull` + `docker compose up -d` | build, then `install.sh` again (or copy the binary + restart) |
 
-Both paths install the **reference server**: the framework with the `Auth`, `Storage` and `Chat`
-modules, configured entirely from its configuration file
+Both paths install the **reference server**: the framework with every module (`Auth`, `Storage`,
+`Chat`, `Leaderboards`, `Notifications`, `Friends`, `Groups`, `OAuth`, `Lobbies`, `Matchmaking`,
+`Files`), configured entirely from its configuration file
 ([`examples/server.rs`](https://github.com/warmar94/net_backend/blob/main/crates/net_backend_server/examples/server.rs)).
-Your own game server is a binary built the same way (your routes, hooks and WebSocket handlers added); it
-has the same command line (`serve`, `migrate`, `config check`, `user:create`, …), so every file here works
-for it: build your own image with the same Dockerfile ([Your own server](#your-own-server-in-docker)), or
-pass your binary to `install.sh --binary`.
+Your own game server is a binary built the same way (your routes, hooks and WebSocket handlers
+added); it has the same command line (`serve`, `migrate`, `config check`, `user:create`, …), so
+every file here works for it: build your own image with the same Dockerfile ([Your own
+server](#your-own-server-in-docker)), or pass your binary to `install.sh --binary`.
 
 ## Contents
 
@@ -47,16 +48,18 @@ With Docker (Docker Desktop on Windows and macOS, Docker Engine on Linux), the s
 shell (PowerShell, cmd, bash, zsh):
 
 ```text
-docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/warmar94/net_backend_server:0.1
+docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/warmar94/net_backend_server:0.2
 ```
 
 The image is the reference server for `linux/amd64` and `linux/arm64` with a configuration built in:
-SQLite in `/data`, migrations applied on start, accounts, storage and chat with a `world` room, readable
+SQLite in `/data`, migrations applied on start, accounts, storage, chat with a `world` room, a
+`highscore` leaderboard, notifications, friends, groups, the OpenID Connect module (no provider
+configured), lobbies, matchmaking with a `duel` queue, players' files in `/data/files`, readable
 logs. Open `http://127.0.0.1:8080/v1/info` in a browser, or `curl http://127.0.0.1:8080/v1/info`
 (`curl.exe` in Windows PowerShell):
 
 ```text
-{"protocol":1,"min_protocol":1,"modules":["auth","chat","storage"]}
+{"protocol":1,"min_protocol":1,"modules":["auth","chat","files","friends","groups","leaderboards","lobbies","matchmaking","notifications","oauth","storage"]}
 ```
 
 The port is published on `127.0.0.1` only, so other machines on the network do not reach it. **The trial
@@ -65,7 +68,7 @@ is plain HTTP with open registration, for your own computer: never publish its p
 stops it; `--rm` removes the container and its data. To keep the data and create an administrator:
 
 ```text
-docker run -d --name nbs -p 127.0.0.1:8080:8080 -v nbs-data:/data ghcr.io/warmar94/net_backend_server:0.1
+docker run -d --name nbs -p 127.0.0.1:8080:8080 -v nbs-data:/data ghcr.io/warmar94/net_backend_server:0.2
 docker exec nbs net-backend-server user:create admin@example.com --admin
 ```
 
@@ -73,7 +76,7 @@ docker exec nbs net-backend-server user:create admin@example.com --admin
 (`docker rm nbs` + `docker volume rm nbs-data` remove both). Every server command works through
 `docker exec nbs net-backend-server …` (`--help` lists them).
 
-Image tags: each release's exact version, `0.1` (the newest 0.1.x release) and `latest` (the newest release).
+Image tags: each release's exact version, `0.2` (the newest 0.2.x release) and `latest` (the newest release).
 
 ## The files
 
@@ -124,8 +127,8 @@ Image tags: each release's exact version, `0.1` (the newest 0.1.x release) and `
    `compose.mysql.yaml` instead of `compose.postgres.yaml` gives MySQL 8.4. `DOMAIN` is the only
    setting; `ACME_EMAIL=you@example.com` as a second line in `.env` sends certificate expiry notices
    there. The Compose project is named after the folder (`net-backend` here): its volumes (database,
-   secrets, certificates) are `net-backend_…`, so give every install on one machine a folder name of its
-   own. `docker compose up -d` pulls the images and then, in order:
+   secrets, players' files, certificates) are `net-backend_…`, so give every install on one machine
+   a folder name of its own. `docker compose up -d` pulls the images and then, in order:
    - `init` writes three secrets into Docker volumes, if they are missing: a random password for the
      app's database account `nbs`, one for the database administrator, and `database_url`, the server's
      connection URL. Existing secrets are never replaced, and it checks everything before it writes: a
@@ -141,7 +144,7 @@ Image tags: each release's exact version, `0.1` (the newest 0.1.x release) and `
 
    ```text
    sudo docker compose ps -a                # server: healthy; init, migrate and activate: exited (0)
-   curl https://api.example.com/v1/info     # {"protocol":1,"min_protocol":1,"modules":["auth","chat","storage"]}
+   curl https://api.example.com/v1/info     # {"protocol":1,"min_protocol":1,"modules":["auth","chat","files","friends","groups","leaderboards","lobbies","matchmaking","notifications","oauth","storage"]}
    ```
 
 4. **The first administrator**:
@@ -153,11 +156,11 @@ Image tags: each release's exact version, `0.1` (the newest 0.1.x release) and `
    The password is generated and printed once. Every server command works this way
    (`… exec server net-backend-server migrate status`, `config check --connect`, `user:role`, …).
 5. **Review the configuration**: `x-nbs-config` near the top of `compose.yaml` holds the server's
-   configuration (`[modules.auth] app_name`, mail, the chat rooms; see [Configuration](#configuration)).
-   After an edit, `sudo docker compose up -d` checks it first: `migrate` loads it (every module's
-   section included) and connects; only then does `activate` put it in place, and
-   `sudo docker compose restart server` loads it. An invalid edit stops `up` with `migrate`'s
-   message; nothing is put in place, and the running server keeps its configuration.
+   configuration (`[modules.auth] app_name`, mail, the chat rooms, the leaderboards; see
+   [Configuration](#configuration)). After an edit, `sudo docker compose up -d` checks it first:
+   `migrate` loads it (every module's section included) and connects; only then does `activate` put
+   it in place, and `sudo docker compose restart server` loads it. An invalid edit stops `up` with
+   `migrate`'s message; nothing is put in place, and the running server keeps its configuration.
 6. **Backups**: `sudo bash /opt/net_backend/deploy/backup/install.sh --mode docker --compose-dir /opt/net-backend`
    (see [Backups](#backups-and-restore)).
 
@@ -177,7 +180,7 @@ that Windows PowerShell 5.1 writes.)
 **Updates:** `sudo docker compose pull`, then `sudo docker compose up -d`: the new image is pulled,
 `migrate` runs again (pending migrations only), then the server is replaced. During the switch open
 WebSockets get close 1001 and clients reconnect. The image tag is `NBS_IMAGE` in `.env` (default
-`ghcr.io/warmar94/net_backend_server:0.1`, the newest 0.1.x); an exact version tag in `NBS_IMAGE` pins
+`ghcr.io/warmar94/net_backend_server:0.2`, the newest 0.2.x); an exact version tag in `NBS_IMAGE` pins
 one release. With your own image built by Compose ([below](#your-own-server-in-docker)) the update is
 `sudo docker compose up -d --build` instead. A newer `compose.yaml` downloads over the old one (copy your
 `x-nbs-config` edits across); the volumes, and with them the secrets and the data, stay. **Logs:** `sudo docker compose logs -f server`
@@ -189,7 +192,7 @@ one release. With your own image built by Compose ([below](#your-own-server-in-d
 |---|---|---|
 | `DOMAIN` | (required) | the public host name of the API |
 | `ACME_EMAIL` | none | where certificate expiry notices go |
-| `NBS_IMAGE` | `ghcr.io/warmar94/net_backend_server:0.1` | the server image (a pinned release, or your own server's image) |
+| `NBS_IMAGE` | `ghcr.io/warmar94/net_backend_server:0.2` | the server image (a pinned release, or your own server's image) |
 | `EDGE_SUBNET`, `EDGE_SUBNET6` | `172.30.250.0/24`, `fd00:6e62:73::/64` | the Caddy <-> server network |
 | `CADDY_IPV4`, `CADDY_IPV6` | `172.30.250.10`, `fd00:6e62:73::10` | Caddy's fixed addresses in it, the only proxies the server trusts |
 
@@ -203,11 +206,11 @@ read-only, run as uid 65532, drop every capability and cannot gain privileges; t
 `DAC_READ_SEARCH`, to see whether the database's data folder holds data); Caddy (pinned to `caddy:2.11`) keeps only
 the capability to bind ports 80 / 443; secrets are files in Docker volumes, and each container mounts
 only its own (read-only): the server and `migrate` see `database_url` (in `/etc/net-backend/`), the
-database its two passwords (in `/run/secrets/`), Caddy none; `stop_grace_period` (90 s) covers the
-server's shutdown grace (20 s), up to 10 s per module shutdown and the pool close; the open-file limits
-are raised for the server (262 144) and Caddy (1 048 576); logs rotate at 5 × 50 MB per container; the
-Caddy network has IPv4 and IPv6, and Caddy has fixed addresses in it, which are the only proxies the
-server trusts.
+database its two passwords (in `/run/secrets/`), Caddy none; `stop_grace_period` (60 s) covers the
+server's shutdown grace (20 s), the modules' shutdown (10 s, all at once) and the pool close; the
+open-file limits are raised for the server (262 144) and Caddy (1 048 576); logs rotate at 5 × 50 MB
+per container; the Caddy network has IPv4 and IPv6, and Caddy has fixed addresses in it, which are
+the only proxies the server trusts.
 
 **Moving from a `setup.sh` install** (the 0.1.0 layout: `/opt/net_backend/deploy/docker` with `secrets/`,
 `config.toml`, `migrations/` and a `.env` holding `COMPOSE_FILE`). The old install's Compose project is
@@ -246,7 +249,7 @@ and set its three build arguments:
 
 | Argument | Reference server (default) | Your server |
 |---|---|---|
-| `CARGO_ARGS` | `-p net_backend_server --example server --no-default-features --features sqlite,mysql,postgres,storage,chat,smtp,steam` | `--bin mygame` (plus `--features …` as your crate needs) |
+| `CARGO_ARGS` | `-p net_backend_server --example server --no-default-features --features sqlite,mysql,postgres,storage,chat,leaderboards,notifications,friends,groups,oauth,lobbies,matchmaking,files,smtp,steam` | `--bin mygame` (plus `--features …` as your crate needs) |
 | `BINARY` | `target/release/examples/server` | `target/release/mygame` |
 | `CONFIG` | `deploy/docker/trial.toml` | your development `config.toml` (built into the image; the Compose files use `x-nbs-config`) |
 
@@ -280,7 +283,7 @@ keep the dependencies between builds, so a rebuild after a code change compiles 
    ```text
    cd /opt/net_backend
    cargo build --release --locked -p net_backend_server --example server \
-       --no-default-features --features mysql,storage,chat,smtp,steam      # postgres / sqlite instead of mysql
+       --no-default-features --features mysql,storage,chat,leaderboards,notifications,friends,groups,oauth,lobbies,matchmaking,files,smtp,steam   # postgres / sqlite instead of mysql
    ```
 
    The binary is `target/release/examples/server`. Building on another machine works too (same CPU
@@ -315,8 +318,8 @@ keep the dependencies between builds, so a rebuild after a code change compiles 
 
 The unit (`systemd/net-backend.service`): user `nbs`, `NoNewPrivileges`, `ProtectSystem=strict` (only
 `/var/lib/net-backend` is writable), `ProtectHome`, `PrivateTmp`, `PrivateDevices`, no capabilities, a
-system-call filter, `LimitNOFILE=262144`, `Restart=on-failure`, `TimeoutStopSec=90s` (the 20 s shutdown
-grace, up to 10 s per module shutdown and the pool close, with room), `ExecStartPre=… migrate`.
+system-call filter, `LimitNOFILE=262144`, `Restart=on-failure`, `TimeoutStopSec=60s` (the 20 s shutdown
+grace, the modules' shutdown, 10 s all at once, and the pool close, with room), `ExecStartPre=… migrate`.
 `/etc/net-backend` is `root:nbs 0750`; the database URL file and the configuration are `root:nbs 0640`.
 
 ## Caddy
@@ -327,9 +330,12 @@ Both Caddyfiles (Docker: `caddyfile` inside the Compose file; systemd: `systemd/
 - **One `reverse_proxy`** for the API and the WebSocket hub (`/v1/ws`): Caddy passes WebSocket upgrades
   through by itself. `stream_close_delay 5m` keeps open WebSockets through a configuration reload
   instead of closing all of them at once.
-- **`request_body { max_size 5MB }` for the whole site.** The storage module's batch put carries up to
-  ~4.2 MB (4 MiB of values plus JSON). In Caddy a site-wide limit applies before a route's own, so it must
-  allow the largest route (64 KB here would answer the batch with 413 from Caddy).
+- **`request_body { max_size 17MB }` for the whole site.** The largest request is a file upload: the files
+  module's `max_file_bytes` (16 MiB) plus 64 KiB for the upload's other parts (the storage module's batch put,
+  the next largest, carries up to ~4.2 MB). In Caddy a site-wide limit applies before a route's own, so it
+  must allow the largest route (64 KB here would answer an upload with 413 from Caddy). Raise it with
+  `max_file_bytes`. Caddy sets no time limit on reading a request body; the server's own upload limits
+  apply (`http.upload_idle_timeout_secs`, `http.upload_timeout_secs`).
 - **Token-safe access logs:** the `Authorization` and `Cookie` headers are deleted from log lines, and a
   `token` query parameter is removed from the logged URL. The server keeps `ws.query_token = false`, so
   clients send the token in the `Authorization` header (or as the first-message `auth`), never in the URL.
@@ -357,6 +363,14 @@ server README's "Configuration" section. What deployments change most:
 | `[modules.auth] app_name`, `mailer = "smtp"`, `smtp_*`, `mail_from`, `verify_url`, `reset_url` | real mail for verification and password resets (the default log mailer only logs the recipient and subject) |
 | `[modules.auth] steam_*` | Steam login |
 | `[[modules.chat.rooms]]` | the public chat rooms (key, name, member cap) |
+| `[[modules.leaderboards.boards]]` | the leaderboards (key, name, mode, order, period, whether clients submit) |
+| `[modules.notifications] retention_days`, `max_per_user` | how long and how many notifications are kept per player |
+| `[modules.friends] max_friends`, `max_pending`, `online_window_secs`, `steam_max_ids`, `steam_rate` | the friend limits, how long a heartbeat keeps a player online, the Steam ID lookup's size and rate |
+| `[modules.groups] max_members`, `max_groups_per_user` | the size of a group and how many groups a player joins |
+| `[modules.files] dir`, `max_file_bytes`, `max_files_per_user`, `max_bytes_per_user` | where players' files are kept (Docker: `/data/files` on the volume `server_data`; systemd: `/var/lib/net-backend/files`) and their limits; `max_file_bytes` stays below `http.max_body_bytes` (32 MiB) minus 64 KiB |
+| `[modules.oauth.providers.<name>] preset`, `issuer`, `client_ids` | OpenID Connect logins (e.g. `preset = "google"` with your client id); without a provider every such login answers 404 |
+| `[modules.lobbies] max_players`, `max_lobbies_per_user`, `leave_on_disconnect` | the largest lobby, how many lobbies a player is in at a time, whether a player whose connection closes leaves its lobbies (after `disconnect_grace_secs`) |
+| `[[modules.matchmaking.queues]] key`, `players`, `timeout_secs` | the matchmaking queues: players per match of the default rule (first come, first matched) and how long a ticket waits |
 | `[ws] max_connections` | the socket cap (keep it below the open-file limit; see Capacity) |
 | `[metrics] enabled` | Prometheus metrics on loopback |
 | `[openapi] enabled` | `/v1/openapi.json` + `/v1/asyncapi.json`; set false to hide the API description |
@@ -421,9 +435,13 @@ The database password never appears on a command line. Run one at once:
 leaves the unit `failed`: check `systemctl status net-backend-backup` (or watch it with your monitoring),
 or add `OnFailure=` to the unit with a service that alerts you.
 
+The dumps hold the database; players' files (the `files` module) are a folder:
+`/var/lib/net-backend/files` (systemd) or the Docker volume `<project>_server_data`.
+
 **Off the machine:** a backup on the same disk does not survive the loss of the machine. Copy
-`/var/backups/net-backend/` elsewhere every day, for example with `restic` (encrypted, deduplicated) or
-`rclone` to object storage, from a second timer or the provider's snapshot feature.
+`/var/backups/net-backend/` (and the players' files folder) elsewhere every day, for example with
+`restic` (encrypted, deduplicated) or `rclone` to object storage, from a second timer or the
+provider's snapshot feature.
 
 **Restore** (the drill: practise it once on a fresh machine before you need it):
 
@@ -466,6 +484,29 @@ server, Caddy and the database:
 | 1000 players saving for the first time at the same moment | all 1000 stored in 8.6 s (MySQL), 7.4 s (PostgreSQL) |
 | 4 MiB batch saves through Caddy | 10 of 10, median 0.97 s (MySQL), 0.47 s (PostgreSQL) |
 | HTTP through Caddy, 64 connections | `/v1/info` ~4 500 requests/s; `GET /v1/account` 770 (MySQL) / 890 (PostgreSQL); a storage read 940 / 1 050 |
+
+### SQLite or PostgreSQL
+
+Measured on the same 2 vCPU / 7.8 GiB machine with `load_test` on that machine, straight to the
+server over loopback (no Caddy), SQLite 3.51 (WAL, `sqlite_synchronous = "normal"`, the default) and
+PostgreSQL 16 on the same disk, the same configuration and 20 database connections:
+
+| What | SQLite | PostgreSQL |
+|---|---|---|
+| 20 000 authenticated WebSockets | all connected, ~15 KiB per socket in the server | the same |
+| A restart with 5000 sockets open (every module registered) | all 5000 reconnected (p99 3.6 s) | all 5000 (p99 4.6 s) |
+| 4000 registrations, 32 at a time | 53 s, none failed | 61 s, none failed |
+| Requests that read: `GET /v1/account`, a storage read (64 connections) | 4 150 / 4 750 requests/s | 1 300 / 1 800 requests/s |
+| Chat, 200 members, every message stored: 50 / 200 / 400 messages per second | all delivered, p99 0.28 s / 0.79 s / 0.43 s | all delivered, p99 0.24 s / 0.53 s / 0.60 s |
+| Players saving for the first time at the same moment: 500 / 1000 / 4000 | 0.7 s / 1.2 s / 6.1 s, none failed | 0.7 s / 1.5 s / 5.4 s, none failed |
+| DM burst: 100 players sending 50 messages each at once | 5000 of 5000, p99 3.2 s | 5000 of 5000, p99 2.9 s |
+
+SQLite lets one write happen at a time; with `sqlite_synchronous = "normal"` a commit does not wait
+for the disk, and on this machine it kept up with PostgreSQL in every row and read faster. Choose
+PostgreSQL when the server and the database should run on different machines, when you run more than
+one server process, or when every committed write must survive a power loss (`sqlite_synchronous =
+"full"` gives that on SQLite, at a cost: 1000 first saves at the same moment got 60 errors after the
+5 s `database.acquire_timeout_secs`).
 
 The limits to set together:
 
@@ -519,13 +560,14 @@ NBS__MODULES__STORAGE__WRITE_RATE=1000
 |---|---|
 | `install.sh` stops at `config check` | the message names the key; `database reachable` needs the database running and the URL in `/etc/net-backend/database_url` |
 | the service is `activating (auto-restart)` or `failed` right after a deploy | `journalctl -u net-backend -n 50`: a failing migration prints which statements ran and how to recover |
+| `systemctl restart net-backend` fails with "Start request repeated too quickly" (`failed`, `start-limit-hit`) | more than 5 starts within 10 minutes (manual restarts count too): `sudo systemctl reset-failed net-backend && sudo systemctl start net-backend` |
 | Docker: `init` exits with `… belongs to another database …; nothing was written` | this folder's project was installed with the other Compose file (MySQL / PostgreSQL): use that file here; a second install goes into a folder with another name |
 | Docker: `init` exits with `the database holds data, but … is missing; nothing was written` | a secret volume of the project (`…_db_secrets`, `…_server_files`) was deleted while the database volume stayed: restore it from your copy. `db_password` alone comes back by itself from `database_url`. Without a copy of `db_root_password`: on PostgreSQL write a new value into it (through `docker compose run --rm --no-deps --entrypoint sh init`) and set the same with `ALTER ROLE postgres PASSWORD …` in `docker compose exec db psql -U postgres` (the container's local socket login needs no password); MySQL's root password is reset only with MySQL's own recovery procedure |
 | Docker: `up` stops at `migrate` after a configuration edit | `docker compose logs migrate` names the key; fix `x-nbs-config`, `docker compose up -d` again (the server kept running with the previous configuration) |
 | Docker: `server` never becomes healthy | `docker compose logs init migrate server`; `docker compose exec server net-backend-server healthcheck` |
 | Docker: `required variable DOMAIN is missing a value` | `.env` next to `compose.yaml` with `DOMAIN=…` |
 | HTTPS does not come up | DNS points at the machine, ports 80 / 443 reachable; `journalctl -u caddy` (Docker: `docker compose logs caddy`) |
-| 413 from Caddy on a batch save | the site's `request_body max_size` is below 5 MB |
+| 413 from Caddy on a file upload or a batch save | the site's `request_body max_size` is below the files module's `max_file_bytes` plus 64 KiB (17 MB for the default 16 MiB) |
 | every player shares one rate limit | `http.trusted_proxies` does not list the proxy in front of the server |
 | sockets refused with 503 above some thousands | `ws.max_connections`, the open-file limits of the server and Caddy, Caddy's memory |
 | `caddy validate` reports an unknown directive or field | Caddy older than 2.8 (`caddy version`); install it from Caddy's repository |

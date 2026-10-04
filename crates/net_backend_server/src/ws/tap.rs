@@ -6,16 +6,22 @@
 //! marker, in order).
 //!
 //! Everything else reaches tungstenite unchanged, except a text message sent in several frames: it
-//! arrives as one frame with the same content (it may be an `auth`). Anything the tap does not
-//! expect (an unmasked frame, reserved bits or opcodes, a frame out of sequence, the end of the
-//! stream) makes it hand the rest of the stream over untouched, so tungstenite answers it as
-//! before; a text message started before that is replaced by an empty one (it may be an `auth`). A
-//! frame or text message over the size limit is refused by tungstenite before it reads the content
-//! (close 1009), as without the tap.
+//! arrives as one frame with the same content (it may be an `auth`). A frame the tap does not
+//! expect (an unmasked frame, reserved bits or opcodes, a frame out of sequence, a fragmented or
+//! oversized control frame) reaches tungstenite as its header alone with an empty payload, so
+//! tungstenite refuses it on the header as before while the content (it may be an `auth`) never
+//! reaches it; a text message started before is replaced by the start of an empty one. Nothing
+//! after a refused frame is handed over, and the end of the stream inside a frame hands over
+//! nothing of that frame. A frame or message over the size limit is refused by tungstenite before
+//! it reads the content (close 1009): the tap hands over a header one byte over tungstenite's limit.
+//!
+//! The size limit is a [`TapLimit`]: [`PRE_AUTH_MAX_BYTES`] until the socket authenticates, then
+//! `ws.max_message_bytes` (the connection raises it).
 
 use std::collections::VecDeque;
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{ready, Context, Poll};
 
@@ -25,11 +31,21 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 /// client that sends this text is diverted like any other.
 pub(crate) const MARKER: &str = r#"{"type":"auth","data":"(read by the server, not by tungstenite)"}"#;
 
+/// The largest frame or message a socket may send before it authenticated (at most
+/// `ws.max_message_bytes`). The only message it may send then is an `auth` (an access token of
+/// the `Auth` module is 69 characters; 16 KiB leaves room for a game's own authenticator's
+/// tokens, e.g. JWTs), so a socket waiting for `auth` holds a few KiB, not several copies of
+/// `ws.max_message_bytes`.
+pub(crate) const PRE_AUTH_MAX_BYTES: usize = 16 * 1024;
+
 /// Bytes read from the socket per call.
 const READ_CHUNK: usize = 8 * 1024;
 
 /// Buffers above this size are given back once empty (an idle socket keeps little memory).
 const KEEP: usize = 1024;
+
+/// The largest control frame payload (RFC 6455 section 5.5).
+const MAX_CONTROL: u64 = 125;
 
 const CONTINUATION: u8 = 0x0;
 const TEXT: u8 = 0x1;
@@ -50,8 +66,29 @@ impl Diverted {
     }
 }
 
+/// The tap's current size limit for one frame or message, shared with the connection (which
+/// raises it once the socket authenticated).
+#[derive(Clone)]
+pub(crate) struct TapLimit(Arc<AtomicUsize>);
+
+impl TapLimit {
+    pub(crate) fn new(bytes: usize) -> Self {
+        Self(Arc::new(AtomicUsize::new(bytes)))
+    }
+
+    pub(crate) fn set(&self, bytes: usize) {
+        self.0.store(bytes, Ordering::Relaxed);
+    }
+
+    fn get(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
 /// A frame header (RFC 6455 section 5.2).
 struct Head {
+    /// The first byte (FIN, RSV1-3, opcode).
+    first: u8,
     fin: bool,
     reserved: bool,
     opcode: u8,
@@ -76,7 +113,7 @@ fn parse_head(raw: &[u8]) -> Option<Head> {
     } else {
         None
     };
-    Some(Head { fin: first & 0x80 != 0, reserved: first & 0x70 != 0, opcode: first & 0x0F, mask, len, size })
+    Some(Head { first, fin: first & 0x80 != 0, reserved: first & 0x70 != 0, opcode: first & 0x0F, mask, len, size })
 }
 
 /// The header of a text frame of `len` bytes, masked with a zero mask (the content unchanged).
@@ -98,6 +135,15 @@ fn text_head(fin: bool, len: u64) -> Vec<u8> {
     head
 }
 
+/// A refused frame's header with an empty payload: the same FIN / RSV / opcode bits and the same
+/// mask bit (a zero mask), so tungstenite refuses it for the same reason.
+fn empty_head(head: &Head) -> Vec<u8> {
+    match head.mask {
+        Some(_) => vec![head.first, 0x80, 0, 0, 0, 0],
+        None => vec![head.first, 0],
+    }
+}
+
 fn unmask(payload: &[u8], mask: [u8; 4]) -> Vec<u8> {
     payload.iter().zip(mask.iter().cycle()).map(|(byte, m)| byte ^ m).collect()
 }
@@ -116,28 +162,47 @@ pub(crate) struct AuthTap<S> {
     sent: usize,
     /// A text message sent in several frames, unmasked, until its last frame.
     text: Option<Vec<u8>>,
-    /// Inside a binary message sent in several frames (its frames pass unchanged).
-    binary: bool,
-    /// Hand everything over untouched from now on.
-    through: bool,
+    /// Inside a binary message sent in several frames (its frames pass unchanged): its size so far.
+    binary: Option<usize>,
+    /// A frame was refused: nothing more is handed over (tungstenite refuses the socket).
+    refused: bool,
     eof: bool,
-    /// The largest frame or message (`ws.max_message_bytes`, tungstenite's limits too).
-    limit: usize,
+    /// The largest frame or message now (see [`TapLimit`]).
+    limit: TapLimit,
+    /// tungstenite's own limit (`ws.max_message_bytes`).
+    hard: usize,
     diverted: Diverted,
 }
 
 impl<S> AuthTap<S> {
-    pub(crate) fn new(inner: S, limit: usize, diverted: Diverted) -> Self {
-        Self { inner, raw: Vec::new(), out: Vec::new(), sent: 0, text: None, binary: false, through: false, eof: false, limit, diverted }
+    /// A tap with the size limit `limit` (the connection raises it after `auth`), under
+    /// tungstenite's own limit `hard`.
+    pub(crate) fn new(inner: S, limit: TapLimit, hard: usize, diverted: Diverted) -> Self {
+        Self { inner, raw: Vec::new(), out: Vec::new(), sent: 0, text: None, binary: None, refused: false, eof: false, limit, hard, diverted }
     }
 
-    /// From now on, the stream reaches tungstenite untouched. A text message started before is
-    /// replaced by the start of an empty one (its content may be an `auth`).
-    fn hand_over(&mut self) {
+    /// Refuse the frame `head`: tungstenite gets its header with an empty payload (after the start
+    /// of an empty text message in place of a started one), then nothing more.
+    fn refuse(&mut self, head: &Head) {
         if self.text.take().is_some() {
             self.out.extend_from_slice(&text_head(false, 0));
         }
-        self.through = true;
+        self.out.extend_from_slice(&empty_head(head));
+        self.stop();
+    }
+
+    /// Refuse an oversized frame or message: a text header one byte over tungstenite's limit
+    /// (tungstenite closes with 1009 on the header alone), then nothing more.
+    fn too_big(&mut self) {
+        self.text = None;
+        self.out.extend_from_slice(&text_head(true, self.hard as u64 + 1));
+        self.stop();
+    }
+
+    /// Hand nothing more over; forget what was read.
+    fn stop(&mut self) {
+        self.refused = true;
+        self.raw = Vec::new();
     }
 
     /// A whole text message: diverted when it is an `auth`, else one frame with the same content.
@@ -155,21 +220,29 @@ impl<S> AuthTap<S> {
     /// Look at the frame at the start of `raw`. False when more bytes are needed first.
     fn step(&mut self) -> bool {
         let Some(head) = parse_head(&self.raw) else { return false };
+        let control = head.opcode & 0x8 != 0;
         let known = matches!(head.opcode, CONTINUATION | TEXT | BINARY | 0x8..=0xA);
-        let Some(mask) = head.mask.filter(|_| known && !head.reserved) else {
-            self.hand_over();
+        let in_sequence = match head.opcode {
+            CONTINUATION => self.text.is_some() || self.binary.is_some(),
+            TEXT | BINARY => self.text.is_none() && self.binary.is_none(),
+            // Control frames: at most 125 bytes.
+            _ => head.len <= MAX_CONTROL,
+        };
+        let expected = known && !head.reserved && in_sequence && (head.fin || !control);
+        let Some(mask) = head.mask.filter(|_| expected) else {
+            self.refuse(&head);
             return true;
         };
-        let pending = self.text.as_ref().map_or(0, Vec::len);
+        let limit = self.limit.get().min(self.hard);
+        let before = match head.opcode {
+            CONTINUATION => self.text.as_ref().map_or(0, Vec::len) + self.binary.unwrap_or(0),
+            _ => 0,
+        };
         let len = match usize::try_from(head.len) {
-            Ok(len) if len <= self.limit && !(head.opcode == CONTINUATION && self.text.is_some() && pending.saturating_add(len) > self.limit) => len,
+            Ok(len) if before.saturating_add(len) <= limit => len,
+            // Too big: refused on a header, before tungstenite reads any content.
             _ => {
-                // Too big: tungstenite refuses a frame header over its limit before it reads the
-                // content. A started text message is replaced by such a header.
-                if self.text.take().is_some() {
-                    self.out.extend_from_slice(&text_head(true, self.limit as u64 + 1));
-                }
-                self.through = true;
+                self.too_big();
                 return true;
             }
         };
@@ -183,16 +256,15 @@ impl<S> AuthTap<S> {
         }
         let payload = frame.get(head.size..).unwrap_or_default();
         match head.opcode {
-            0x8..=0xA => self.out.extend_from_slice(&frame),
-            BINARY if self.text.is_none() && !self.binary => {
-                self.binary = !head.fin;
+            BINARY => {
+                self.binary = (!head.fin).then_some(len);
                 self.out.extend_from_slice(&frame);
             }
-            CONTINUATION if self.binary => {
-                self.binary = !head.fin;
+            CONTINUATION if self.binary.is_some() => {
+                self.binary = (!head.fin).then_some(before + len);
                 self.out.extend_from_slice(&frame);
             }
-            CONTINUATION if self.text.is_some() => {
+            CONTINUATION => {
                 let mut text = self.text.take().unwrap_or_default();
                 text.extend(payload.iter().zip(mask.iter().cycle()).map(|(byte, m)| byte ^ m));
                 if head.fin {
@@ -201,7 +273,7 @@ impl<S> AuthTap<S> {
                     self.text = Some(text);
                 }
             }
-            TEXT if self.text.is_none() && !self.binary => {
+            TEXT => {
                 let text = unmask(payload, mask);
                 if !head.fin {
                     self.text = Some(text);
@@ -211,11 +283,8 @@ impl<S> AuthTap<S> {
                     self.out.extend_from_slice(&frame);
                 }
             }
-            _ => {
-                // Out of sequence: tungstenite refuses it.
-                self.hand_over();
-                self.out.extend_from_slice(&frame);
-            }
+            // Control frames (ping, pong, close) pass unchanged, also between fragments.
+            _ => self.out.extend_from_slice(&frame),
         }
         true
     }
@@ -242,24 +311,21 @@ impl<S: AsyncRead + Unpin> AsyncRead for AuthTap<S> {
                 }
                 return Poll::Ready(Ok(()));
             }
-            if this.through {
-                if !this.raw.is_empty() {
-                    std::mem::swap(&mut this.out, &mut this.raw);
-                    continue;
-                }
-            } else if this.step() {
-                continue;
-            }
-            if this.eof {
+            if this.refused || this.eof {
+                // After a refusal tungstenite has what it refuses on; at the end of the stream a
+                // cut frame is not handed over (it may be an `auth`): tungstenite sees the end.
                 return Poll::Ready(Ok(()));
+            }
+            if this.step() {
+                continue;
             }
             let mut chunk = [0u8; READ_CHUNK];
             let mut read = ReadBuf::new(&mut chunk);
             ready!(Pin::new(&mut this.inner).poll_read(cx, &mut read))?;
             if read.filled().is_empty() {
-                // The end: a cut frame goes over as it is (tungstenite reports the cut).
                 this.eof = true;
-                this.hand_over();
+                this.raw = Vec::new();
+                this.text = None;
                 continue;
             }
             this.raw.extend_from_slice(read.filled());
@@ -318,9 +384,13 @@ mod tests {
     /// Feed `input` through a tap, `piece` bytes per read; what tungstenite would read, and the
     /// diverted texts.
     fn run(input: &[u8], piece: usize) -> (Vec<u8>, Vec<String>) {
+        run_limited(input, piece, &TapLimit::new(LIMIT), LIMIT)
+    }
+
+    fn run_limited(input: &[u8], piece: usize, limit: &TapLimit, hard: usize) -> (Vec<u8>, Vec<String>) {
         let mut reader = Pieces { data: input.to_vec(), at: 0, piece: piece.max(1) };
         let diverted = Diverted::default();
-        let mut tap = AuthTap::new(&mut reader, LIMIT, diverted.clone());
+        let mut tap = AuthTap::new(&mut reader, limit.clone(), hard, diverted.clone());
         let mut seen = Vec::new();
         let waker = std::task::Waker::noop();
         let mut cx = Context::from_waker(waker);
@@ -396,7 +466,92 @@ mod tests {
         messages.iter().filter_map(|m| m.to_text().ok().filter(|_| m.is_text()).map(str::to_string)).collect()
     }
 
+    /// Every payload byte tungstenite would receive in `bytes`, unmasked, frame by frame (a cut
+    /// last frame with what arrived of it).
+    fn payloads(bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut rest = bytes;
+        while let Some(head) = parse_head(rest) {
+            let end = (head.size as u64).saturating_add(head.len).min(rest.len() as u64) as usize;
+            let payload = rest.get(head.size..end).unwrap_or_default();
+            match head.mask {
+                Some(mask) => out.extend(unmask(payload, mask)),
+                None => out.extend_from_slice(payload),
+            }
+            rest = &rest[end..];
+        }
+        // A cut header: its bytes as they are.
+        out.extend_from_slice(rest);
+        out
+    }
+
+    /// Whether an access token is in what tungstenite would receive.
+    fn token_reaches_tungstenite(seen: &[u8]) -> bool {
+        payloads(seen).windows(5).any(|w| w == b"nbsa_")
+    }
+
     const AUTH: &str = r#"{"type":"auth","data":{"token":"nbsa_secret_token_value"}}"#;
+
+    /// The inputs of the "no token reaches tungstenite" checks below.
+    fn token_inputs() -> Vec<(&'static str, Vec<u8>)> {
+        let (a, b) = AUTH.as_bytes().split_at(20);
+        let mut fragmented = frame(false, TEXT, a);
+        fragmented.extend(frame(true, 0x9, b"p2"));
+        fragmented.extend(frame(true, CONTINUATION, b));
+        let mut rsv1 = frame(true, TEXT, AUTH.as_bytes());
+        rsv1[0] |= 0x40;
+        let mut binary_open = frame(false, BINARY, &[1, 2, 3]);
+        binary_open.extend(frame(true, TEXT, AUTH.as_bytes()));
+        let mut text_open = frame(false, TEXT, b"{\"type\":");
+        text_open.extend(frame(true, TEXT, AUTH.as_bytes()));
+        let (long, _) = AUTH.as_bytes().split_at(40);
+        let mut started_then_unexpected = frame(false, TEXT, long);
+        started_then_unexpected.extend(frame(true, TEXT, b"x"));
+        let mut cut = frame(false, TEXT, long);
+        cut.extend_from_slice(&frame(true, CONTINUATION, b"rest")[..3]);
+        let mut cut_single = frame(true, TEXT, AUTH.as_bytes());
+        cut_single.truncate(cut_single.len() - 3);
+        let mut unknown_opcode = frame(true, 0x3, AUTH.as_bytes());
+        unknown_opcode[0] = 0x83;
+        let mut fragmented_ping = frame(false, 0x9, AUTH.as_bytes());
+        fragmented_ping[0] = 0x09;
+        let big_ping = frame(true, 0x9, format!("{AUTH}{AUTH}{AUTH}").as_bytes());
+        let mut unmasked = vec![0x81, AUTH.len() as u8];
+        unmasked.extend_from_slice(AUTH.as_bytes());
+        vec![
+            ("one frame", frame(true, TEXT, AUTH.as_bytes())),
+            ("fragmented with a ping between", fragmented),
+            ("RSV1 set", rsv1),
+            ("binary message open", binary_open),
+            ("text message open", text_open),
+            ("started, then an unexpected frame", started_then_unexpected),
+            ("cut inside a fragment", cut),
+            ("cut inside one frame", cut_single),
+            ("unknown opcode", unknown_opcode),
+            ("fragmented ping", fragmented_ping),
+            ("ping over 125 bytes", big_ping),
+            ("unmasked", unmasked),
+        ]
+    }
+
+    #[test]
+    fn no_token_reaches_tungstenite() {
+        for (what, input) in token_inputs() {
+            for piece in [1, 3, 64, 100_000] {
+                let (seen, _) = run(&input, piece);
+                assert!(!token_reaches_tungstenite(&seen), "{what}, piece {piece}: a token reached tungstenite");
+            }
+        }
+    }
+
+    /// The check above can fail: without the tap (the bytes as they are) every input hands a token
+    /// to tungstenite.
+    #[test]
+    fn the_token_check_sees_tokens_without_the_tap() {
+        for (what, input) in token_inputs() {
+            assert!(token_reaches_tungstenite(&input), "{what}: the check missed a token");
+        }
+    }
 
     #[test]
     fn auth_messages_are_diverted_and_everything_else_arrives_unchanged() {
@@ -418,9 +573,10 @@ mod tests {
         input.extend(frame(false, BINARY, &[9]));
         input.extend(frame(true, CONTINUATION, &[8]));
         input.extend(frame(true, TEXT, MARKER.as_bytes()));
+        assert!(token_reaches_tungstenite(&input));
         for piece in [1, 2, 3, 7, 64, 100_000] {
             let (seen, diverted) = run(&input, piece);
-            assert!(!seen.windows(5).any(|w| w == b"nbsa_"), "piece {piece}: a token reached tungstenite");
+            assert!(!token_reaches_tungstenite(&seen), "piece {piece}: a token reached tungstenite");
             assert_eq!(diverted, vec![AUTH.to_string(), AUTH.to_string(), MARKER.to_string()], "piece {piece}");
             let (got, error) = messages(seen);
             assert!(error.is_none(), "piece {piece}: {error:?}");
@@ -454,7 +610,7 @@ mod tests {
         let big = AUTH.repeat(LIMIT / AUTH.len() + 1);
         // One frame over the limit.
         let (seen, diverted) = run(&frame(true, TEXT, big.as_bytes()), 64);
-        assert!(diverted.is_empty());
+        assert!(diverted.is_empty() && !token_reaches_tungstenite(&seen));
         let (_, error) = messages(seen);
         assert!(matches!(error, Some(tungstenite::Error::Capacity(_))), "{error:?}");
         // A fragmented auth over the limit: its first part is never handed over.
@@ -463,37 +619,95 @@ mod tests {
         input.extend(frame(true, CONTINUATION, b));
         let (seen, diverted) = run(&input, 64);
         assert!(diverted.is_empty());
-        let header = text_head(true, LIMIT as u64 + 1);
-        assert!(seen.starts_with(&header), "the oversized header comes first");
-        assert!(!seen.windows(5).any(|w| w == b"nbsa_"));
+        assert_eq!(seen, text_head(true, LIMIT as u64 + 1), "only the oversized header");
         let (got, error) = messages(seen);
         assert!(got.is_empty() && matches!(error, Some(tungstenite::Error::Capacity(_))), "{error:?}");
+        // A fragmented binary message over the limit (each frame under it).
+        let mut input = frame(false, BINARY, &[0; 600]);
+        input.extend(frame(true, CONTINUATION, &[0; 600]));
+        let (_, error) = messages(run(&input, 64).0);
+        assert!(matches!(error, Some(tungstenite::Error::Capacity(_))), "{error:?}");
+    }
+
+    /// SF4: before `auth` a socket may send only small messages; the limit rises once raised.
+    #[test]
+    fn the_pre_auth_limit_is_lower_and_can_be_raised() {
+        let limit = TapLimit::new(100);
+        let text = "y".repeat(200);
+        let (seen, _) = run_limited(&frame(true, TEXT, text.as_bytes()), 16, &limit, LIMIT);
+        assert_eq!(seen, text_head(true, LIMIT as u64 + 1), "refused on a header over tungstenite's limit");
+        assert!(matches!(messages(seen).1, Some(tungstenite::Error::Capacity(_))));
+        // A fragmented text message over the small limit.
+        let mut input = frame(false, TEXT, &text.as_bytes()[..80]);
+        input.extend(frame(true, CONTINUATION, &text.as_bytes()[80..]));
+        assert!(matches!(messages(run_limited(&input, 16, &limit, LIMIT).0).1, Some(tungstenite::Error::Capacity(_))));
+        // An auth under it passes; after raising, the large message passes too.
+        let mut input = frame(true, TEXT, AUTH.as_bytes());
+        input.extend(frame(true, TEXT, text.as_bytes()));
+        let mut reader = Pieces { data: input, at: 0, piece: 100_000 };
+        let diverted = Diverted::default();
+        let mut tap = AuthTap::new(&mut reader, limit.clone(), LIMIT, diverted.clone());
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let mut chunk = [0u8; 4096];
+        let mut buf = ReadBuf::new(&mut chunk);
+        assert!(matches!(Pin::new(&mut tap).poll_read(&mut cx, &mut buf), Poll::Ready(Ok(()))));
+        let mut seen = buf.filled().to_vec();
+        assert_eq!(diverted.pop().as_deref(), Some(AUTH));
+        limit.set(LIMIT);
+        loop {
+            let mut chunk = [0u8; 4096];
+            let mut buf = ReadBuf::new(&mut chunk);
+            match Pin::new(&mut tap).poll_read(&mut cx, &mut buf) {
+                Poll::Ready(Ok(())) if buf.filled().is_empty() => break,
+                Poll::Ready(Ok(())) => seen.extend_from_slice(buf.filled()),
+                other => panic!("{other:?}"),
+            }
+        }
+        let (got, error) = messages(seen);
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(texts(&got), vec![MARKER.to_string(), text]);
     }
 
     #[test]
-    fn anything_unexpected_is_handed_over_and_refused_by_tungstenite() {
-        // An unmasked frame.
+    fn anything_unexpected_is_refused_by_tungstenite_on_the_header() {
+        // An unmasked frame: its header alone.
         let mut unmasked = vec![0x81, 5];
         unmasked.extend_from_slice(b"hello");
         let (seen, _) = run(&unmasked, 2);
-        assert_eq!(seen, unmasked);
+        assert_eq!(seen, vec![0x81, 0]);
         assert!(messages(seen).1.is_some());
-        // A started auth, then an unexpected text frame: the auth's start is not handed over.
+        // A started auth, then an unexpected text frame: neither content is handed over.
         let (a, _) = AUTH.as_bytes().split_at(30);
         let mut input = frame(false, TEXT, a);
         input.extend(frame(true, TEXT, b"x"));
+        input.extend(frame(true, TEXT, AUTH.as_bytes()));
         let (seen, diverted) = run(&input, 4);
-        assert!(diverted.is_empty() && !seen.windows(5).any(|w| w == b"nbsa_"));
+        assert!(diverted.is_empty() && !token_reaches_tungstenite(&seen));
+        let mut expected = text_head(false, 0);
+        expected.extend_from_slice(&[0x81, 0x80, 0, 0, 0, 0]);
+        assert_eq!(seen, expected, "the empty start, the refused header, nothing after it");
         assert!(matches!(messages(seen).1, Some(tungstenite::Error::Protocol(_))));
-        // A continuation without a start, reserved bits.
+        // RSV1 on an auth, an auth while a binary message is open: refused, no content.
+        let mut rsv1 = frame(true, TEXT, AUTH.as_bytes());
+        rsv1[0] |= 0x40;
+        let (seen, diverted) = run(&rsv1, 7);
+        assert!(diverted.is_empty());
+        assert_eq!(seen, vec![0xC1, 0x80, 0, 0, 0, 0]);
+        assert!(matches!(messages(seen).1, Some(tungstenite::Error::Protocol(_))));
+        let mut open = frame(false, BINARY, &[1, 2, 3]);
+        open.extend(frame(true, TEXT, AUTH.as_bytes()));
+        let (seen, diverted) = run(&open, 7);
+        assert!(diverted.is_empty() && !token_reaches_tungstenite(&seen));
+        let (got, error) = messages(seen);
+        assert!(got.is_empty() && matches!(error, Some(tungstenite::Error::Protocol(_))), "{error:?}");
+        // A continuation without a start, an unknown opcode, a fragmented ping.
         assert!(messages(run(&frame(true, CONTINUATION, b"x"), 1).0).1.is_some());
-        let mut reserved = frame(true, TEXT, b"x");
-        reserved[0] |= 0x40;
-        assert!(messages(run(&reserved, 1).0).1.is_some());
+        assert!(messages(run(&frame(true, 0x3, b"x"), 1).0).1.is_some());
+        assert!(messages(run(&frame(false, 0x9, b"x"), 1).0).1.is_some());
         // The stream ends inside an auth: nothing of it is handed over.
         let mut cut = frame(false, TEXT, a);
         cut.extend_from_slice(&frame(true, CONTINUATION, b"rest")[..3]);
         let (seen, diverted) = run(&cut, 5);
-        assert!(diverted.is_empty() && !seen.windows(5).any(|w| w == b"nbsa_"));
+        assert!(diverted.is_empty() && seen.is_empty());
     }
 }

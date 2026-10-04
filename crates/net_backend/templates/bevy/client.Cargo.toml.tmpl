@@ -1,0 +1,12 @@
+[package]
+name = "{{package}}"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# The Bevy client (HTTP + WebSocket) and the server's message types, which plug into it as typed
+# requests and pushes (feature `bevy_net_backend`). Bevy is pinned exactly, like bevy_net_backend.
+bevy_net_backend = { version = "{{bevy_net_backend_version}}", features = ["http", "json", "ws"] }
+net_backend_protocol = { version = "{{version}}", features = ["bevy_net_backend"] }
+bevy = { version = "=0.19.0", default-features = false, features = ["std", "bevy_log"] }

@@ -1,4 +1,4 @@
-//! The WebSocket envelope: JSON objects in text frames, exactly as `bevy_net_backend` 0.1.0's
+//! The WebSocket envelope: JSON objects in text frames, exactly as `bevy_net_backend`'s
 //! `JsonEnvelope` speaks them.
 //!
 //! | Direction | Frame | JSON |

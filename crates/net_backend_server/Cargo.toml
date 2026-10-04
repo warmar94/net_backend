@@ -1,6 +1,6 @@
 [package]
 name = "net_backend_server"
-version = "0.1.1"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 description = "A framework for game backend servers: tokio + axum, modules with hooks, MySQL / PostgreSQL / SQLite, migrations, OpenAPI."
@@ -14,9 +14,9 @@ categories = ["game-development", "network-programming", "web-programming::http-
 exclude = ["NOTES.md", "docs/", "/target"]
 
 [features]
-# MySQL is the default database (owner decision); every backend is additive and any combination
+# PostgreSQL is the default database; every backend is additive and any combination
 # compiles. At least one is needed at runtime: without any, starting the server is a clear error.
-default = ["mysql"]
+default = ["postgres"]
 # MySQL / MariaDB through sqlx (TLS: rustls with ring, webpki roots).
 mysql = ["sqlx/mysql", "sqlx/tls-rustls-ring-webpki", "sea-query-sqlx/sqlx-mysql"]
 # PostgreSQL through sqlx (TLS: rustls with ring, webpki roots).
@@ -34,10 +34,35 @@ smtp = ["dep:lettre"]
 storage = []
 # The chat module (rooms, DMs, history, presence over the WebSocket hub). No extra dependency.
 chat = []
+# The leaderboards module (boards, scores, ranks: `/v1/leaderboards`). No extra dependency.
+leaderboards = []
+# The notifications module (stored per player, pushed live: `/v1/notifications`, `notify.*`). No extra
+# dependency.
+notifications = []
+# The friends module (requests by id, name or friend code; blocks; online state: `/v1/friends`,
+# `friends.presence`). No extra dependency.
+friends = []
+# The groups module (guilds / clans: invitations, roles, metadata, a name search, a chat room per
+# group with the chat module: `/v1/groups`). No extra dependency.
+groups = []
+# The lobbies module (lobbies with a host, join codes, ready flags, metadata, a metadata search, a chat
+# room per lobby with the chat module: `/v1/lobbies`, `lobby.member`, `lobby.changed`). No extra dependency.
+lobbies = []
+# The matchmaking module (queues, tickets, matching rounds by the game's hooks: `/v1/matchmaking`,
+# `match.found`, `match.expired`; tickets in memory). No extra dependency.
+matchmaking = []
+# The OpenID Connect login module (an identity provider's ID token, e.g. Google's: `/v1/auth/oauth/{provider}`).
+# Signatures checked with ring (RS256 / ES256); the provider's keys fetched over HTTPS (hyper + rustls
+# with ring, webpki roots; no OpenSSL, no aws-lc).
+oauth = ["dep:ring", "dep:base64", "dep:hyper-rustls", "dep:rustls", "hyper-util/client-legacy", "hyper-util/http1"]
+# The files module (binary uploads with quotas, downloads, visibility and share lists: `/v1/files`;
+# bytes in a local folder or an app-provided store). Multipart parsing through axum's `multipart`
+# (multer); file I/O through tokio.
+files = ["axum/multipart", "tokio/fs", "tokio/io-util"]
 
 [dependencies]
 # The shared message types (error body, routes, version, ids, timestamps).
-net_backend_protocol = { path = "../net_backend_protocol", version = "0.1.0" }
+net_backend_protocol = { path = "../net_backend_protocol", version = "0.2.0" }
 
 # HTTP. Caret minimums (PLUGINS §8): apps depend on axum / tower-http themselves, and an `=` pin
 # would break their resolution at the next patch. These crates are re-exported and part of our
@@ -52,6 +77,8 @@ tower = { version = "0.5.2", default-features = false, features = ["util"] }
 # Ubiquitous crates: caret minimums (an exact pin would force every app's version).
 tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 http = "1.3"
+# The request body wrapper of the upload time limits (`http::upload_timeout`); axum's own body trait.
+http-body = "1.0"
 serde = { workspace = true, features = ["rc"] }
 serde_json = { workspace = true }
 # The WebSocket protocol under `/v1/ws`: the same tungstenite / tokio-tungstenite versions axum's `ws`
@@ -76,12 +103,18 @@ hmac = "0.12.1"
 # NFC for emails and passwords (the same text typed on different keyboards compares equal).
 unicode-normalization = "0.1.25"
 
-# Steam (feature `steam`): an HTTPS client without OpenSSL / aws-lc (hyper-rustls with ring).
+# Steam (feature `steam`) and OpenID Connect keys (feature `oauth`): an HTTPS client without OpenSSL /
+# aws-lc (hyper-rustls with ring).
 hyper-rustls = { version = "0.27.10", default-features = false, features = ["http1", "ring", "tls12", "webpki-tokio"], optional = true }
 rustls = { version = "0.23.31", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 
 # Mail (feature `smtp`): lettre's SMTP transport on tokio with rustls + ring (no native-tls / aws-lc).
 lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls", "rustls-tls"], optional = true }
+
+# OpenID Connect (feature `oauth`): RS256 / ES256 signature checks with ring (already in the tree through
+# rustls) and base64url decoding of the token parts (already in the tree).
+ring = { version = "0.17.14", optional = true }
+base64 = { version = "0.22.1", default-features = false, features = ["alloc"], optional = true }
 
 # Database: sqlx pools behind the `Db` enum, statements built with sea-query (one statement, three
 # dialects). Caret minimums: apps use sqlx directly (pools, `FromRow`); re-exported (see above).
@@ -106,15 +139,18 @@ tokio-tungstenite = { version = "0.29.0", default-features = false, features = [
 futures-util = { version = "0.3.31", default-features = false, features = ["std", "sink"] }
 # `tests/ws_log.rs` captures `log` records (already in the tree).
 log = "0.4"
+# `tests/oauth.rs` signs test ID tokens (RS256 / ES256) for its local mock OpenID provider (both in the tree).
+ring = "0.17.14"
+base64 = "0.22.1"
 
 [[example]]
 name = "minimal"
 
-# The reference server (Auth + Storage + Chat from the configuration) that the repository's
-# deployment files install.
+# The reference server (every module, from the configuration) that the repository's deployment
+# files install.
 [[example]]
 name = "server"
-required-features = ["storage", "chat"]
+required-features = ["storage", "chat", "leaderboards", "notifications", "friends", "groups", "oauth", "lobbies", "matchmaking", "files"]
 
 [package.metadata.docs.rs]
 all-features = true

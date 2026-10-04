@@ -5,7 +5,8 @@ Description=net_backend_server game backend
 Documentation=https://github.com/warmar94/net_backend/tree/main/deploy
 After=network-online.target mysql.service mariadb.service postgresql.service
 Wants=network-online.target
-# Give up after 5 failed starts within 10 minutes (then `systemctl reset-failed` + start).
+# Give up after 5 starts within 10 minutes (crash restarts AND `systemctl restart`s count: a sixth
+# restart in that time is refused; then `systemctl reset-failed net-backend` + start).
 StartLimitIntervalSec=600
 StartLimitBurst=5
 
@@ -19,10 +20,10 @@ ExecStartPre=/usr/local/bin/net-backend-server migrate
 ExecStart=/usr/local/bin/net-backend-server serve
 Restart=on-failure
 RestartSec=5s
-# SIGTERM starts the graceful shutdown: server.shutdown_grace_secs (20 s), then up to 10 s per module
-# shutdown (3 modules) and the pool close (5 s); 90 s leaves room.
+# SIGTERM starts the graceful shutdown: server.shutdown_grace_secs (20 s), then the modules' shutdown
+# (10 s, all at once) and the pool close (5 s); 60 s leaves room.
 KillSignal=SIGTERM
-TimeoutStopSec=90s
+TimeoutStopSec=60s
 # Migrations on a big database may take a while; the start itself is quick.
 TimeoutStartSec=300s
 

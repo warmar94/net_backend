@@ -24,6 +24,48 @@ pub const CHAT_DELETED: &str = "chat.deleted";
 pub const CHAT_MEMBERS: &str = "chat.members";
 /// Push: a user came online in a room or left it ([`Presence`](crate::chat::Presence)).
 pub const CHAT_PRESENCE: &str = "chat.presence";
+/// Request: change a message's text ([`EditMessage`](crate::chat::EditMessage)).
+pub const CHAT_EDIT: &str = "chat.edit";
+/// Push: a message's text was changed ([`MessageEdited`](crate::chat::MessageEdited)).
+pub const CHAT_EDITED: &str = "chat.edited";
+/// Request: store the caller's read marker of a room ([`MarkRead`](crate::chat::MarkRead)).
+pub const CHAT_MARK_READ: &str = "chat.mark_read";
+/// Push: a member's read marker moved ([`ReadReceipt`](crate::chat::ReadReceipt)).
+pub const CHAT_READ: &str = "chat.read";
+/// Request: the read markers of a room ([`ListReceipts`](crate::chat::ListReceipts)).
+pub const CHAT_RECEIPTS: &str = "chat.receipts";
+/// Request: the caller's unread counts ([`UnreadQuery`](crate::chat::UnreadQuery)).
+pub const CHAT_UNREAD: &str = "chat.unread";
+/// Request: the caller types in a room or stopped ([`SetTyping`](crate::chat::SetTyping)).
+pub const CHAT_SET_TYPING: &str = "chat.set_typing";
+/// Push: a user types in a room or stopped ([`TypingUpdate`](crate::chat::TypingUpdate)).
+pub const CHAT_TYPING: &str = "chat.typing";
+/// Push: a player room changed: name, members, roles, deletion ([`RoomUpdate`](crate::chat::RoomUpdate)).
+pub const CHAT_ROOM: &str = "chat.room";
+
+/// Request: a page of the caller's notifications ([`NotificationQuery`](crate::notifications::NotificationQuery)).
+pub const NOTIFY_LIST: &str = "notify.list";
+/// Request: how many notifications the caller has ([`CountNotifications`](crate::notifications::CountNotifications)).
+pub const NOTIFY_COUNT: &str = "notify.count";
+/// Request: mark notifications read or unread ([`MarkNotifications`](crate::notifications::MarkNotifications)).
+pub const NOTIFY_MARK: &str = "notify.mark";
+/// Request: delete a notification ([`DeleteNotification`](crate::notifications::DeleteNotification)).
+pub const NOTIFY_DELETE: &str = "notify.delete";
+/// Push: a new notification for the player ([`Notification`](crate::notifications::Notification)).
+pub const NOTIFY_NEW: &str = "notify.new";
+
+/// Push: a friend came online or went offline ([`FriendPresence`](crate::friends::FriendPresence)).
+pub const FRIENDS_PRESENCE: &str = "friends.presence";
+
+/// Push: a lobby member joined, left, was kicked or changed its ready flag ([`LobbyMemberUpdate`](crate::lobbies::LobbyMemberUpdate)).
+pub const LOBBY_MEMBER: &str = "lobby.member";
+/// Push: a lobby's host, metadata, settings, state or join code changed ([`LobbyUpdate`](crate::lobbies::LobbyUpdate)).
+pub const LOBBY_CHANGED: &str = "lobby.changed";
+
+/// Push: the player's matchmaking ticket was matched ([`MatchFound`](crate::matchmaking::MatchFound)).
+pub const MATCH_FOUND: &str = "match.found";
+/// Push: the player's matchmaking ticket ran out unmatched ([`TicketExpired`](crate::matchmaking::TicketExpired)).
+pub const MATCH_EXPIRED: &str = "match.expired";
 
 /// Whether `kind` is reserved for authentication (`auth`, `auth.ok`, `auth.failed`): never a push
 /// or a game's own request kind.
@@ -32,7 +74,38 @@ pub fn is_reserved(kind: &str) -> bool {
 }
 
 /// Every kind this crate defines (for tests and for a server's routing table).
-pub const ALL: &[&str] = &[AUTH, AUTH_OK, AUTH_FAILED, CHAT_JOIN, CHAT_LEAVE, CHAT_SEND, CHAT_HISTORY, CHAT_MESSAGE, CHAT_DELETED, CHAT_MEMBERS, CHAT_PRESENCE];
+pub const ALL: &[&str] = &[
+    AUTH,
+    AUTH_OK,
+    AUTH_FAILED,
+    CHAT_JOIN,
+    CHAT_LEAVE,
+    CHAT_SEND,
+    CHAT_HISTORY,
+    CHAT_MESSAGE,
+    CHAT_DELETED,
+    CHAT_MEMBERS,
+    CHAT_PRESENCE,
+    CHAT_EDIT,
+    CHAT_EDITED,
+    CHAT_MARK_READ,
+    CHAT_READ,
+    CHAT_RECEIPTS,
+    CHAT_UNREAD,
+    CHAT_SET_TYPING,
+    CHAT_TYPING,
+    CHAT_ROOM,
+    NOTIFY_LIST,
+    NOTIFY_COUNT,
+    NOTIFY_MARK,
+    NOTIFY_DELETE,
+    NOTIFY_NEW,
+    FRIENDS_PRESENCE,
+    LOBBY_MEMBER,
+    LOBBY_CHANGED,
+    MATCH_FOUND,
+    MATCH_EXPIRED,
+];
 
 #[cfg(test)]
 mod tests {

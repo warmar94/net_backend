@@ -2,7 +2,7 @@
 //!
 //! | Event | Kind | When |
 //! |---|---|---|
-//! | [`BeforeStorageWrite`] | before | an object is about to be written (PUT, each batch item, server / admin writes); validate the game's data, change `value` (checked again against the size limit) or refuse |
+//! | [`BeforeStorageWrite`] | before | an object is about to be written (PUT, each batch item, server / admin writes); validate the game's data, change `value` (checked again against the size limit) or `visibility` (checked again), or refuse |
 //! | [`InStorageWriteTx`] | in_tx | the object row is written, the transaction is still open: write your own rows with it (atomic with the save), or refuse (everything rolls back). Use only the given transaction (never `StorageService` inside it); it may run again if the database aborts the transaction as a deadlock |
 //! | [`AfterStorageWrite`] | after | the write is committed |
 //! | [`BeforeStorageDelete`] | before | an object is about to be deleted; refuse to keep it |
@@ -31,7 +31,7 @@
 //! # let _ = server;
 //! ```
 
-use net_backend_protocol::storage::ObjectVersion;
+use net_backend_protocol::storage::{ObjectVersion, ObjectVisibility};
 use net_backend_protocol::{UnixMillis, UserId};
 use serde_json::Value;
 
@@ -49,8 +49,8 @@ pub enum Writer {
     Admin(UserId),
 }
 
-/// An object is about to be written. Hooks may change `value` or refuse; the other fields are
-/// for reading (changes to them are ignored).
+/// An object is about to be written. Hooks may change `value` and `visibility` or refuse; the
+/// other fields are for reading (changes to them are ignored).
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct BeforeStorageWrite {
@@ -64,6 +64,10 @@ pub struct BeforeStorageWrite {
     pub value: Value,
     /// The version the writer expects, if any.
     pub if_version: Option<ObjectVersion>,
+    /// The visibility the write sets (`None`: an existing object keeps its own, a new one is
+    /// `private`). Hooks may change it (checked again: `friends` needs the friends module), e.g.
+    /// to keep content private until the game reviewed it.
+    pub visibility: Option<ObjectVisibility>,
     /// Who writes.
     pub writer: Writer,
 }

@@ -38,8 +38,10 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use net_backend_protocol::auth::{AuthSession, LoginRequest, RegisterRequest, SteamLoginRequest, TokenPair};
+use net_backend_protocol::oauth::OAuthLogin;
 use net_backend_protocol::{HttpCall, ServerInfo};
 
 use crate::runtime::{refuse_on_client_thread, RuntimeThread};
@@ -101,6 +103,27 @@ impl Client {
         self.runtime.spawn(async move { client.call(&call).await })
     }
 
+    /// [`call`](Self::call) with its own deadline instead of the builder's (see
+    /// [`crate::Client::call_with_timeout`]; clamped to 1 ms..=1 h).
+    pub fn call_with_timeout<C: HttpCall + Clone + Send + Sync + 'static>(&self, call: &C, timeout: Duration) -> Result<C::Response, Error>
+    where
+        C::Response: Send + 'static,
+    {
+        let client = self.inner.clone();
+        let call = call.clone();
+        self.runtime.block(async move { client.call_with_timeout(&call, timeout).await })
+    }
+
+    /// [`send`](Self::send) with its own deadline instead of the builder's (see
+    /// [`crate::Client::call_with_timeout`]; clamped to 1 ms..=1 h).
+    pub fn send_with_timeout<C: HttpCall + Send + Sync + 'static>(&self, call: C, timeout: Duration) -> Reply<C::Response>
+    where
+        C::Response: Send + 'static,
+    {
+        let client = self.inner.clone();
+        self.runtime.spawn(async move { client.call_with_timeout(&call, timeout).await })
+    }
+
     /// `GET /v1/info`.
     pub fn info(&self) -> Result<ServerInfo, Error> {
         let client = self.inner.clone();
@@ -129,6 +152,121 @@ impl Client {
     pub fn link_steam(&self, request: SteamLoginRequest) -> Result<AuthSession, Error> {
         let client = self.inner.clone();
         self.runtime.block(async move { client.link_steam(request).await })
+    }
+
+    /// Log in with an OpenID Connect provider's ID token (see [`crate::Client::login_oauth`]).
+    pub fn login_oauth(&self, login: OAuthLogin) -> Result<AuthSession, Error> {
+        let client = self.inner.clone();
+        self.runtime.block(async move { client.login_oauth(login).await })
+    }
+
+    /// Link an OpenID Connect provider account (see [`crate::Client::link_oauth`]).
+    pub fn link_oauth(&self, login: OAuthLogin) -> Result<AuthSession, Error> {
+        let client = self.inner.clone();
+        self.runtime.block(async move { client.link_oauth(login).await })
+    }
+
+    /// Sign in at a provider in the system browser, then log in (see
+    /// [`crate::Client::sign_in_oauth`]). Blocks until the player is back (or the flow's time
+    /// limit); `open` runs on the client's thread.
+    #[cfg(feature = "oauth")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "oauth")))]
+    pub fn sign_in_oauth<F>(&self, provider: &str, flow: &crate::oauth::OAuthFlow, open: F) -> Result<AuthSession, Error>
+    where
+        F: FnOnce(&str) -> Result<(), String> + Send + 'static,
+    {
+        let client = self.inner.clone();
+        let (provider, flow) = (provider.to_string(), flow.clone());
+        self.runtime.block(async move { client.sign_in_oauth(&provider, &flow, open).await })
+    }
+
+    /// The same sign-in without blocking (game loops): the answer arrives in the [`Reply`]; poll it
+    /// with [`Reply::try_take`] every frame. `open` runs on the client's thread.
+    ///
+    /// [`Reply::cancel`] ends the sign-in: the loopback listener is closed and the answer is
+    /// [`Error::Cancelled`] with `sent: Some(false)` while the code had not been sent to the
+    /// provider's token endpoint (nothing reached the provider or the server), `None` after (the
+    /// code exchange or the server's login may have happened).
+    #[cfg(feature = "oauth")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "oauth")))]
+    pub fn start_sign_in_oauth<F>(&self, provider: &str, flow: &crate::oauth::OAuthFlow, open: F) -> Reply<AuthSession>
+    where
+        F: FnOnce(&str) -> Result<(), String> + Send + 'static,
+    {
+        let client = self.inner.clone();
+        let (provider, flow) = (provider.to_string(), flow.clone());
+        self.runtime.spawn(async move { client.sign_in_oauth(&provider, &flow, open).await })
+    }
+
+    /// Sign in at a provider in the system browser, then link that provider account to the
+    /// logged-in account (see [`crate::Client::link_oauth_sign_in`]; needs a recent login).
+    /// Blocks until the player is back (or the flow's time limit); `open` runs on the client's
+    /// thread.
+    #[cfg(feature = "oauth")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "oauth")))]
+    pub fn link_oauth_sign_in<F>(&self, provider: &str, flow: &crate::oauth::OAuthFlow, open: F) -> Result<AuthSession, Error>
+    where
+        F: FnOnce(&str) -> Result<(), String> + Send + 'static,
+    {
+        let client = self.inner.clone();
+        let (provider, flow) = (provider.to_string(), flow.clone());
+        self.runtime.block(async move { client.link_oauth_sign_in(&provider, &flow, open).await })
+    }
+
+    /// The same link without blocking (game loops): the answer arrives in the [`Reply`]; poll it
+    /// with [`Reply::try_take`] every frame. `open` runs on the client's thread.
+    ///
+    /// [`Reply::cancel`] ends the sign-in: the loopback listener is closed and the answer is
+    /// [`Error::Cancelled`] with `sent: Some(false)` while the code had not been sent to the
+    /// provider's token endpoint (nothing reached the provider or the server), `None` after (the
+    /// code exchange or the server's link may have happened).
+    #[cfg(feature = "oauth")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "oauth")))]
+    pub fn start_link_oauth_sign_in<F>(&self, provider: &str, flow: &crate::oauth::OAuthFlow, open: F) -> Reply<AuthSession>
+    where
+        F: FnOnce(&str) -> Result<(), String> + Send + 'static,
+    {
+        let client = self.inner.clone();
+        let (provider, flow) = (provider.to_string(), flow.clone());
+        self.runtime.spawn(async move { client.link_oauth_sign_in(&provider, &flow, open).await })
+    }
+
+    /// Upload a file (see [`crate::Client::upload_file`]).
+    pub fn upload_file(&self, upload: crate::files::FileUpload) -> Result<net_backend_protocol::files::FileInfo, Error> {
+        let client = self.inner.clone();
+        self.runtime.block(async move { client.upload_file(upload).await })
+    }
+
+    /// Start an upload with progress (see [`crate::Client::start_upload`]); poll it with
+    /// `try_progress` / `try_finish` or block with `wait`.
+    pub fn start_upload(&self, upload: crate::files::FileUpload) -> crate::files::FileTransfer<net_backend_protocol::files::FileInfo> {
+        let client = self.inner.clone();
+        self.runtime.enter(move || client.start_upload(upload))
+    }
+
+    /// Download a file into memory (see [`crate::Client::download_file`]).
+    pub fn download_file(&self, file: net_backend_protocol::FileId, options: crate::files::DownloadOptions) -> Result<Vec<u8>, Error> {
+        let client = self.inner.clone();
+        self.runtime.block(async move { client.download_file(file, options).await })
+    }
+
+    /// Download a file to `path` (see [`crate::Client::download_file_to`]).
+    pub fn download_file_to(&self, file: net_backend_protocol::FileId, path: impl AsRef<std::path::Path>) -> Result<u64, Error> {
+        let client = self.inner.clone();
+        let path = path.as_ref().to_path_buf();
+        self.runtime.block(async move { client.download_file_to(file, path).await })
+    }
+
+    /// Start a download to `path` with progress (see [`crate::Client::start_download_to`]).
+    pub fn start_download_to(
+        &self,
+        file: net_backend_protocol::FileId,
+        path: impl AsRef<std::path::Path>,
+        options: crate::files::DownloadOptions,
+    ) -> crate::files::FileTransfer<u64> {
+        let client = self.inner.clone();
+        let path = path.as_ref().to_path_buf();
+        self.runtime.enter(move || client.start_download_to(file, path, options))
     }
 
     /// Get a new token pair now.

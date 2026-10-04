@@ -24,9 +24,11 @@
 //!   ([`WsAuthMode`]), or the first-message `auth`. The token is refreshed first when it is about
 //!   to expire; a handshake refused with 401 (`token_expired` / `unauthorized`) gets ONE refresh
 //!   and one more try.
-//! - **Never** an automatic reconnect after a close code 4000–4099, except ONE refresh + one new
-//!   connection after 4001 (a revoked token); 4003 (banned), 4009 (replaced), 4010 (unsupported
-//!   protocol) and a second 4001 end the connection ([`WsEvent::Closed`]).
+//! - **Never** an automatic reconnect after a close code 4000–4099, except after 4001 (a revoked
+//!   token) with a reconnect policy: ONE refresh, then one new connection at once (a refresh that
+//!   fails for a passing reason, e.g. the network, goes on with the backoff below; a refused one
+//!   ends the session). 4003 (banned), 4009 (replaced), 4010 (unsupported protocol), a second
+//!   4001, and 4001 without a reconnect policy end the connection ([`WsEvent::Closed`]).
 //! - Every other loss (1000, 1001, 1006, 1008, 1009, 1011, 1013, network, heartbeat) reconnects
 //!   with exponential backoff and full jitter ([`Reconnect`]); a 429 / 503 handshake waits at least
 //!   its `Retry-After`. A TLS or certificate error on a reconnect attempt ends the connection,
@@ -45,7 +47,7 @@ mod task;
 use std::fmt;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::time::Duration;
 
 use net_backend_protocol::{ServerPush, WsCall, WsRequestFrame};
@@ -57,6 +59,9 @@ use crate::runtime::RuntimeThread;
 use crate::{Client, Error, Reply, MAX_TIMEOUT};
 
 pub(crate) use task::{Command, Pending};
+
+/// The largest push / event stream buffer ([`WsSettings::with_push_buffer`]).
+const MAX_STREAM_BUFFER: usize = 65_536;
 
 /// How the socket authenticates.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -238,16 +243,16 @@ impl WsSettings {
         self
     }
 
-    /// How many pushes each push stream buffers (default 256, at least 1); a stream that falls
+    /// How many pushes each push stream buffers (default 256, 1..=65 536); a stream that falls
     /// further behind gets [`Error::Lagged`].
     pub fn with_push_buffer(mut self, pushes: usize) -> Self {
-        self.push_buffer = pushes.max(1);
+        self.push_buffer = pushes.clamp(1, MAX_STREAM_BUFFER);
         self
     }
 
-    /// How many events each event stream buffers (default 64, at least 1).
+    /// How many events each event stream buffers (default 64, 1..=65 536).
     pub fn with_event_buffer(mut self, events: usize) -> Self {
-        self.event_buffer = events.max(1);
+        self.event_buffer = events.clamp(1, MAX_STREAM_BUFFER);
         self
     }
 
@@ -333,10 +338,14 @@ pub(crate) struct Shared {
     pub(crate) commands: mpsc::UnboundedSender<Command>,
     pub(crate) next_id: AtomicU64,
     pub(crate) state: watch::Receiver<WsState>,
-    /// Templates for new subscriptions (only the task holds the senders, so streams end with it).
-    pub(crate) events: Mutex<broadcast::Receiver<WsEvent>>,
-    pub(crate) pushes: Mutex<broadcast::Receiver<Arc<WsPush>>>,
+    /// For new subscriptions: weak senders (only the task holds the strong ones, so streams end
+    /// with it; nothing is buffered while no stream exists).
+    pub(crate) events: broadcast::WeakSender<WsEvent>,
+    pub(crate) pushes: broadcast::WeakSender<Arc<WsPush>>,
     pub(crate) settings: WsSettings,
+    /// The task runs on a current-thread runtime other than the client's own thread (see
+    /// [`Reply::wait`]).
+    pub(crate) on_current_thread: bool,
     /// Keeps the blocking interface's runtime thread alive while the connection is used.
     pub(crate) _runtime: Option<Arc<RuntimeThread>>,
 }
@@ -407,7 +416,7 @@ impl WsConnection {
             Ok(text) => text,
             Err(e) => return Reply::ready(Err(Error::invalid(format!("the request cannot be encoded: {e}")))),
         };
-        let (sender, reply) = Reply::channel();
+        let (sender, reply) = Reply::channel_from(self.shared.on_current_thread);
         let answer = Box::new(move |result: Result<Value, Error>| {
             let typed =
                 result.and_then(|value| serde_json::from_value::<C::Response>(value).map_err(|e| Error::Decode { status: None, message: e.to_string() }));
@@ -424,7 +433,7 @@ impl WsConnection {
             Ok(text) => text,
             Err(e) => return Reply::ready(Err(Error::invalid(format!("the request cannot be encoded: {e}")))),
         };
-        let (sender, reply) = Reply::channel();
+        let (sender, reply) = Reply::channel_from(self.shared.on_current_thread);
         let answer = Box::new(move |result: Result<Value, Error>| {
             let _ = sender.send(result);
         });
@@ -461,17 +470,17 @@ impl WsConnection {
     /// Typed pushes of one kind (`P::KIND`), e.g. `subscribe::<ChatMessage>()`. Only pushes that
     /// arrive after this call; each stream has its own buffer.
     pub fn subscribe<P: ServerPush>(&self) -> PushStream<P> {
-        PushStream { receiver: self.shared.pushes.lock().unwrap_or_else(PoisonError::into_inner).resubscribe(), kind: Some(P::KIND), _type: PhantomData }
+        PushStream { receiver: subscribe_weak(&self.shared.pushes), kind: Some(P::KIND), _type: PhantomData }
     }
 
     /// Every push, untyped ([`WsPush`]).
     pub fn pushes(&self) -> PushStream<WsPush> {
-        PushStream { receiver: self.shared.pushes.lock().unwrap_or_else(PoisonError::into_inner).resubscribe(), kind: None, _type: PhantomData }
+        PushStream { receiver: subscribe_weak(&self.shared.pushes), kind: None, _type: PhantomData }
     }
 
     /// What happens to the connection (connected, reconnecting, closed). Only events after this call.
     pub fn events(&self) -> WsEvents {
-        WsEvents { receiver: self.shared.events.lock().unwrap_or_else(PoisonError::into_inner).resubscribe() }
+        WsEvents { receiver: subscribe_weak(&self.shared.events) }
     }
 
     /// The current state.
@@ -494,6 +503,15 @@ impl WsConnection {
     pub async fn closed(&self) {
         let mut state = self.shared.state.clone();
         let _ = state.wait_for(|s| *s == WsState::Closed).await;
+    }
+}
+
+/// A new receiver of the task's channel (only what is sent from now on); an already ended one
+/// once the task is gone.
+fn subscribe_weak<T: Clone>(sender: &broadcast::WeakSender<T>) -> broadcast::Receiver<T> {
+    match sender.upgrade() {
+        Some(sender) => sender.subscribe(),
+        None => broadcast::channel(1).1,
     }
 }
 
@@ -617,6 +635,10 @@ mod tests {
         assert!(!Reconnect::default().with_max_attempts(Some(2)).may_retry(3));
         let settings = WsSettings::default().with_heartbeat(Duration::from_secs(20), Duration::from_secs(1));
         assert_eq!(settings.dead_after, Duration::from_secs(20), "dead_after is at least the interval");
+        let settings = WsSettings::default().with_push_buffer(usize::MAX).with_event_buffer(usize::MAX / 2);
+        assert_eq!((settings.push_buffer, settings.event_buffer), (MAX_STREAM_BUFFER, MAX_STREAM_BUFFER), "bounded: no panic, no huge allocation");
+        let settings = WsSettings::default().with_push_buffer(0).with_event_buffer(0);
+        assert_eq!((settings.push_buffer, settings.event_buffer), (1, 1));
     }
 
     #[test]

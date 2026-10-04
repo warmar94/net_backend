@@ -1,8 +1,8 @@
 //! A minimal game server: the framework plus one custom route. Headless.
 //!
 //! ```text
-//! # MySQL (the default feature):
-//! NBS__DATABASE__URL=mysql://game:secret@127.0.0.1/game cargo run --example minimal
+//! # PostgreSQL (the default feature):
+//! NBS__DATABASE__URL=postgres://game:secret@127.0.0.1/game cargo run --example minimal
 //! # or SQLite in memory, no database server needed:
 //! NBS__DATABASE__URL=sqlite::memory: cargo run --example minimal --no-default-features --features sqlite
 //!

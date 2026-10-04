@@ -247,17 +247,51 @@ pub(crate) struct RevokedRow {
     pub(crate) revoke_reason: Option<String>,
 }
 
-/// Sessions revoked at or after `since`, oldest first (the revocation poll).
-pub(crate) fn revoked_since(since: i64, limit: u64) -> SelectStatement {
+/// Sessions revoked after the position `(at, id)` in `(revoked_at, id)` order, oldest first: one
+/// keyset page of the revocation poll (`id = i64::MIN` starts at `at` itself).
+pub(crate) fn revoked_after(at: i64, id: i64, limit: u64) -> SelectStatement {
     let mut select = Query::select();
     select
         .columns(["id", "user_id", "revoked_at", "revoke_reason"])
         .from(SESSIONS)
-        .and_where(Expr::col("revoked_at").gte(since))
+        .and_where(Expr::col("revoked_at").gt(at).or(Expr::col("revoked_at").eq(at).and(Expr::col("id").gt(id))))
         .order_by("revoked_at", Order::Asc)
         .order_by("id", Order::Asc)
         .limit(limit);
     select
+}
+
+#[derive(Debug, sqlx::FromRow)]
+pub(crate) struct SessionIdRow {
+    pub(crate) id: i64,
+}
+
+/// A user's live sessions (not revoked, not expired) beyond the newest `keep`, newest first (the
+/// per-user session cap revokes them).
+pub(crate) fn sessions_over_cap(user: i64, now: i64, keep: u64) -> SelectStatement {
+    let mut select = Query::select();
+    select
+        .column("id")
+        .from(SESSIONS)
+        .and_where(Expr::col("user_id").eq(user))
+        .and_where(Expr::col("revoked_at").is_null())
+        .and_where(Expr::col("expires_at").gt(now))
+        .order_by("id", Order::Desc)
+        .limit(1000)
+        .offset(keep);
+    select
+}
+
+/// Revoke these sessions (those not revoked yet).
+pub(crate) fn revoke_session_ids(ids: &[i64], reason: &str, now: i64) -> UpdateStatement {
+    let mut update = Query::update();
+    update
+        .table(SESSIONS)
+        .value("revoked_at", now)
+        .value("revoke_reason", reason)
+        .and_where(Expr::col("id").is_in(ids.iter().copied()))
+        .and_where(Expr::col("revoked_at").is_null());
+    update
 }
 
 pub(crate) fn delete_role(user: i64, role: &str) -> DeleteStatement {

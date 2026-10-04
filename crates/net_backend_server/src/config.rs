@@ -69,9 +69,48 @@ impl fmt::Debug for SecretString {
     }
 }
 
+/// A secret is text: a number or `true` / `false` (an environment value like
+/// `NBS__MODULES__AUTH__SMTP_PASSWORD=12345678` reads as a TOML number) is taken as its text. Any
+/// other type is refused with a message that never shows the value.
 impl<'de> Deserialize<'de> for SecretString {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        String::deserialize(deserializer).map(SecretString)
+        struct SecretVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for SecretVisitor {
+            type Value = SecretString;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a string")
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<SecretString, E> {
+                Ok(SecretString(value.to_string()))
+            }
+            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<SecretString, E> {
+                Ok(SecretString(value))
+            }
+            // The TOML text of the number (`env_value` keeps a number only when this gives its
+            // text back unchanged).
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<SecretString, E> {
+                Ok(SecretString(toml::Value::Integer(value).to_string()))
+            }
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<SecretString, E> {
+                Ok(SecretString(value.to_string()))
+            }
+            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<SecretString, E> {
+                Ok(SecretString(toml::Value::Float(value).to_string()))
+            }
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<SecretString, E> {
+                Ok(SecretString(value.to_string()))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, _: A) -> Result<SecretString, A::Error> {
+                Err(serde::de::Error::custom("a secret must be a string, not a list"))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, _: A) -> Result<SecretString, A::Error> {
+                Err(serde::de::Error::custom("a secret must be a string, not a table"))
+            }
+        }
+
+        deserializer.deserialize_any(SecretVisitor)
     }
 }
 
@@ -101,6 +140,9 @@ pub struct Config {
     /// prints only the key names (a module section may hold secrets). A section without a
     /// registered module is refused when the server is built.
     pub modules: toml::Table,
+    /// `[permissions]`: role → the permissions it holds, replacing the declared defaults for that
+    /// role (see [`crate::permissions`]); checked against the declared permissions at build.
+    pub permissions: BTreeMap<String, Vec<String>>,
 }
 
 impl fmt::Debug for Config {
@@ -120,6 +162,7 @@ impl fmt::Debug for Config {
             .field("openapi", &self.openapi)
             .field("ws", &self.ws)
             .field("modules (keys only)", &modules)
+            .field("permissions", &self.permissions)
             .finish()
     }
 }
@@ -140,7 +183,9 @@ pub struct ServerConfig {
     pub header_read_timeout_secs: u64,
     /// The time limit of one module's `start`, in seconds (then the start fails). Default 30.
     pub module_start_timeout_secs: u64,
-    /// The time limit of one module's `shutdown`, in seconds (then it is abandoned). Default 10.
+    /// The time limit of the modules' `shutdown`, in seconds: they shut down at the same time, so
+    /// this is the time all of them get together (a module still running then is abandoned).
+    /// Default 10.
     pub module_shutdown_timeout_secs: u64,
 }
 
@@ -171,8 +216,12 @@ pub struct DatabaseConfig {
     pub max_connections: u32,
     /// Connections kept open while idle. Default 0.
     pub min_connections: u32,
-    /// How long a query waits for a free connection, in seconds. Default 5.
+    /// How long a query waits for a free connection, in seconds. Default 5. On SQLite also the
+    /// busy timeout: how long a statement waits for another connection's write lock.
     pub acquire_timeout_secs: u64,
+    /// SQLite only: when a commit waits for the disk (`PRAGMA synchronous`). Default
+    /// [`SqliteSynchronous::Normal`]. Ignored for MySQL and PostgreSQL.
+    pub sqlite_synchronous: SqliteSynchronous,
     /// Open connections only when first needed (the server starts even while the database is
     /// down; `/readyz` reports it). Default false: connect at startup and fail fast.
     pub connect_lazy: bool,
@@ -183,6 +232,12 @@ pub struct DatabaseConfig {
     pub migrations_dir: PathBuf,
     /// How long `migrate` waits for another process's migrations lock, in seconds. Default 60.
     pub migrate_lock_timeout_secs: u64,
+    /// MySQL / MariaDB / PostgreSQL: the longest a statement may run on the server's connections, in
+    /// seconds; the database cancels it after that (a request that timed out does not leave its
+    /// query running). PostgreSQL `statement_timeout` (every statement); MySQL `max_execution_time`
+    /// (read-only `SELECT`s); MariaDB `max_statement_time` (every statement). Migrations run without
+    /// it (on their own short-lived connections). Default 0: no limit. Ignored for SQLite.
+    pub statement_timeout_secs: u64,
 }
 
 impl Default for DatabaseConfig {
@@ -193,10 +248,41 @@ impl Default for DatabaseConfig {
             max_connections: 10,
             min_connections: 0,
             acquire_timeout_secs: 5,
+            sqlite_synchronous: SqliteSynchronous::Normal,
             connect_lazy: false,
             migrate_on_start: false,
             migrations_dir: PathBuf::from("migrations"),
             migrate_lock_timeout_secs: 60,
+            statement_timeout_secs: 0,
+        }
+    }
+}
+
+/// `database.sqlite_synchronous`: SQLite's `PRAGMA synchronous` for every pooled connection.
+///
+/// The server runs SQLite file databases in WAL mode. With `normal` a power loss or an operating
+/// system crash can lose the last commits before it; the file is never corrupted, and a crash of
+/// the server process alone loses nothing. With `full` every commit waits until the disk has it,
+/// which allows far fewer writes per second.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum SqliteSynchronous {
+    /// `PRAGMA synchronous = NORMAL` (SQLite's recommendation for WAL mode). The default.
+    #[default]
+    Normal,
+    /// `PRAGMA synchronous = FULL`: every commit waits for the disk.
+    Full,
+}
+
+impl std::str::FromStr for SqliteSynchronous {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "normal" => Ok(Self::Normal),
+            "full" => Ok(Self::Full),
+            _ => Err("expected `normal` or `full`".into()),
         }
     }
 }
@@ -216,8 +302,16 @@ pub struct HttpConfig {
     /// The request body limit of every route without its own, in bytes. Default 64 KiB (the
     /// protocol's `DEFAULT_BODY_LIMIT_BYTES`; axum's own default would be 2 MB).
     pub body_limit_bytes: usize,
-    /// The time limit of one request, in seconds (then 503 `unavailable`). Default 30.
+    /// The time limit of one request, in seconds (then 503 `unavailable`). Default 30. Routes with
+    /// [`upload_timeout`](crate::http::upload_timeout) (the files module's upload) use the upload
+    /// limits below while their body arrives, and this limit for the work after it.
     pub request_timeout_secs: u64,
+    /// An upload fails when no data arrives for this long, in seconds (503 `unavailable`). Default
+    /// 30; 1 to 3600.
+    pub upload_idle_timeout_secs: u64,
+    /// The time limit of a whole upload body, in seconds (503 `unavailable`). Default 3600 (an
+    /// hour); 0 = no overall limit (only the idle limit); at most 86400.
+    pub upload_timeout_secs: u64,
     /// Keep a client's `x-request-id` (when short and plain) instead of always making a new one.
     /// Default false; enable it behind a proxy that sets the header.
     pub trust_request_id: bool,
@@ -236,6 +330,8 @@ impl Default for HttpConfig {
         Self {
             body_limit_bytes: net_backend_protocol::routes::DEFAULT_BODY_LIMIT_BYTES,
             request_timeout_secs: 30,
+            upload_idle_timeout_secs: 30,
+            upload_timeout_secs: 3600,
             trust_request_id: false,
             max_body_bytes: 32 * 1024 * 1024,
             trusted_proxies: Vec::new(),
@@ -381,7 +477,9 @@ pub struct WsConfig {
     /// Frames waiting to be sent per socket (pushes): the largest burst the game may push to one
     /// socket at once. While a request handler runs, as many again are held back (they follow its
     /// answer). When both are full the socket is closed with 1013 (the client reconnects and
-    /// resyncs). Raise it for broadcast-heavy games. Default 256.
+    /// resyncs). Raise it for broadcast-heavy games. Default 256. Memory: per socket up to this many
+    /// waiting frames plus as many held back, each up to `max_message_bytes` (a frame pushed to a
+    /// room or to everyone is shared by its sockets).
     pub outbox_frames: usize,
     /// Incoming frames per second per socket (sustained); over it a request is answered
     /// `rate_limited`, and a socket that keeps flooding is closed with 1008. Default 20.
@@ -390,6 +488,8 @@ pub struct WsConfig {
     pub frame_burst: u32,
     /// The largest message in either direction, in bytes (a bigger incoming one closes the socket
     /// with 1009). Default 1 MiB (the protocol's `MAX_MESSAGE_BYTES` and the client's default).
+    /// Until a socket authenticated the limit is 16 KiB (or this, if smaller): the only message
+    /// then is `auth`.
     pub max_message_bytes: usize,
     /// The socket's read buffer, in bytes. Default 8 KiB (tungstenite's own default, 128 KiB per
     /// socket, costs ~120 KiB more per idle connection).
@@ -400,9 +500,9 @@ pub struct WsConfig {
     /// The most sockets in one room unless the room is joined with its own cap. Default 200 (the
     /// protocol's `DEFAULT_MAX_ROOM_MEMBERS`).
     pub max_room_members: usize,
-    /// Accept the access token as `?token=` on the handshake. Default false: reverse proxies (Caddy,
-    /// nginx) log URLs with their query, so a token there ends up in access logs. Clients that cannot
-    /// set headers (browsers) use first-message `auth` instead.
+    /// Accept the access token as `?token=` (or `?access_token=`) on the handshake. Default false:
+    /// reverse proxies (Caddy, nginx) log URLs with their query, so a token there ends up in access
+    /// logs. Clients that cannot set headers (browsers) use first-message `auth` instead.
     pub query_token: bool,
 }
 
@@ -561,12 +661,16 @@ impl Config {
             ["database", "max_connections"] => self.database.max_connections = parse(value)?,
             ["database", "min_connections"] => self.database.min_connections = parse(value)?,
             ["database", "acquire_timeout_secs"] => self.database.acquire_timeout_secs = parse(value)?,
+            ["database", "sqlite_synchronous"] => self.database.sqlite_synchronous = value.parse()?,
             ["database", "connect_lazy"] => self.database.connect_lazy = parse(value)?,
             ["database", "migrate_on_start"] => self.database.migrate_on_start = parse(value)?,
             ["database", "migrations_dir"] => self.database.migrations_dir = PathBuf::from(value),
             ["database", "migrate_lock_timeout_secs"] => self.database.migrate_lock_timeout_secs = parse(value)?,
+            ["database", "statement_timeout_secs"] => self.database.statement_timeout_secs = parse(value)?,
             ["http", "body_limit_bytes"] => self.http.body_limit_bytes = parse(value)?,
             ["http", "request_timeout_secs"] => self.http.request_timeout_secs = parse(value)?,
+            ["http", "upload_idle_timeout_secs"] => self.http.upload_idle_timeout_secs = parse(value)?,
+            ["http", "upload_timeout_secs"] => self.http.upload_timeout_secs = parse(value)?,
             ["http", "trust_request_id"] => self.http.trust_request_id = parse(value)?,
             ["http", "max_body_bytes"] => self.http.max_body_bytes = parse(value)?,
             ["http", "trusted_proxies"] => self.http.trusted_proxies = value.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect(),
@@ -669,6 +773,9 @@ impl Config {
         if !(1..=3600).contains(&self.database.migrate_lock_timeout_secs) {
             problems.push("database.migrate_lock_timeout_secs must be between 1 and 3600".into());
         }
+        if self.database.statement_timeout_secs > 86_400 {
+            problems.push("database.statement_timeout_secs must be at most 86400 (0 = no limit)".into());
+        }
         if !(1024..=64 * 1024 * 1024).contains(&self.http.body_limit_bytes) {
             problems.push("http.body_limit_bytes must be between 1024 and 67108864 (raise it per route for uploads)".into());
         }
@@ -697,6 +804,12 @@ impl Config {
         if !(1..=3600).contains(&self.http.request_timeout_secs) {
             problems.push("http.request_timeout_secs must be between 1 and 3600".into());
         }
+        if !(1..=3600).contains(&self.http.upload_idle_timeout_secs) {
+            problems.push("http.upload_idle_timeout_secs must be between 1 and 3600".into());
+        }
+        if self.http.upload_timeout_secs > 86_400 {
+            problems.push("http.upload_timeout_secs must be at most 86400 (0 = no overall limit)".into());
+        }
         let origins = &self.cors.allowed_origins;
         if origins.iter().any(|o| o == "*") && origins.len() > 1 {
             problems.push("cors.allowed_origins: `*` must be the only entry".into());
@@ -724,7 +837,9 @@ impl Config {
     /// A module's settings (`[modules.<name>]`) decoded as `T`; `None` if the section is absent.
     /// Module config structs should use `#[serde(deny_unknown_fields)]` (typos become errors) and
     /// [`SecretString`] for secrets (with a `<name>_file` alternative, see [`resolve_secret`]).
-    /// Error messages never quote the configured values.
+    /// The values serde quotes in its error messages (strings, numbers, booleans, enum variants)
+    /// are replaced by `<hidden>`; a module's own `Deserialize` code should not put values in its
+    /// messages either.
     pub fn module_config<T: DeserializeOwned>(&self, name: &str) -> Result<Option<T>, Error> {
         match self.modules.get(name) {
             None => Ok(None),
@@ -750,8 +865,11 @@ pub fn resolve_secret(name: &str, value: Option<SecretString>, file: Option<&Pat
     }
 }
 
-/// Replace every `"…"` / `'…'` quoted part of a message (serde quotes the offending value).
+/// Replace every value serde quotes in a message: `"…"` / `'…'` (strings), and `` `…` `` after
+/// `integer`, `floating point`, `boolean`, `character` or `variant` (numbers, booleans, enum
+/// names). Backtick-quoted field names and expected values stay.
 fn mask_quoted(message: &str) -> String {
+    const VALUE_KINDS: [&str; 5] = ["integer ", "floating point ", "boolean ", "character ", "variant "];
     let mut out = String::with_capacity(message.len());
     let mut quote: Option<char> = None;
     for c in message.chars() {
@@ -763,8 +881,9 @@ fn mask_quoted(message: &str) -> String {
             }
             Some(_) => {}
             None => {
+                let value = c == '"' || c == '\'' || (c == '`' && VALUE_KINDS.iter().any(|kind| out.ends_with(kind)));
                 out.push(c);
-                if c == '"' || c == '\'' {
+                if value {
                     quote = Some(c);
                 }
             }
@@ -795,13 +914,19 @@ fn redact_toml_error(error: &toml::de::Error) -> String {
     }
 }
 
-/// An environment value for a module setting: a TOML scalar / array if it parses as one
-/// (`42`, `true`, `[1, 2]`), else the plain string.
+/// An environment value for a module setting: a TOML number or boolean when it reads back as the
+/// same text (`42`, `1.5`, `true`), an array or inline table (`[1, 2]`), a string in TOML quotes
+/// (`"0042"`) as that string; anything else is the plain string (`1e5`, `0042`, `+5`, dates,
+/// passwords). A [`SecretString`] takes a number or boolean as its text, so a secret given here is
+/// always exactly the variable's text.
 fn env_value(value: &str) -> toml::Value {
+    let plain = || toml::Value::String(value.to_string());
     let doc = format!("v = {value}");
-    match toml::from_str::<toml::Table>(&doc) {
-        Ok(mut table) => table.remove("v").unwrap_or_else(|| toml::Value::String(value.to_string())),
-        Err(_) => toml::Value::String(value.to_string()),
+    let Some(parsed) = toml::from_str::<toml::Table>(&doc).ok().and_then(|mut table| table.remove("v")) else { return plain() };
+    match parsed {
+        toml::Value::Integer(_) | toml::Value::Float(_) | toml::Value::Boolean(_) if parsed.to_string() == value => parsed,
+        toml::Value::String(_) | toml::Value::Array(_) | toml::Value::Table(_) => parsed,
+        _ => plain(),
     }
 }
 
@@ -856,11 +981,12 @@ mod tests {
     #[test]
     fn file_then_env_override() {
         let toml = format!("[server]\nbind = \"0.0.0.0:9000\"\n[database]\nurl = \"{}\"\nmax_connections = 4\n", url_for_enabled());
-        let env = [("NBS__DATABASE__MAX_CONNECTIONS", "7"), ("NBS__HTTP__REQUEST_TIMEOUT_SECS", "12"), ("OTHER", "x")];
+        let env = [("NBS__DATABASE__MAX_CONNECTIONS", "7"), ("NBS__HTTP__REQUEST_TIMEOUT_SECS", "12"), ("NBS__HTTP__UPLOAD_TIMEOUT_SECS", "0"), ("OTHER", "x")];
         let config = Config::from_sources(Some(&toml), env).unwrap();
         assert_eq!(config.server.bind.port(), 9000);
         assert_eq!(config.database.max_connections, 7);
         assert_eq!(config.http.request_timeout_secs, 12);
+        assert_eq!((config.http.upload_idle_timeout_secs, config.http.upload_timeout_secs), (30, 0));
         assert_eq!(config.http.body_limit_bytes, 64 * 1024);
     }
 
@@ -888,6 +1014,8 @@ mod tests {
         config.database.min_connections = 5;
         config.http.body_limit_bytes = 10;
         config.http.request_timeout_secs = 0;
+        config.http.upload_idle_timeout_secs = 0;
+        config.http.upload_timeout_secs = 86_401;
         config.server.hook_timeout_ms = 0;
         config.cors.allowed_origins = vec!["*".into(), "example.com".into()];
         config.log.level = "info,[".into();
@@ -898,12 +1026,41 @@ mod tests {
             "min_connections",
             "body_limit_bytes",
             "request_timeout_secs",
+            "upload_idle_timeout_secs",
+            "upload_timeout_secs must be at most",
             "hook_timeout_ms",
             "`*` must be",
             "example.com",
             "log.level",
         ] {
             assert!(problems.iter().any(|p| p.contains(needle)), "missing {needle}: {problems:?}");
+        }
+    }
+
+    #[cfg(any(feature = "mysql", feature = "postgres", feature = "sqlite"))]
+    #[test]
+    fn sqlite_synchronous_default_full_and_invalid() {
+        let url = url_for_enabled();
+        // The default is NORMAL.
+        let config = Config::from_sources(Some(&format!("[database]\nurl = \"{url}\"\n")), std::iter::empty::<(&str, &str)>()).unwrap();
+        assert_eq!(config.database.sqlite_synchronous, SqliteSynchronous::Normal);
+        assert_eq!(DatabaseConfig::default().sqlite_synchronous, SqliteSynchronous::Normal);
+        // `full` from the file, `normal` from the environment (which wins), any case there.
+        let toml = format!("[database]\nurl = \"{url}\"\nsqlite_synchronous = \"full\"\n");
+        let config = Config::from_sources(Some(&toml), std::iter::empty::<(&str, &str)>()).unwrap();
+        assert_eq!(config.database.sqlite_synchronous, SqliteSynchronous::Full);
+        let config = Config::from_sources(Some(&toml), [("NBS__DATABASE__SQLITE_SYNCHRONOUS", "Normal")]).unwrap();
+        assert_eq!(config.database.sqlite_synchronous, SqliteSynchronous::Normal);
+        let config = Config::from_sources(None, [("NBS__DATABASE__URL", url), ("NBS__DATABASE__SQLITE_SYNCHRONOUS", "FULL")]).unwrap();
+        assert_eq!(config.database.sqlite_synchronous, SqliteSynchronous::Full);
+        // Anything else is refused, in the file and in the environment.
+        for bad in ["\"off\"", "\"extra\"", "\"\"", "\"Full\"", "2", "true"] {
+            let found = problems_of_toml(&format!("[database]\nurl = \"{url}\"\nsqlite_synchronous = {bad}\n"));
+            assert!(!found.is_empty(), "{bad} was accepted");
+        }
+        for bad in ["off", "", "2"] {
+            let found = problems(Config::from_sources(None, [("NBS__DATABASE__URL", url), ("NBS__DATABASE__SQLITE_SYNCHRONOUS", bad)]));
+            assert!(found.iter().any(|p| p.starts_with("NBS__DATABASE__SQLITE_SYNCHRONOUS") && p.contains("`normal` or `full`")), "{bad:?}: {found:?}");
         }
     }
 
@@ -1021,5 +1178,71 @@ mod tests {
         assert_eq!(config.unknown_module_sections(&["chat"]), Vec::<String>::new());
         assert_eq!(config.unknown_module_sections(&["chta"]), ["chat"]);
         assert_eq!(env_value("mysql://x"), toml::Value::String("mysql://x".into()));
+    }
+
+    /// NIT9: `database.statement_timeout_secs` from the environment, at most a day.
+    #[cfg(any(feature = "mysql", feature = "postgres", feature = "sqlite"))]
+    #[test]
+    fn statement_timeout_setting() {
+        let url = url_for_enabled();
+        assert_eq!(Config::from_sources(None, [("NBS__DATABASE__URL", url)]).expect("config").database.statement_timeout_secs, 0);
+        let config = Config::from_sources(None, [("NBS__DATABASE__URL", url), ("NBS__DATABASE__STATEMENT_TIMEOUT_SECS", "30")]).expect("config");
+        assert_eq!(config.database.statement_timeout_secs, 30);
+        let problems = problems(Config::from_sources(None, [("NBS__DATABASE__URL", url), ("NBS__DATABASE__STATEMENT_TIMEOUT_SECS", "86401")]));
+        assert!(problems.iter().any(|p| p.contains("statement_timeout_secs")), "{problems:?}");
+    }
+
+    /// SF2: a secret given by environment variable is its exact text, whatever it looks like, and a
+    /// wrong-type value never appears in an error message.
+    #[cfg(any(feature = "mysql", feature = "postgres", feature = "sqlite"))]
+    #[test]
+    fn secrets_from_the_environment_are_text_and_never_echoed() {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Mail {
+            password: SecretString,
+            port: Option<u16>,
+            ratio: Option<f64>,
+            on: Option<bool>,
+            name: Option<String>,
+        }
+        let url = url_for_enabled();
+        for secret in
+            ["12345678", "-17", "1.5", "true", "1e5", "0042", "+5", "1979-05-27", "1979-05-27T07:32:00Z", "inf", "nan", "1_000", "s3cr3t", "\"quoted\""]
+        {
+            let env = [("NBS__DATABASE__URL", url), ("NBS__MODULES__MAIL__PASSWORD", secret), ("NBS__MODULES__MAIL__PORT", "587")];
+            let config = Config::from_sources(None, env).expect("config");
+            let mail = config.module_config::<Mail>("mail").map_err(|e| e.to_string()).expect("decodes").expect("section");
+            let expected = if secret == "\"quoted\"" { "quoted" } else { secret };
+            assert_eq!(mail.password.expose(), expected, "{secret}");
+            assert_eq!(mail.port, Some(587));
+        }
+        // Numbers, booleans and quoted strings for other settings still work.
+        let env = [
+            ("NBS__DATABASE__URL", url),
+            ("NBS__MODULES__MAIL__PASSWORD", "x"),
+            ("NBS__MODULES__MAIL__RATIO", "0.25"),
+            ("NBS__MODULES__MAIL__ON", "false"),
+            ("NBS__MODULES__MAIL__NAME", "\"2048\""),
+        ];
+        let mail = Config::from_sources(None, env).expect("config").module_config::<Mail>("mail").ok().flatten().expect("decodes");
+        assert_eq!((mail.ratio, mail.on, mail.name.as_deref()), (Some(0.25), Some(false), Some("2048")));
+        // Wrong types: the value is never in the message.
+        for (key, value) in [
+            ("NBS__MODULES__MAIL__PORT", "98765432"),
+            ("NBS__MODULES__MAIL__PORT", "hunter22"),
+            ("NBS__MODULES__MAIL__NAME", "98765432"),
+            ("NBS__MODULES__MAIL__ON", "98765432"),
+            ("NBS__MODULES__MAIL__PASSWORD", "[98765432]"),
+        ] {
+            let env = [("NBS__DATABASE__URL", url), ("NBS__MODULES__MAIL__PASSWORD", "x"), (key, value)];
+            let error = Config::from_sources(None, env).expect("config").module_config::<Mail>("mail").err().map(|e| e.to_string()).expect("an error");
+            assert!(!error.contains("98765432") && !error.contains("hunter22"), "{key}={value}: {error}");
+            assert!(error.contains("modules.mail"), "{error}");
+        }
+        assert_eq!(mask_quoted("invalid type: integer `12345678`, expected a string"), "invalid type: integer `<hidden>`, expected a string");
+        assert_eq!(mask_quoted("invalid type: floating point `1.5`, expected u16"), "invalid type: floating point `<hidden>`, expected u16");
+        assert_eq!(mask_quoted("unknown field `pasword`, expected one of `password`, `port`"), "unknown field `pasword`, expected one of `password`, `port`");
+        assert_eq!(mask_quoted("unknown variant `hunter2`, expected `log` or `smtp`"), "unknown variant `<hidden>`, expected `log` or `smtp`");
     }
 }

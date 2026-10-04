@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use net_backend_protocol::admin::AdminPutObject;
 use net_backend_protocol::storage::{
-    is_valid_name, value_bytes, BatchAcks, BatchGet, BatchObjects, BatchPut, ObjectAck, ObjectVersion, StorageObject, StorageObjectInfo, VersionConflict,
-    WriteAccess, MAX_BATCH_BYTES,
+    is_valid_name, value_bytes, BatchAcks, BatchGet, BatchObjects, BatchPut, ObjectAck, ObjectVersion, ObjectVisibility, StorageObject, StorageObjectInfo,
+    VersionConflict, WriteAccess, MAX_BATCH_BYTES,
 };
 use net_backend_protocol::{codes, Cursor, Page, PageRequest, UnixMillis, UserId};
 use serde_json::Value;
@@ -61,6 +61,8 @@ pub(crate) struct WriteRequest {
     /// Set the lock (server / admin writes); `None` keeps it (a new object: owner, or server in a
     /// server collection).
     pub(crate) write: Option<WriteAccess>,
+    /// Set who may read it; `None` keeps it (a new object: private).
+    pub(crate) visibility: Option<ObjectVisibility>,
     pub(crate) writer: Writer,
 }
 
@@ -106,17 +108,53 @@ fn check_names(collection: &str, key: Option<&str>) -> Result<(), AppError> {
     Ok(())
 }
 
+/// A stored visibility (an unknown text reads as private: never more open than written).
+fn visibility_of(text: &str) -> ObjectVisibility {
+    ObjectVisibility::parse(text).unwrap_or(ObjectVisibility::Private)
+}
+
 fn decode(row: ObjectRow, owner: UserId) -> Result<StorageObject, AppError> {
     let value: Value = serde_json::from_slice(&row.value).map_err(AppError::internal)?;
     Ok(StorageObject::new(row.collection, row.object_key, owner, value, ObjectVersion(row.version), UnixMillis(row.updated_at))
-        .with_write(access_of(&row.write_access)))
+        .with_write(access_of(&row.write_access))
+        .with_visibility(visibility_of(&row.visibility)))
 }
 
 fn info(collection: &str, row: InfoRow) -> StorageObjectInfo {
     let mut info =
         StorageObjectInfo::new(collection, row.object_key, ObjectVersion(row.version), u64::try_from(row.size_bytes).unwrap_or(0), UnixMillis(row.updated_at));
     info.write = access_of(&row.write_access);
+    info.visibility = visibility_of(&row.visibility);
     info
+}
+
+/// Whether the friends module is registered (the `friends` visibility needs it).
+fn friends_known(state: &AppState) -> bool {
+    #[cfg(feature = "friends")]
+    {
+        state.get::<crate::friends::FriendService>().is_some()
+    }
+    #[cfg(not(feature = "friends"))]
+    {
+        let _ = state;
+        false
+    }
+}
+
+/// Whether `a` and `b` are friends (false without the friends module).
+async fn are_friends(state: &AppState, a: UserId, b: UserId) -> Result<bool, AppError> {
+    #[cfg(feature = "friends")]
+    {
+        match state.get::<crate::friends::FriendService>() {
+            Some(friends) => friends.are_friends(state, a, b).await,
+            None => Ok(false),
+        }
+    }
+    #[cfg(not(feature = "friends"))]
+    {
+        let _ = (state, a, b);
+        Ok(false)
+    }
 }
 
 /// The stored version, lock and size of an object, inside the transaction (a plain read; exact
@@ -136,6 +174,18 @@ fn with_index(error: AppError, index: Option<u32>) -> AppError {
         None => details = serde_json::json!({ "index": index }),
     }
     error.with_details(details)
+}
+
+/// A known visibility; `friends` only with the friends module (422 `validation_failed`).
+fn check_visibility(state: &AppState, visibility: Option<ObjectVisibility>) -> Result<(), AppError> {
+    let problem = match visibility {
+        Some(ObjectVisibility::Unknown) => "is not private, public or friends",
+        Some(ObjectVisibility::Friends) if !friends_known(state) => "`friends` needs the friends module on this server",
+        _ => return Ok(()),
+    };
+    let mut details = net_backend_protocol::ValidationDetails::new();
+    details.add("visibility", problem);
+    Err(AppError::validation(details))
 }
 
 fn server_collection() -> AppError {
@@ -178,6 +228,17 @@ impl StorageService {
 
     /// A page of `user`'s `collection` (no values), ordered by key.
     pub async fn list(&self, state: &AppState, user: UserId, collection: &str, page: &PageRequest) -> Result<Page<StorageObjectInfo>, AppError> {
+        self.list_where(state, user, collection, page, None).await
+    }
+
+    async fn list_where(
+        &self,
+        state: &AppState,
+        user: UserId,
+        collection: &str,
+        page: &PageRequest,
+        shown: Option<&[&str]>,
+    ) -> Result<Page<StorageObjectInfo>, AppError> {
         check_names(collection, None)?;
         page.validate()?;
         let after = match &page.cursor {
@@ -186,11 +247,49 @@ impl StorageService {
             None => None,
         };
         let limit = u64::from(page.limit_or_default());
-        let mut rows = state.db().fetch_all::<InfoRow, _>(&store::list(user.get(), collection, after, limit + 1)).await?;
+        let mut rows = state.db().fetch_all::<InfoRow, _>(&store::list(user.get(), collection, after, limit + 1, shown)).await?;
         let more = rows.len() as u64 > limit;
         rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
         let next = if more { rows.last().map(|r| Cursor::new(r.object_key.clone())) } else { None };
         Ok(Page::new(rows.into_iter().map(|r| info(collection, r)).collect(), next))
+    }
+
+    /// The visibilities of `owner`'s objects that `reader` may read (`None`: all of them, the
+    /// owner itself).
+    async fn readable(&self, state: &AppState, reader: UserId, owner: UserId) -> Result<Option<Vec<&'static str>>, AppError> {
+        if reader == owner {
+            return Ok(None);
+        }
+        let mut shown = vec![ObjectVisibility::Public.as_str()];
+        if are_friends(state, owner, reader).await? {
+            shown.push(ObjectVisibility::Friends.as_str());
+        }
+        Ok(Some(shown))
+    }
+
+    /// One of `owner`'s objects as `reader` sees it: `None` when it does not exist or `reader` may
+    /// not read it (public objects, `friends` objects for the owner's friends, everything for the
+    /// owner).
+    pub async fn get_visible(&self, state: &AppState, reader: UserId, owner: UserId, collection: &str, key: &str) -> Result<Option<StorageObject>, AppError> {
+        let Some(object) = self.get(state, owner, collection, key).await? else { return Ok(None) };
+        match self.readable(state, reader, owner).await? {
+            None => Ok(Some(object)),
+            Some(shown) if shown.contains(&object.visibility.as_str()) => Ok(Some(object)),
+            Some(_) => Ok(None),
+        }
+    }
+
+    /// A page of `owner`'s `collection` as `reader` sees it (no values), ordered by key.
+    pub async fn list_visible(
+        &self,
+        state: &AppState,
+        reader: UserId,
+        owner: UserId,
+        collection: &str,
+        page: &PageRequest,
+    ) -> Result<Page<StorageObjectInfo>, AppError> {
+        let shown = self.readable(state, reader, owner).await?;
+        self.list_where(state, owner, collection, page, shown.as_deref()).await
     }
 
     /// Several of `user`'s objects (those that exist, in request order). Over
@@ -232,6 +331,7 @@ impl StorageService {
             value: put.value,
             if_version: put.if_version,
             write: put.write,
+            visibility: put.visibility,
             writer: Writer::Server,
         };
         self.write(state, &HookCtx::new(state.clone(), None), request, None).await
@@ -262,6 +362,7 @@ impl StorageService {
         if let Some(write) = request.write {
             access_text(write)?;
         }
+        check_visibility(state, request.visibility)?;
         if request.writer == Writer::Owner && self.0.config.is_server_collection(&request.collection) {
             return Err(server_collection());
         }
@@ -271,10 +372,13 @@ impl StorageService {
             key: request.key.clone(),
             value: request.value,
             if_version: request.if_version,
+            visibility: request.visibility,
             writer: request.writer,
         };
-        // Only the value may change; the object and the condition stay what was asked for.
+        // Only the value and the visibility may change; the object and the condition stay what
+        // was asked for.
         let event = state.hooks().run_before(ctx, event).await?;
+        check_visibility(state, event.visibility)?;
         let max = self.0.config.max_object_bytes;
         if value_bytes(&event.value) > max {
             let mut details = net_backend_protocol::ValidationDetails::new();
@@ -288,6 +392,7 @@ impl StorageService {
             value: event.value,
             if_version: request.if_version,
             write: request.write,
+            visibility: event.visibility,
             writer: request.writer,
         })
     }
@@ -341,6 +446,7 @@ impl StorageService {
         let size = i64::try_from(bytes.len()).unwrap_or(i64::MAX);
         let owner = request.writer == Writer::Owner;
         let write = request.write.map(access_text).transpose()?;
+        let visibility = request.visibility.map(ObjectVisibility::as_str);
         let (collection, key) = (request.collection.as_str(), request.key.as_str());
         if !Self::lock(tx, request.user, tx_state).await? {
             return Ok(Err(Refusal::NoAccount));
@@ -356,7 +462,16 @@ impl StorageService {
                     return Ok(Err(refusal));
                 }
                 let default_write = if self.0.config.is_server_collection(collection) { WRITE_SERVER } else { WRITE_OWNER };
-                tx.execute(&store::insert(user, collection, key, bytes, write.unwrap_or(default_write), now)?).await?;
+                tx.execute(&store::insert(
+                    user,
+                    collection,
+                    key,
+                    bytes,
+                    write.unwrap_or(default_write),
+                    visibility.unwrap_or(ObjectVisibility::Private.as_str()),
+                    now,
+                )?)
+                .await?;
                 Ok(Ok(ObjectVersion(1)))
             }
             Some(row) => {
@@ -374,7 +489,7 @@ impl StorageService {
                     return Ok(Err(refusal));
                 }
                 // The version read under the lock is the condition: nothing else changed it.
-                let update = store::Update { user, collection, key, value: bytes, now, if_version: Some(row.version), owner_only: owner, write };
+                let update = store::Update { user, collection, key, value: bytes, now, if_version: Some(row.version), owner_only: owner, write, visibility };
                 if tx.execute(&store::update(update)).await? != 1 {
                     // Only a writer that bypasses the account lock (raw SQL) gets here.
                     let stored = current(tx, user, collection, key).await?.map(|r| ObjectVersion(r.version));
@@ -445,6 +560,7 @@ impl StorageService {
                 value: item.put.value,
                 if_version: item.put.if_version,
                 write: None,
+                visibility: item.put.visibility,
                 writer: Writer::Owner,
             };
             let index = Some(u32::try_from(index).unwrap_or(u32::MAX));

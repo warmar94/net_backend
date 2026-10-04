@@ -2,20 +2,26 @@
 //! included; the client, the in-process server, the libraries) and every `log` record of the
 //! client's side (TRACE included: tungstenite and russh log through `log`) is captured while the
 //! session runs
-//! through register, login (also a wrong password), a refresh, a 401 → refresh → retry, the
+//! through register (the session kept in a token file), login (also a wrong password), a refresh, a 401 → refresh → retry, the
 //! WebSocket with header and first-message authentication (each refused once with an expired
-//! token and refreshed), a refused unknown token, a reused refresh token, and logout; with feature
-//! `ssh` also SSH logins (encrypted key + passphrase, a wrong passphrase, a password,
-//! keyboard-interactive), a command line, stdin and output holding secrets, and a reconnect. No
-//! captured line holds a password, a token, a passphrase (also hex-encoded, as tungstenite prints
-//! frame payloads) or a `Bearer` header. Own test binary: it installs a process-wide subscriber and
-//! logger. The in-process server's own `log` records (its threads) are not the client's and are left
-//! out.
+//! token and refreshed), a refused unknown token, a reused refresh token, and logout; a file upload
+//! and a download to a file with progress (the download after the access token expired: refreshed
+//! first); with feature `oauth` the OpenID Connect sign-in against a mock identity provider (the
+//! client secret, the authorization code, the PKCE verifier, `state`, the nonce, the provider's ID,
+//! access and refresh tokens, the server's session) and a link; with feature `ssh` also SSH logins
+//! (encrypted key + passphrase, a wrong passphrase, a password, keyboard-interactive), a command
+//! line, stdin and output holding secrets, and a reconnect. No captured line holds a password, a
+//! token, a passphrase (also hex-encoded, as tungstenite prints frame payloads) or a `Bearer`
+//! header. Own test binary: it installs a process-wide subscriber and logger. The in-process
+//! server's own `log` records (its threads) are not the client's and are left out.
 
 mod common;
 #[cfg(feature = "ssh")]
 #[path = "common/mock_ssh.rs"]
 mod mock_ssh;
+#[cfg(feature = "oauth")]
+#[path = "common/oauth_provider.rs"]
+mod oauth_provider;
 
 use std::fmt::{self, Write as _};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -130,6 +136,9 @@ fn no_secret_is_ever_logged() {
     let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("runtime");
     let mut secrets: Vec<String> = vec![PASSWORD.into(), WRONG_PASSWORD.into(), FAKE_ACCESS.into(), FAKE_REFRESH.into()];
     runtime.block_on(http_and_ws(&server, &mut secrets));
+    runtime.block_on(files_part(&server, &mut secrets));
+    #[cfg(feature = "oauth")]
+    runtime.block_on(oauth_part(&mut secrets));
     #[cfg(feature = "ssh")]
     secrets.extend(runtime.block_on(ssh_part()));
     drop(server);
@@ -153,8 +162,11 @@ fn no_secret_is_ever_logged() {
 }
 
 async fn http_and_ws(server: &Server, secrets: &mut Vec<String>) {
-    // Register, a wrong password, a login, an explicit refresh.
-    let client = Client::builder(&server.base).refresh_margin(Duration::ZERO).build().expect("client");
+    // Register, a wrong password, a login, an explicit refresh. The session is kept in a token
+    // file (every pair below is written to it; the file's own messages never hold a token).
+    let token_file = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("redaction-session.json");
+    let _ = std::fs::remove_file(&token_file);
+    let client = Client::builder(&server.base).refresh_margin(Duration::ZERO).token_file(&token_file).build().expect("client");
     client.register(RegisterRequest::new(email("redact"), PASSWORD)).await.expect("register");
     remember(secrets, &client);
     let wrong = server.client().login(LoginRequest::new(email("redact"), WRONG_PASSWORD)).await.expect_err("wrong password");
@@ -201,6 +213,73 @@ async fn http_and_ws(server: &Server, secrets: &mut Vec<String>) {
     // Logout (the access token expired: the refresh token in the body does it).
     client.logout().await.expect("logout");
     assert!(matches!(client.call(&GetAccount::new()).await, Err(Error::NotLoggedIn)));
+}
+
+/// A file upload streamed from disk and a download to a file, both with progress; the download
+/// starts after the access token expired (refreshed first).
+async fn files_part(server: &Server, secrets: &mut Vec<String>) {
+    use net_backend_client::files::{DownloadOptions, FileUpload};
+
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("target")
+        .join("tmp")
+        .join(format!("client-redaction-files-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let bytes: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    let source = dir.join("save.bin");
+    std::fs::write(&source, &bytes).expect("write");
+    let client = Client::builder(&server.base).refresh_margin(Duration::ZERO).build().expect("client");
+    client.register(RegisterRequest::new(email("redact-files"), PASSWORD)).await.expect("register");
+    remember(secrets, &client);
+    let mut upload = client.start_upload(FileUpload::path(&source));
+    let mut reports = 0;
+    while upload.next_progress().await.is_some() {
+        reports += 1;
+    }
+    let info = upload.finish().await.expect("uploaded");
+    assert!(reports > 0, "upload progress");
+    server.advance(Duration::from_secs(3601));
+    let copy = dir.join("copy.bin");
+    let mut download = client.start_download_to(info.id, &copy, DownloadOptions::default());
+    while download.next_progress().await.is_some() {}
+    assert_eq!(download.finish().await.expect("downloaded"), bytes.len() as u64);
+    remember(secrets, &client);
+    assert_eq!(std::fs::read(&copy).expect("copy"), bytes);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The OpenID Connect sign-in against the mock identity provider: a login, a plain sign-in whose
+/// tokens the app gets, and a link to a password account. Every secret the provider saw or issued
+/// and every session token is added to `secrets`.
+#[cfg(feature = "oauth")]
+async fn oauth_part(secrets: &mut Vec<String>) {
+    use oauth_provider::{browser, flow, server_for, start_provider, Browser, SECRET};
+
+    let provider = start_provider().await;
+    let server = server_for(&provider);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let client = server.client();
+    client.sign_in_oauth("test", &flow(&provider), browser(provider.clone(), "sub-redact", Browser::SignIn, seen.clone())).await.expect("signed in");
+    remember(secrets, &client);
+    let signed = flow(&provider).sign_in(browser(provider.clone(), "sub-redact", Browser::SignIn, seen.clone())).await.expect("signed");
+    for token in [Some(&signed.id_token), Some(&signed.nonce), signed.access_token.as_ref(), signed.refresh_token.as_ref()].into_iter().flatten() {
+        secrets.push(token.expose().to_string());
+    }
+    let plain = server.client();
+    plain.login_oauth(net_backend_client::protocol::oauth::OAuthLogin::new("test", signed.token())).await.expect("login with the token");
+    remember(secrets, &plain);
+    let linker = server.client();
+    linker.register(RegisterRequest::new(email("redact-oauth-linker"), PASSWORD)).await.expect("register");
+    linker.link_oauth_sign_in("test", &flow(&provider), browser(provider.clone(), "sub-redact-2", Browser::SignIn, seen)).await.expect("linked");
+    remember(secrets, &linker);
+    let issued = provider.secrets.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    assert!(issued.len() >= 15, "the provider saw codes, verifiers, states, nonces and issued tokens: {}", issued.len());
+    secrets.push(SECRET.to_string());
+    secrets.extend(issued.into_iter().filter(|s| !s.is_empty()));
+    drop(server);
 }
 
 /// SSH to the mock: an encrypted key and its passphrase, a wrong passphrase, a password,

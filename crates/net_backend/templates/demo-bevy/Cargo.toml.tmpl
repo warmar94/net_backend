@@ -1,0 +1,45 @@
+[package]
+name = "{{package}}"
+version = "0.1.0"
+edition = "2024"
+publish = false
+{{standalone}}
+[features]
+# Steam (`cargo run --features steam`, Steam running): a Steam row through bevy_steam_kit (Steam
+# login, Steam friends who play here, "Join Game" and invites for a lobby, joins from Steam). Off
+# by default: without it nothing of Steam is built or linked.
+steam = ["dep:bevy_steam_kit", "dep:steamworks"]
+
+[dependencies]
+# The Bevy client (HTTP + WebSocket) and the server's message types, which plug into it as typed
+# requests and pushes (feature `bevy_net_backend`).
+bevy_net_backend = { version = "{{bevy_net_backend_version}}", features = ["http", "json", "ws"] }
+net_backend_protocol = { version = "{{version}}", features = ["bevy_net_backend"] }
+# Pinned exactly, like bevy_net_backend; only what a window with buttons, text and typing needs.
+bevy = { version = "=0.19.0", default-features = false, features = [
+    "std",
+    "multi_threaded",
+    "async_executor",
+    "bevy_log",
+    "bevy_asset",
+    "bevy_window",
+    "bevy_winit",
+    "bevy_render",
+    "bevy_core_pipeline",
+    "bevy_text",
+    "default_font",
+    "bevy_ui",
+    "bevy_ui_render",
+    "bevy_picking",
+    "ui_picking",
+    "mouse",
+    "keyboard",
+    "x11",
+] }
+serde_json = "1"
+# Steam (feature `steam`): bevy_steam_kit does everything Steam (the callback pump, the friends
+# list, the login ticket, invites, the overlay, rich presence, joins); steamworks, the kit's exact
+# version, only starts Steam (`Client::init_app`) before the client goes to the kit.
+bevy_steam_kit = { version = "0.2.0", features = ["lobby", "friends", "auth", "overlay", "steam"], optional = true }
+steamworks = { version = "=0.12.2", optional = true }
+{{profile}}

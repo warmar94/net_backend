@@ -1,6 +1,6 @@
 [package]
 name = "net_backend_client"
-version = "0.1.1"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 description = "A Rust client for net_backend_server: typed HTTP calls with automatic token refresh, a reconnecting WebSocket, SSH / SFTP to the server machine, async (tokio) or blocking."
@@ -17,8 +17,8 @@ exclude = ["NOTES.md", "docs/", "/target"]
 # HTTP(S), the session (login, refresh, logout) and the blocking interface are always compiled.
 default = []
 # The WebSocket: typed requests and answers, pushes, heartbeats, reconnects (tokio-tungstenite over our
-# own TCP / TLS stream; the upgrade request goes out through hyper).
-ws = ["dep:tokio-tungstenite", "dep:tokio-rustls", "dep:futures-util", "dep:tower-service", "tokio/macros", "tokio/io-util"]
+# own TCP / TLS stream; the crate writes the upgrade request and a proxy's CONNECT itself).
+ws = ["dep:tokio-tungstenite", "dep:tokio-rustls", "dep:futures-util", "tokio/macros", "tokio/io-util"]
 # ADMIN / DEV TOOLS ONLY. SSH to the server machine's OpenSSH (russh with ring, never aws-lc): strict
 # known_hosts checking, key files / agent / password / keyboard-interactive. Refused in release builds
 # unless the target opts in.
@@ -28,14 +28,23 @@ sftp = ["ssh", "dep:russh-sftp"]
 # RSA host keys and RSA key files for SSH (rsa-sha2-256/512). Off by default: the `rsa` crate carries
 # the unfixed Marvin timing advisory RUSTSEC-2023-0071.
 ssh-rsa = ["ssh", "russh/rsa"]
+# Trust the operating system's certificate store instead of webpki-roots, opted into per client with
+# `ClientBuilder::os_certificates(true)` (rustls-platform-verifier with ring; no OpenSSL, no aws-lc).
+os-certificates = ["dep:rustls-platform-verifier"]
+# Offer HTTP/2 through ALPN on HTTPS, opted into per client with `ClientBuilder::http2(true)` (hyper's
+# h2; HTTP/1.1 stays the fallback).
+http2 = ["hyper/http2", "hyper-util/http2", "hyper-rustls/http2"]
+# The desktop sign-in at an OpenID Connect provider (module `oauth`: authorization code + PKCE with a
+# loopback redirect, Google's endpoints as a preset); base64url (random values and SHA-256: ring).
+oauth = ["dep:base64", "tokio/io-util"]
 
 [dependencies]
 # The shared message types.
-net_backend_protocol = { path = "../net_backend_protocol", version = "0.1.1" }
+net_backend_protocol = { path = "../net_backend_protocol", version = "0.2.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # Ubiquitous crates: caret minimums (PLUGINS §8), the same ones the server uses (one tokio, one hyper).
-tokio = { version = "1.47", default-features = false, features = ["rt", "net", "time", "sync"] }
+tokio = { version = "1.47", default-features = false, features = ["rt", "net", "time", "sync", "fs", "io-util"] }
 hyper = { version = "1.6", default-features = false, features = ["client", "http1"] }
 # `client-proxy`: the proxy settings from the environment (`HTTPS_PROXY`, `NO_PROXY`, ...) and the
 # HTTP CONNECT tunnel (adds only `ipnet`; base64 and percent-encoding are in every TLS build already).
@@ -52,15 +61,20 @@ tracing = { version = "0.1.41", default-features = false, features = ["std"] }
 # Wipes the crate's own copies of secrets (the `Bearer …` text, request bodies, SSH key file text).
 # rustls already depends on it.
 zeroize = { version = "1.7", default-features = false, features = ["alloc"] }
+# Feature `os-certificates`: the operating system's certificate verifier (Windows CryptoAPI, macOS /
+# iOS Security framework, the system's CA files on Linux / BSD, Android's), given ring explicitly.
+rustls-platform-verifier = { version = "0.7.1", optional = true }
+# Random values (the OS source: multipart boundaries, the PKCE verifier, state and nonce) and SHA-256
+# (file checks): ring, the crypto provider every TLS build of this crate already has.
+ring = "0.17.14"
+# Feature `oauth`: base64url (already in the tree).
+base64 = { version = "0.22.1", default-features = false, features = ["alloc"], optional = true }
 
 # Feature `ws`: the WebSocket protocol engine of the server's own version (tungstenite 0.29, as axum's),
 # only its `handshake` feature: TLS is ours (tokio-rustls with the same ring config).
 tokio-tungstenite = { version = "0.29.0", default-features = false, features = ["handshake"], optional = true }
 tokio-rustls = { version = "0.26.2", default-features = false, features = ["ring", "tls12"], optional = true }
 futures-util = { version = "0.3.31", default-features = false, features = ["std", "sink"], optional = true }
-# Drives hyper-util's CONNECT tunnel for a WebSocket through a proxy (already in the tree through
-# hyper-util; no new crate).
-tower-service = { version = "0.3.3", optional = true }
 
 # Feature `ssh`: the same crates and versions as `bevy_net_backend` (pinned exactly: SSH security fixes
 # arrive as patch releases and are bumped deliberately). ring only, RSA only with `ssh-rsa`.
@@ -77,12 +91,22 @@ russh-sftp = { version = "=3.0.1", optional = true }
 
 [dev-dependencies]
 # The real server on loopback (SQLite in memory, storage + chat), by path: tests only, stripped on publish.
-net_backend_server = { path = "../net_backend_server", default-features = false, features = ["sqlite", "storage", "chat"] }
+net_backend_server = { path = "../net_backend_server", default-features = false, features = ["sqlite", "storage", "chat", "leaderboards", "notifications", "friends", "groups", "oauth", "lobbies", "matchmaking", "files"] }
 tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
 # Random seeds for the throwaway keys of the in-process SSH test server.
 getrandom = { version = "0.4", features = ["sys_rng"] }
 # The log-capture test also records the `log` crate's records (tungstenite and russh log through it).
 log = { version = "0.4", features = ["std"] }
+# Throwaway CA + server certificates for the loopback TLS tests (ring only, as bevy_net_backend's).
+rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "pem"] }
+# The loopback TLS test servers (a TLS front for the test server, an HTTP/2 server).
+tokio-rustls = { version = "0.26.2", default-features = false, features = ["ring", "tls12"] }
+hyper = { version = "1.6", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+# `tests/oauth.rs`: the mock identity provider signs its ID tokens (ES256) and checks the PKCE
+# verifier (both already in the tree).
+ring = "0.17.14"
+base64 = "0.22.1"
 
 [[example]]
 name = "quickstart"
@@ -117,6 +141,19 @@ name = "redaction"
 
 [[test]]
 name = "proxy"
+
+[[test]]
+name = "tls"
+
+[[test]]
+name = "token_file"
+
+[[test]]
+name = "oauth"
+required-features = ["oauth"]
+
+[[test]]
+name = "files"
 
 [package.metadata.docs.rs]
 all-features = true

@@ -1,16 +1,20 @@
 //! [`Client`] (async, tokio) and [`ClientBuilder`]: typed calls, the session and its refresh.
 
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use net_backend_protocol::auth::{AuthSession, LoginRequest, LogoutRequest, RefreshRequest, RegisterRequest, SteamLoginRequest, TokenPair};
+use net_backend_protocol::oauth::OAuthLogin;
 use net_backend_protocol::{codes, GetServerInfo, HttpCall, ServerInfo};
 use tokio::sync::watch;
 use tokio::time::Instant;
 
-use crate::http::{Answer, BaseUrl, Http, Outgoing, Proxy, ProxySetting};
+use crate::http::{Answer, BaseUrl, Http, Outgoing, ProxySetting};
 use crate::session::{Session, TokenUpdates, UNCERTAIN_RETRY_WINDOW};
+use crate::tls::{PemSource, TrustSettings};
+use crate::token_file::{LoadError, TokenFile};
 use crate::Error;
 
 /// The default deadline of one call: 15 s.
@@ -31,6 +35,10 @@ pub struct ClientBuilder {
     allow_insecure_http: bool,
     tokens: Option<TokenPair>,
     proxy: ProxySetting,
+    trust: TrustSettings,
+    token_file: Option<TokenFile>,
+    #[cfg(feature = "http2")]
+    http2: bool,
 }
 
 impl fmt::Debug for ClientBuilder {
@@ -48,6 +56,8 @@ impl fmt::Debug for ClientBuilder {
             .field("allow_insecure_http", &self.allow_insecure_http)
             .field("tokens", &self.tokens.is_some())
             .field("proxy", &proxy)
+            .field("trust", &self.trust)
+            .field("token_file", &self.token_file.as_ref().map(TokenFile::path))
             .finish()
     }
 }
@@ -62,13 +72,17 @@ impl ClientBuilder {
             allow_insecure_http: false,
             tokens: None,
             proxy: ProxySetting::Env,
+            trust: TrustSettings::default(),
+            token_file: None,
+            #[cfg(feature = "http2")]
+            http2: false,
         }
     }
 
     /// The deadline of one call (default 15 s, clamped to 1 ms..=1 h): waiting for a token refresh,
     /// connecting, sending and reading the answer together.
     pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout.clamp(Duration::from_millis(1), MAX_TIMEOUT);
+        self.timeout = clamp_timeout(timeout);
         self
     }
 
@@ -115,8 +129,67 @@ impl ClientBuilder {
         self
     }
 
-    /// Check the URL (and the proxy settings) and build the client. No I/O: nothing connects
-    /// until the first call. Needs no runtime (the first call does).
+    /// Also trust the root certificates in this PEM text (every `CERTIFICATE` block; other blocks
+    /// are skipped), e.g. the certificate of a self-signed development server or a company CA. They
+    /// apply to HTTPS and the WebSocket, on top of webpki-roots (or of the operating system's store
+    /// with [`os_certificates`](Self::os_certificates)). Can be called more than once. Checked at
+    /// [`build`](Self::build): PEM without a certificate, or a certificate that cannot be a root,
+    /// is `InvalidRequest`.
+    pub fn root_certificates_pem(mut self, pem: impl AsRef<[u8]>) -> Self {
+        self.trust.extra.push(PemSource::Bytes(pem.as_ref().to_vec()));
+        self
+    }
+
+    /// Like [`root_certificates_pem`](Self::root_certificates_pem), with the PEM read from this
+    /// file at [`build`](Self::build) (a file that cannot be read is `InvalidRequest`).
+    pub fn root_certificates_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.trust.extra.push(PemSource::File(path.into()));
+        self
+    }
+
+    /// Trust the operating system's certificate store and certificate checks (Windows, macOS / iOS,
+    /// Linux / BSD system CA files, Android) instead of the built-in Mozilla roots (webpki-roots),
+    /// e.g. for a company proxy or CA installed on the machine (default `false`). Extra roots from
+    /// [`root_certificates_pem`](Self::root_certificates_pem) are added on top (not on Android).
+    /// Uses `rustls-platform-verifier` with ring. On Android, that crate needs its JNI
+    /// initialization first (see its documentation).
+    #[cfg(feature = "os-certificates")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "os-certificates")))]
+    pub fn os_certificates(mut self, on: bool) -> Self {
+        self.trust.os_store = on;
+        self
+    }
+
+    /// Offer HTTP/2 to `https://` servers through ALPN (default `false`). The server picks: HTTP/2
+    /// when it supports it, else HTTP/1.1. Plain `http://` stays HTTP/1.1; the WebSocket is not
+    /// affected.
+    #[cfg(feature = "http2")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
+    pub fn http2(mut self, on: bool) -> Self {
+        self.http2 = on;
+        self
+    }
+
+    /// Keep the session in this file ([`TokenFile`]): `build` loads it (the session resumes; the
+    /// next call refreshes an expired access token), and every change of the tokens is written to
+    /// it (login, registration, every refresh, [`Client::resume`]); a logout, a refused refresh or
+    /// [`Client::forget_session`] deletes it. Written atomically and owner-only (Unix `0600`;
+    /// Windows: the folder's inherited ACL, so keep it under the user's profile).
+    ///
+    /// The file stores the server URL: a file written for another server is not used. A damaged
+    /// file is not used either (a warning is logged; the next login overwrites it). Tokens given to
+    /// [`tokens`](Self::tokens) take the place of the file's and are written to it. A file that
+    /// exists but cannot be read makes `build` fail with `InvalidRequest`. A failed write is logged
+    /// as a warning (the file name and the I/O error, never a token); the session goes on, and
+    /// [`Client::token_updates`] still reports every pair.
+    pub fn token_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.token_file = Some(TokenFile::new(path));
+        self
+    }
+
+    /// Check the URL (and the proxy settings, the extra root certificates) and build the client.
+    /// Nothing connects until the first call; the only I/O is reading the root certificate files
+    /// and the token file. Needs no runtime (the first call does).
     ///
     /// The proxy, unless [`proxy`](Self::proxy) or [`no_proxy`](Self::no_proxy) was called,
     /// comes from the environment as `build` reads it: `HTTPS_PROXY` for an `https://` server,
@@ -132,17 +205,47 @@ impl ClientBuilder {
                 base.host
             )));
         }
-        let proxy = Proxy::resolve(&self.proxy, &base)?;
-        let http = Http::new(base, self.max_response_bytes, proxy)?;
-        let session = Session::new(self.refresh_margin);
-        if let Some(tokens) = self.tokens {
-            session.set(tokens, None);
+        #[cfg(feature = "http2")]
+        let http2 = self.http2;
+        #[cfg(not(feature = "http2"))]
+        let http2 = false;
+        let http = Http::new(base, self.max_response_bytes, self.proxy.clone(), &self.trust, http2)?;
+        let mut session = Session::new(self.refresh_margin);
+        let mut tokens = self.tokens;
+        if let Some(file) = self.token_file {
+            let server = http.base.url("");
+            if tokens.is_none() {
+                tokens = match file.load_checked(&server) {
+                    Ok(stored) => stored,
+                    // Damaged: start without a session; the next login overwrites it.
+                    Err(LoadError::Damaged(error)) => {
+                        tracing::warn!("net_backend_client: {error}; starting without a stored session");
+                        None
+                    }
+                    Err(LoadError::Unreadable(error)) => return Err(error),
+                };
+            }
+            session = session.with_file(file, server);
+        }
+        if let Some(tokens) = tokens {
+            session.set(tokens, None).now();
         }
         Ok(Client { inner: Arc::new(Inner { http, session, timeout: self.timeout, refreshing: Mutex::new(None) }) })
     }
 }
 
 type RefreshOutcome = Option<Result<TokenPair, Error>>;
+
+/// A deadline `timeout` from now.
+fn deadline_after(timeout: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(timeout).unwrap_or(now)
+}
+
+/// A call's deadline as accepted: 1 ms..=[`MAX_TIMEOUT`].
+fn clamp_timeout(timeout: Duration) -> Duration {
+    timeout.clamp(Duration::from_millis(1), MAX_TIMEOUT)
+}
 
 pub(crate) struct Inner {
     pub(crate) http: Http,
@@ -184,24 +287,37 @@ impl Client {
     }
 
     fn deadline(&self) -> Instant {
-        let now = Instant::now();
-        now.checked_add(self.inner.timeout).unwrap_or(now)
+        deadline_after(self.inner.timeout)
     }
 
     /// Any typed call of the protocol (or a game's own route implementing
     /// [`HttpCall`]): its method, path and payload, the Bearer token when the route needs one (refreshed first if it is
-    /// about to expire), the answer decoded as `C::Response`, errors as [`Error::Api`] with the
+    /// about to expire) and on logout (which takes it instead of the refresh token), the answer decoded as `C::Response`, errors as [`Error::Api`] with the
     /// server's code.
     ///
     /// Login, registration, Steam login and logout go through the session methods
     /// ([`login`](Self::login), …) so the tokens are kept; calling them here works too but the
     /// session does not see the tokens.
     pub async fn call<C: HttpCall>(&self, call: &C) -> Result<C::Response, Error> {
+        self.call_with_timeout(call, self.inner.timeout).await
+    }
+
+    /// [`call`](Self::call) with its own deadline instead of the builder's
+    /// ([`ClientBuilder::timeout`]), clamped to 1 ms..=1 h: waiting for a token refresh,
+    /// connecting, sending and reading the answer together. A longer deadline than the builder's
+    /// holds too (a slow export, a large batch); a shorter one ends the call early with
+    /// [`Error::Timeout`]. A token refresh the call waits for keeps its own deadline (it is shared).
+    pub async fn call_with_timeout<C: HttpCall>(&self, call: &C, timeout: Duration) -> Result<C::Response, Error> {
         crate::runtime::current()?;
-        let deadline = self.deadline();
+        let deadline = deadline_after(clamp_timeout(timeout));
         let out = Outgoing::for_call(call)?;
         if !C::ROUTE.auth {
-            return self.inner.http.send(&out, None, deadline).await?.decode();
+            // Logout takes a Bearer token instead of the refresh token in the body: the current
+            // access token goes along (unless expired), as `logout` sends it.
+            let bearer = (C::ROUTE.path == net_backend_protocol::routes::auth::LOGOUT && !self.inner.session.expired())
+                .then(|| self.inner.session.access().map(|(token, _, _)| token))
+                .flatten();
+            return self.inner.http.send(&out, bearer.as_ref().map(net_backend_protocol::AccessToken::expose), deadline).await?.decode();
         }
         self.send_authed(&out, deadline).await?.decode()
     }
@@ -306,13 +422,55 @@ impl Client {
         self.session_call(&request, true).await
     }
 
+    /// Log in (or create the account) with an OpenID Connect provider's ID token
+    /// (`POST /v1/auth/oauth/{provider}`): the session keeps the tokens. No Bearer token is sent
+    /// (with one, the server links the provider instead: [`link_oauth`](Self::link_oauth)). With
+    /// the feature `oauth`, `sign_in_oauth` gets the token through the
+    /// system browser first.
+    pub async fn login_oauth(&self, login: OAuthLogin) -> Result<AuthSession, Error> {
+        self.session_call(&login, false).await
+    }
+
+    /// Link an OpenID Connect provider account to the logged-in account (needs a login younger
+    /// than 10 minutes, otherwise 403 `reauthentication_required`; a provider account linked to
+    /// another account answers 409 `conflict`).
+    pub async fn link_oauth(&self, login: OAuthLogin) -> Result<AuthSession, Error> {
+        self.session_call(&login, true).await
+    }
+
+    /// Sign in at an OpenID Connect provider in the system browser ([`crate::oauth`]: PKCE, a
+    /// loopback redirect; `open` gets the sign-in URL), then log in at the server with the ID
+    /// token (feature `oauth`). The token endpoint is reached with this client's TLS settings and
+    /// proxy setting, the proxy decided for the token endpoint's own host.
+    #[cfg(feature = "oauth")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "oauth")))]
+    pub async fn sign_in_oauth<F>(&self, provider: &str, flow: &crate::oauth::OAuthFlow, open: F) -> Result<AuthSession, Error>
+    where
+        F: FnOnce(&str) -> Result<(), String>,
+    {
+        let signed = flow.sign_in_with(self, open).await?;
+        self.login_oauth(OAuthLogin::new(provider, signed.token())).await
+    }
+
+    /// [`sign_in_oauth`](Self::sign_in_oauth), linking the provider account to the logged-in
+    /// account instead of logging in (needs a recent login).
+    #[cfg(feature = "oauth")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "oauth")))]
+    pub async fn link_oauth_sign_in<F>(&self, provider: &str, flow: &crate::oauth::OAuthFlow, open: F) -> Result<AuthSession, Error>
+    where
+        F: FnOnce(&str) -> Result<(), String>,
+    {
+        let signed = flow.sign_in_with(self, open).await?;
+        self.link_oauth(OAuthLogin::new(provider, signed.token())).await
+    }
+
     async fn session_call<C: HttpCall<Response = AuthSession>>(&self, call: &C, authed: bool) -> Result<AuthSession, Error> {
         crate::runtime::current()?;
         let deadline = self.deadline();
         let out = Outgoing::for_call(call)?;
         let answer = if authed { self.send_authed(&out, deadline).await? } else { self.inner.http.send(&out, None, deadline).await? };
         let session: AuthSession = answer.decode()?;
-        self.inner.session.set(session.tokens.clone(), answer.server_now);
+        self.inner.session.set(session.tokens.clone(), answer.server_now).finish().await;
         Ok(session)
     }
 
@@ -343,9 +501,11 @@ impl Client {
     async fn logout_with(&self, request: LogoutRequest) -> Result<(), Error> {
         crate::runtime::current()?;
         let deadline = self.deadline();
-        let (tokens, generation) = {
+        // The session's lineage, not the pair's generation: a refresh that completes while the
+        // logout is on its way rotates the pair of the SAME session, which the logout revokes too.
+        let (tokens, lineage) = {
             let state = self.inner.session.lock();
-            (state.tokens.clone().ok_or(Error::NotLoggedIn)?, state.generation)
+            (state.tokens.clone().ok_or(Error::NotLoggedIn)?, state.lineage)
         };
         let request = request.with_refresh_token(tokens.refresh_token.clone());
         let out = Outgoing::for_call(&request)?;
@@ -353,11 +513,11 @@ impl Client {
         let answer = self.inner.http.send(&out, bearer.as_ref().map(net_backend_protocol::AccessToken::expose), deadline).await?;
         match answer.decode::<net_backend_protocol::Ack>() {
             Ok(_) => {
-                self.inner.session.clear_if(generation);
+                self.inner.session.clear_lineage(lineage).finish().await;
                 Ok(())
             }
             Err(error) if error.status() == Some(401) => {
-                self.inner.session.clear_if(generation);
+                self.inner.session.clear_lineage(lineage).finish().await;
                 Ok(())
             }
             Err(error) => Err(error),
@@ -366,15 +526,17 @@ impl Client {
 
     /// Use these tokens (the app's stored session). The access token's expiry is taken from the
     /// pair; an expired one is refreshed at the next call. [`token_updates`](Self::token_updates)
-    /// reports the pair.
+    /// reports the pair. A [token file](ClientBuilder::token_file) is written on the calling
+    /// thread before this returns.
     pub fn resume(&self, tokens: TokenPair) {
-        self.inner.session.set(tokens, None);
+        self.inner.session.set(tokens, None).now();
     }
 
     /// Drop the tokens locally without telling the server (the session stays valid there until it
-    /// expires or is logged out elsewhere).
+    /// expires or is logged out elsewhere). A [token file](ClientBuilder::token_file) is deleted
+    /// on the calling thread before this returns.
     pub fn forget_session(&self) {
-        self.inner.session.clear();
+        self.inner.session.clear().now();
     }
 
     /// The current tokens, if logged in (store them like a password).
@@ -423,17 +585,18 @@ async fn refresh_task(inner: &Arc<Inner>) -> Result<TokenPair, Error> {
         };
         match result {
             Ok((pair, server_now)) => {
-                if inner.session.lock().generation != generation {
+                // Checked and stored under one lock: a logout or a new login meanwhile wins.
+                let Some(write) = inner.session.set_if(pair.clone(), server_now, generation) else {
                     // The session changed meanwhile (logout, a new login): this pair is not wanted.
                     return inner.session.tokens().ok_or(Error::NotLoggedIn);
-                }
-                inner.session.set(pair.clone(), server_now);
+                };
+                write.finish().await;
                 return Ok(pair);
             }
             Err(error) if error.ends_session() => {
                 let code = error.code().unwrap_or(codes::UNAUTHORIZED).to_string();
                 tracing::info!("net_backend_client: the session ended: the server refused the refresh ({code})");
-                inner.session.clear_if(generation);
+                inner.session.clear_if(generation).finish().await;
                 return Err(Error::SessionEnded { code });
             }
             Err(error) => {

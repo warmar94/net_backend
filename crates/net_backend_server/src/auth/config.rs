@@ -189,6 +189,10 @@ pub struct AuthConfig {
     /// only with `ws.enabled = false`: with the WebSocket hub on, 0 is refused, because a ban made
     /// by the command line or another instance would then never close open sockets.
     pub revocation_poll_secs: u64,
+    /// The most live sessions (logins not logged out, revoked or expired) one account may have; a
+    /// login over it revokes the account's oldest sessions (reason `session_limit`, open sockets of
+    /// those sessions close with 4001). Default 100; between 1 and 100000.
+    pub max_sessions_per_user: u32,
 }
 
 impl Default for AuthConfig {
@@ -247,6 +251,7 @@ impl Default for AuthConfig {
             purge_interval_secs: 3600,
             audit_retention_days: 365,
             revocation_poll_secs: 5,
+            max_sessions_per_user: 100,
         }
     }
 }
@@ -366,6 +371,7 @@ impl AuthConfig {
         need((60..=7 * 24 * 3600).contains(&self.link_reauth_secs), "link_reauth_secs must be between 60 and 604800");
         need((32..=128).contains(&self.rate_limit_ipv6_prefix), "rate_limit_ipv6_prefix must be between 32 and 128");
         need(self.revocation_poll_secs <= 3600, "revocation_poll_secs must be at most 3600");
+        need((1..=100_000).contains(&self.max_sessions_per_user), "max_sessions_per_user must be between 1 and 100000");
         need(self.audit_retention_days <= 36500, "audit_retention_days must be at most 36500");
         if problems.is_empty() {
             Ok(())

@@ -1,9 +1,9 @@
 [package]
 name = "net_backend"
-version = "0.1.1"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
-description = "The net_backend project generator: `net-backend new <name>` writes a game backend that runs at once (a net_backend_server with accounts, saves and chat on SQLite, plus a net_backend_client program)."
+description = "The net_backend installer: `net-backend new <name>` asks a few questions (client, database, modules, demo) and writes a game backend that runs at once: a net_backend_server, a client and an optional demo app."
 license.workspace = true
 repository.workspace = true
 homepage = "https://net-backend.com"
@@ -12,14 +12,16 @@ keywords = ["gamedev", "backend", "generator", "cli", "template"]
 categories = ["game-development", "command-line-utilities", "development-tools"]
 # Not part of the published package.
 exclude = ["/target"]
-# Removed at release (net_backend is published after protocol, server and client).
-publish = false
 
 # The command is `net-backend`; the crate name is `net_backend`.
 [[bin]]
 name = "net-backend"
 path = "src/main.rs"
 
-# No dependencies: the arguments are parsed with std, the templates are embedded with `include_str!`,
-# and generating a project needs no network.
+# Two dependencies: `inquire` for the questions of `net-backend new` (cross-platform prompts) and
+# `crossterm` (the version inquire uses) for colors, the spinner and the ANSI switch on Windows. The
+# arguments are parsed with std, the templates are embedded with `include_str!`, and generating a
+# project needs no network.
 [dependencies]
+inquire = "0.9.4"
+crossterm = "0.29.0"

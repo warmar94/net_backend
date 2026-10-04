@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-# The server framework with SQLite (compiled in, no system library) and the storage and chat modules.
-# PostgreSQL / MySQL: add the feature `postgres` / `mysql` (any combination; `database.url` picks one).
-net_backend_server = { version = "{{version}}", default-features = false, features = ["sqlite", "storage", "chat"] }
+# The server framework: {{features_doc}}. Another database: its feature (`sqlite`, `postgres`,
+# `mysql`; any combination, `database.url` in config.toml picks one).
+net_backend_server = { version = "{{version}}", default-features = false, features = [{{features}}] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

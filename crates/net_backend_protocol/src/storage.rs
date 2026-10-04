@@ -1,8 +1,16 @@
 //! Storage: save slots and other per-user key-value objects. Routes: [`routes::storage`](crate::routes::storage).
 //!
 //! An object lives at `(owner, collection, key)` and holds one JSON value (a save game, settings,
-//! an inventory snapshot). Every route addresses the CALLER's own objects; another user's objects
-//! are reached only through the admin routes.
+//! an inventory snapshot). The `/v1/storage` routes address the CALLER's own objects; another
+//! player's objects are read through [`GetPlayerObject`] / [`ListPlayerObjects`] when their
+//! [`ObjectVisibility`] allows it (a public profile, a shared level), and reached in full only
+//! through the admin routes.
+//!
+//! **Visibility.** An object is [`ObjectVisibility::Private`] (the owner only, the default),
+//! [`ObjectVisibility::Public`] (every logged-in player reads it) or [`ObjectVisibility::Friends`]
+//! (the owner's friends read it; servers with the friends module). A write sets it with
+//! [`PutObject::with_visibility`]; a write without it keeps the stored one (a new object: private).
+//! Only the owner writes; other players get 404 for an object they may not read.
 //!
 //! **Versions.** Every write bumps the object's [`ObjectVersion`] (1 for a new object). The default
 //! is **last write wins**. A write that names the version it expects ([`PutObject::if_version`])
@@ -150,9 +158,50 @@ impl VersionConflict {
     }
 }
 
+/// Who may read a storage object besides its owner.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ObjectVisibility {
+    /// The owner only (the default).
+    #[default]
+    Private,
+    /// Every logged-in player.
+    Public,
+    /// The owner's friends (on servers with the friends module).
+    Friends,
+    /// A visibility this crate does not know (a newer server).
+    #[serde(other)]
+    Unknown,
+}
+
+impl ObjectVisibility {
+    /// The name on the wire (`"private"`, …).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ObjectVisibility::Private => "private",
+            ObjectVisibility::Public => "public",
+            ObjectVisibility::Friends => "friends",
+            ObjectVisibility::Unknown => "unknown",
+        }
+    }
+
+    /// The visibility named `text`, if it is one this crate knows.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "private" => Some(ObjectVisibility::Private),
+            "public" => Some(ObjectVisibility::Public),
+            "friends" => Some(ObjectVisibility::Friends),
+            _ => None,
+        }
+    }
+}
+
 /// Write one object: `PUT /v1/storage/{collection}/{key}` → [`ObjectAck`].
 ///
-/// JSON: `{"value":{…},"if_version":3}` (`if_version` optional; without it the last write wins).
+/// JSON: `{"value":{…},"if_version":3,"visibility":"public"}` (`if_version` optional: without it
+/// the last write wins; `visibility` optional: without it the stored one stays, a new object is
+/// private).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct PutObject {
@@ -161,12 +210,21 @@ pub struct PutObject {
     /// Only write if the stored version is this one ([`ObjectVersion::ABSENT`]: only if new).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub if_version: Option<ObjectVersion>,
+    /// Who may read it from now on (absent: unchanged; a new object is private).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<ObjectVisibility>,
 }
 
 impl PutObject {
     /// An unconditional write of `value`.
     pub fn new(value: Value) -> Self {
-        Self { value, if_version: None }
+        Self { value, if_version: None, visibility: None }
+    }
+
+    /// The same write, setting who may read the object.
+    pub fn with_visibility(mut self, visibility: ObjectVisibility) -> Self {
+        self.visibility = Some(visibility);
+        self
     }
 
     /// Serialize `value` to JSON first.
@@ -250,19 +308,37 @@ pub struct StorageObject {
     /// Who may write it.
     #[serde(default)]
     pub write: WriteAccess,
+    /// Who may read it.
+    #[serde(default)]
+    pub visibility: ObjectVisibility,
     /// When it was last written.
     pub updated_at: UnixMillis,
 }
 
 impl StorageObject {
-    /// An object (owner write access).
+    /// An object (owner write access, private).
     pub fn new(collection: impl Into<String>, key: impl Into<String>, owner: UserId, value: Value, version: ObjectVersion, updated_at: UnixMillis) -> Self {
-        Self { collection: collection.into(), key: key.into(), owner, value, version, write: WriteAccess::Owner, updated_at }
+        Self {
+            collection: collection.into(),
+            key: key.into(),
+            owner,
+            value,
+            version,
+            write: WriteAccess::Owner,
+            visibility: ObjectVisibility::Private,
+            updated_at,
+        }
     }
 
     /// The same object with this write access.
     pub fn with_write(mut self, write: WriteAccess) -> Self {
         self.write = write;
+        self
+    }
+
+    /// The same object with this visibility.
+    pub fn with_visibility(mut self, visibility: ObjectVisibility) -> Self {
+        self.visibility = visibility;
         self
     }
 
@@ -278,6 +354,7 @@ impl StorageObject {
             key: self.key.clone(),
             version: self.version,
             write: self.write,
+            visibility: self.visibility,
             size_bytes: u64::try_from(value_bytes(&self.value)).unwrap_or(u64::MAX),
             updated_at: self.updated_at,
         }
@@ -298,6 +375,9 @@ pub struct StorageObjectInfo {
     /// Who may write it.
     #[serde(default)]
     pub write: WriteAccess,
+    /// Who may read it.
+    #[serde(default)]
+    pub visibility: ObjectVisibility,
     /// The size of the value's JSON, in bytes.
     pub size_bytes: u64,
     /// When it was last written.
@@ -305,9 +385,17 @@ pub struct StorageObjectInfo {
 }
 
 impl StorageObjectInfo {
-    /// A listing entry.
+    /// A listing entry (owner write access, private).
     pub fn new(collection: impl Into<String>, key: impl Into<String>, version: ObjectVersion, size_bytes: u64, updated_at: UnixMillis) -> Self {
-        Self { collection: collection.into(), key: key.into(), version, write: WriteAccess::Owner, size_bytes, updated_at }
+        Self {
+            collection: collection.into(),
+            key: key.into(),
+            version,
+            write: WriteAccess::Owner,
+            visibility: ObjectVisibility::Private,
+            size_bytes,
+            updated_at,
+        }
     }
 }
 
@@ -667,9 +755,96 @@ mod calls {
             Ok(Self { collection, key, delete })
         }
     }
+
+    /// Read another player's object the caller may read (public, or the owner's friend for
+    /// `friends`; the caller's own objects too): `GET /v1/users/{user}/storage/{collection}/{key}`
+    /// → [`StorageObject`] (404 when it does not exist or the caller may not read it).
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub struct GetPlayerObject {
+        /// The owner.
+        pub user: UserId,
+        /// The collection.
+        pub collection: String,
+        /// The key.
+        pub key: String,
+    }
+
+    impl GetPlayerObject {
+        /// Read `user`'s `collection` / `key`.
+        pub fn new(user: UserId, collection: impl Into<String>, key: impl Into<String>) -> Self {
+            Self { user, collection: collection.into(), key: key.into() }
+        }
+    }
+
+    impl HttpCall for GetPlayerObject {
+        type Payload = NoPayload;
+        type Response = StorageObject;
+        const ROUTE: Route = Route::new(HttpMethod::Get, routes::storage::PLAYER_OBJECT, true);
+        const PAYLOAD: PayloadKind = PayloadKind::Empty;
+
+        fn payload(&self) -> &NoPayload {
+            &NO_PAYLOAD
+        }
+
+        fn path_params(&self) -> PathParams {
+            PathParams::new().with("user", self.user).with("collection", &self.collection).with("key", &self.key)
+        }
+
+        fn from_parts(params: &PathParams, _payload: NoPayload) -> Result<Self, ApiError> {
+            let (collection, key) = names(params)?;
+            Ok(Self::new(params.id("user")?, collection, key))
+        }
+    }
+
+    /// List the objects of another player's collection the caller may read:
+    /// `GET /v1/users/{user}/storage/{collection}?cursor=…&limit=…` →
+    /// [`Page`]`<`[`StorageObjectInfo`]`>` (no values; ordered by key).
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub struct ListPlayerObjects {
+        /// The owner.
+        pub user: UserId,
+        /// The collection.
+        pub collection: String,
+        /// Which page.
+        pub page: PageRequest,
+    }
+
+    impl ListPlayerObjects {
+        /// The first page of `user`'s `collection`.
+        pub fn new(user: UserId, collection: impl Into<String>) -> Self {
+            Self { user, collection: collection.into(), page: PageRequest::first() }
+        }
+
+        /// The same call for this page.
+        pub fn with_page(mut self, page: PageRequest) -> Self {
+            self.page = page;
+            self
+        }
+    }
+
+    impl HttpCall for ListPlayerObjects {
+        type Payload = PageRequest;
+        type Response = Page<StorageObjectInfo>;
+        const ROUTE: Route = Route::new(HttpMethod::Get, routes::storage::PLAYER_COLLECTION, true);
+        const PAYLOAD: PayloadKind = PayloadKind::Query;
+
+        fn payload(&self) -> &PageRequest {
+            &self.page
+        }
+
+        fn path_params(&self) -> PathParams {
+            PathParams::new().with("user", self.user).with("collection", &self.collection)
+        }
+
+        fn from_parts(params: &PathParams, page: PageRequest) -> Result<Self, ApiError> {
+            Ok(Self::new(params.id("user")?, params.checked("collection", is_valid_name, NOT_A_NAME)?).with_page(page))
+        }
+    }
 }
 
-pub use calls::{GetObject, ListObjects, RemoveObject, WriteObject};
+pub use calls::{GetObject, GetPlayerObject, ListObjects, ListPlayerObjects, RemoveObject, WriteObject};
 
 #[cfg(test)]
 mod tests {

@@ -1,4 +1,4 @@
-//! `net_backend_server`'s WebSocket hub driven by the published `bevy_net_backend` 0.1.0 client in
+//! `net_backend_server`'s WebSocket hub driven by the published `bevy_net_backend` client in
 //! a headless Bevy app (`MinimalPlugins`, no window), over `ws://127.0.0.1` (loopback: plain
 //! `ws://` is allowed there without opting in). The server runs on a tokio runtime in this
 //! process; the app is stepped on the test thread. Bounded: every wait has a deadline.

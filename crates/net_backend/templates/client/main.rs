@@ -25,6 +25,8 @@ use net_backend_client::protocol::storage::{GetObject, PutObject, WriteObject};
 use net_backend_client::protocol::{PROTOCOL_VERSION, codes};
 use net_backend_client::ws::{WsEvent, WsSettings};
 
+/// The project's name.
+const NAME: &str = "{{name}}";
 /// The server when neither an argument nor `NET_BACKEND_URL` names one.
 const DEFAULT_URL: &str = "http://127.0.0.1:8080";
 /// The development account (registered on the first run; used on this machine only).
@@ -79,6 +81,10 @@ async fn run(url: &str) -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
+    if !info.has_module("auth") {
+        println!("the server has no accounts module (auth): nothing more to try");
+        return Ok(());
+    }
 
     // Log in; on the first run, register the account instead.
     match client
@@ -118,8 +124,11 @@ async fn run(url: &str) -> Result<(), Box<dyn std::error::Error>> {
         let mut messages = ws.subscribe::<ChatMessage>();
         let room = ws.request(&JoinRoom::new("world")).await?;
         println!("joined `world`; listening for {} s", LISTEN.as_secs());
-        ws.request(&SendMessage::new(room.id, "hello from the {{name}} client"))
-            .await?;
+        ws.request(&SendMessage::new(
+            room.id,
+            format!("hello from the {NAME} client"),
+        ))
+        .await?;
         let until = tokio::time::Instant::now() + LISTEN;
         loop {
             tokio::select! {

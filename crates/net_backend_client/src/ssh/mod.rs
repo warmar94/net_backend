@@ -22,11 +22,10 @@
 //!
 //! **Host keys** are always checked: the server's key must be in a known_hosts file (read-only;
 //! `~/.ssh/known_hosts` by default) or match a fingerprint pinned in code. An unknown, changed or
-//! revoked key is [`Error::HostKey`], never accepted silently. Connections
-//! that would be open to the Terrapin attack (CVE-2023-48795) are refused unless
-//! [`SshTarget::allow_terrapin_vulnerable`] is set (the refusal is tested against an in-process mock server;
-//! OpenSSH 9.6+ supports strict key exchange and connects). RSA keys need feature `ssh-rsa`; SHA-1 RSA
-//! signatures are never used.
+//! revoked key is [`Error::HostKey`], never accepted silently. Connections that would be open to
+//! the Terrapin attack (CVE-2023-48795) are refused unless
+//! [`SshTarget::allow_terrapin_vulnerable`] is set (OpenSSH 9.6+ supports strict key exchange and
+//! connects). RSA keys need feature `ssh-rsa`; SHA-1 RSA signatures are never used.
 //!
 //! **A lost connection** ends the session, unless the target opts in to
 //! [`SshTarget::with_reconnect`]: then a new connection is opened with backoff, a command that was

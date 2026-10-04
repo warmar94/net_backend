@@ -2,7 +2,7 @@
 
 use axum::extract::State;
 use http::header::{HeaderMap, HeaderValue, ETAG, IF_MATCH, IF_NONE_MATCH};
-use net_backend_protocol::storage::{BatchGet, BatchPut, GetObject, ListObjects, ObjectVersion, RemoveObject, WriteObject};
+use net_backend_protocol::storage::{BatchGet, BatchPut, GetObject, GetPlayerObject, ListObjects, ListPlayerObjects, ObjectVersion, RemoveObject, WriteObject};
 use net_backend_protocol::Ack;
 
 use super::events::Writer;
@@ -95,6 +95,48 @@ pub(crate) async fn get(
     Ok(with_etag(Reply::new(object), version))
 }
 
+/// List another player's objects in a collection that the caller may read (public ones; `friends`
+/// ones for the owner's friends; all of them for the owner), no values, ordered by key.
+#[utoipa::path(get, path = "/v1/users/{user}/storage/{collection}", tag = "storage", operation_id = "storage_player_list", security(("bearer" = [])),
+    params(
+        ("user" = i64, Path, description = "The owner"),
+        ("collection" = String, Path, description = "The collection"),
+        ("cursor" = Option<String>, Query, description = "The previous page's next_cursor"),
+        ("limit" = Option<u32>, Query, description = "1-100, default 50"),
+    ),
+    responses(
+        (status = 200, description = "A page of the objects the caller may read (an unknown player: an empty page)", body = doc::StorageObjectInfoPage),
+        (status = 400, description = "`bad_request`: an invalid name or cursor", body = ErrorBody),
+        (status = 401, description = "`unauthorized` / `token_expired`", body = ErrorBody),
+    ))]
+pub(crate) async fn player_list(
+    State(state): State<AppState>,
+    Ext(service): Ext<StorageService>,
+    who: AuthContext,
+    Call(call): Call<ListPlayerObjects>,
+) -> CallResult<ListPlayerObjects> {
+    service.list_visible(&state, who.user_id, call.user, &call.collection, &call.page).await.map(Reply::new)
+}
+
+/// Read another player's object the caller may read (`ETag`: its version).
+#[utoipa::path(get, path = "/v1/users/{user}/storage/{collection}/{key}", tag = "storage", operation_id = "storage_player_get", security(("bearer" = [])),
+    params(("user" = i64, Path, description = "The owner"), ("collection" = String, Path, description = "The collection"), ("key" = String, Path, description = "The key")),
+    responses(
+        (status = 200, description = "The object", body = doc::StorageObject, headers(("ETag" = String, description = "The version in quotes"))),
+        (status = 404, description = "`not_found`: no such object, or the caller may not read it", body = ErrorBody),
+    ))]
+pub(crate) async fn player_get(
+    State(state): State<AppState>,
+    Ext(service): Ext<StorageService>,
+    who: AuthContext,
+    Call(call): Call<GetPlayerObject>,
+) -> CallResult<GetPlayerObject> {
+    let object =
+        service.get_visible(&state, who.user_id, call.user, &call.collection, &call.key).await?.ok_or_else(|| AppError::not_found("no such object"))?;
+    let version = object.version;
+    Ok(with_etag(Reply::new(object), version))
+}
+
 /// Write one of the caller's objects. Without a condition the last write wins; `if_version` (or
 /// `If-Match: "N"`, `If-None-Match: *`) makes it conditional.
 #[utoipa::path(put, path = "/v1/storage/{collection}/{key}", tag = "storage", operation_id = "storage_put", request_body = doc::PutObject, security(("bearer" = [])),
@@ -124,8 +166,16 @@ pub(crate) async fn put(
     service.check_rate(who.user_id)?;
     call.put.validate(service.config().max_object_bytes)?;
     let if_version = condition(&headers, call.put.if_version, true)?;
-    let request =
-        WriteRequest { user: who.user_id, collection: call.collection, key: call.key, value: call.put.value, if_version, write: None, writer: Writer::Owner };
+    let request = WriteRequest {
+        user: who.user_id,
+        collection: call.collection,
+        key: call.key,
+        value: call.put.value,
+        if_version,
+        write: None,
+        visibility: call.put.visibility,
+        writer: Writer::Owner,
+    };
     let ack = service.write(&state, &HookCtx::new(state.clone(), Some(request_id)), request, None).await?;
     let version = ack.version;
     Ok(with_etag(Reply::new(ack), version))

@@ -23,6 +23,8 @@ pub(crate) struct StorageObject {
     version: i64,
     /// Who may write it: `owner` or `server` (server-locked: client writes get 403).
     write: String,
+    /// Who may read it: `private` (the owner), `public` (every player) or `friends` (the owner's friends).
+    visibility: String,
     /// When it was last written (unix ms).
     updated_at: i64,
 }
@@ -38,6 +40,8 @@ pub(crate) struct StorageObjectInfo {
     version: i64,
     /// `owner` or `server`.
     write: String,
+    /// `private`, `public` or `friends`.
+    visibility: String,
     /// The size of the value's JSON in bytes.
     size_bytes: u64,
     /// When it was last written (unix ms).
@@ -75,6 +79,9 @@ pub(crate) struct PutObject {
     /// Only write if the stored version is this one (0: only if new); 409 `version_conflict`
     /// otherwise. Without it the last write wins.
     if_version: Option<i64>,
+    /// Who may read it from now on: `private`, `public` or `friends` (the friends module); absent:
+    /// unchanged (a new object is private).
+    visibility: Option<String>,
 }
 
 /// One object to read.
@@ -138,6 +145,8 @@ pub(crate) struct AdminPutObject {
     if_version: Option<i64>,
     /// `owner` or `server` (locks the object against the owner); absent: unchanged (new: `owner`).
     write: Option<String>,
+    /// `private`, `public` or `friends`; absent: unchanged (new: `private`).
+    visibility: Option<String>,
 }
 
 /// The `details` of a 409 `version_conflict`.
@@ -190,7 +199,7 @@ mod tests {
         assert_eq!(properties::<StorageObjectInfo>(), keys(object.info()));
         assert_eq!(properties::<StorageObjectInfoPage>(), keys(Page::new(vec![object.info()], Some(Cursor::new("k")))));
         assert_eq!(properties::<ObjectAck>(), keys(p::ObjectAck::new("s", "k", p::ObjectVersion(1), t)));
-        assert_eq!(properties::<PutObject>(), keys(p::PutObject::new(json!(1)).if_absent()));
+        assert_eq!(properties::<PutObject>(), keys(p::PutObject::new(json!(1)).if_absent().with_visibility(p::ObjectVisibility::Public)));
         assert_eq!(properties::<ObjectRef>(), keys(p::ObjectRef::new("s", "k")));
         assert_eq!(properties::<BatchGet>(), keys(p::BatchGet::new(vec![])));
         assert_eq!(properties::<BatchObjects>(), keys(p::BatchObjects::new(vec![])));
@@ -199,7 +208,12 @@ mod tests {
         assert_eq!(properties::<BatchAcks>(), keys(p::BatchAcks::new(vec![])));
         assert_eq!(
             properties::<AdminPutObject>(),
-            keys(p_admin::AdminPutObject::new(json!(1)).if_version(p::ObjectVersion(1)).with_write(p::WriteAccess::Server))
+            keys(
+                p_admin::AdminPutObject::new(json!(1))
+                    .if_version(p::ObjectVersion(1))
+                    .with_write(p::WriteAccess::Server)
+                    .with_visibility(p::ObjectVisibility::Public)
+            )
         );
         assert_eq!(properties::<VersionConflict>(), keys(p::VersionConflict::new(Some(p::ObjectVersion(1))).at_index(0)));
     }

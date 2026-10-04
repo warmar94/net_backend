@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1
 #
-# The {{name}} server in a small non-root Linux image, the SQLite database in /data.
-#   docker compose up -d --build              (compose.yaml: the image, the port and the volume)
-#   docker build -t {{name}}-server .          (the image alone)
+# The {{name}} server in a small non-root Linux image.
+#   docker compose up -d --build              ({{compose_note}})
+#   docker build -t {{image}} .          (the image alone)
 #
 # Build arguments (the same as in net_backend's deploy/docker/Dockerfile): CARGO_ARGS (what to
 # build), BINARY (the built file), CONFIG (the configuration copied to /etc/net-backend/config.toml).
@@ -15,7 +15,7 @@ FROM rust:${RUST_VERSION}-slim-bookworm AS build
 WORKDIR /src
 ARG CARGO_ARGS="--bin {{package}}"
 ARG BINARY=target/release/{{package}}
-ARG CONFIG=config.docker.toml
+ARG CONFIG={{docker_config}}
 COPY . .
 # Cache mounts keep the registry and the build directory between builds (BuildKit). The project's own
 # migrations (./migrations, when present) go to /app/migrations.
@@ -28,7 +28,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     && if [ -d migrations ]; then cp -R migrations/. /out/migrations/; fi
 
 # glibc + libgcc only, no shell, no package manager; runs as uid/gid 65532 ("nonroot"); /data belongs
-# to it (the SQLite file of config.docker.toml).
+# to it (for a SQLite file).
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=build /out/net-backend-server /usr/local/bin/net-backend-server
 COPY --from=build /out/config.toml /etc/net-backend/config.toml

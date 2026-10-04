@@ -1,7 +1,19 @@
 //! Every route of the protocol (`routes::ALL`, each with its `HttpCall`) is served by a server with
 //! every module, with the protocol's method, and documented at the protocol's path; a game's own
 //! `HttpCall` marked `auth` is guarded by the mount itself.
-#![cfg(all(feature = "sqlite", feature = "storage", feature = "chat"))]
+#![cfg(all(
+    feature = "sqlite",
+    feature = "storage",
+    feature = "chat",
+    feature = "leaderboards",
+    feature = "notifications",
+    feature = "friends",
+    feature = "groups",
+    feature = "oauth",
+    feature = "lobbies",
+    feature = "matchmaking",
+    feature = "files"
+))]
 
 mod common;
 
@@ -9,7 +21,15 @@ use axum::body::Body;
 use http::{Request, StatusCode};
 use net_backend_server::auth::{Auth, AuthConfig};
 use net_backend_server::chat::Chat;
+use net_backend_server::files::{Files, FilesConfig};
+use net_backend_server::friends::Friends;
+use net_backend_server::groups::Groups;
 use net_backend_server::http::call::{Call, CallResult, Reply};
+use net_backend_server::leaderboards::Leaderboards;
+use net_backend_server::lobbies::Lobbies;
+use net_backend_server::matchmaking::Matchmaking;
+use net_backend_server::notifications::Notifications;
+use net_backend_server::oauth::OAuth;
 use net_backend_server::protocol::http_call::placeholders;
 use net_backend_server::protocol::routes::{self, HttpMethod};
 use net_backend_server::protocol::PathParams;
@@ -23,10 +43,20 @@ async fn every_protocol_route_is_served_and_documented() {
     auth.admin_in_openapi = true;
     let mut storage = StorageConfig::default();
     storage.admin_in_openapi = true;
+    let mut files = FilesConfig::default();
+    files.dir = common::temp_dir("routes-files");
     let prepared = NetBackendServer::new(common::http_config())
         .module(Auth::new().with_config(auth))
         .module(Storage::new().with_config(storage))
         .module(Chat::new())
+        .module(Leaderboards::new())
+        .module(Notifications::new())
+        .module(Friends::new())
+        .module(Groups::new())
+        .module(OAuth::new())
+        .module(Lobbies::new())
+        .module(Matchmaking::new())
+        .module(Files::new().with_config(files))
         .build()
         .await
         .expect("build");
@@ -40,7 +70,7 @@ async fn every_protocol_route_is_served_and_documented() {
         // a route that needs a token says so (401) before anything else.
         let mut params = PathParams::new();
         for name in placeholders(route.path) {
-            params.insert(name, if matches!(name, "user" | "room" | "message") { "1" } else { "sample" });
+            params.insert(name, if matches!(name, "user" | "room" | "message" | "id" | "group" | "file") { "1" } else { "sample" });
         }
         let path = params.fill(route.path).expect("a path");
         let request = Request::builder().method(method).uri(&path).header("content-type", "application/json").body(Body::from("{}")).expect("request");
@@ -55,6 +85,14 @@ async fn every_protocol_route_is_served_and_documented() {
             let request = Request::builder().method(other).uri(&path).body(Body::empty()).expect("request");
             assert_eq!(common::call(&router, request).await.0, StatusCode::METHOD_NOT_ALLOWED, "{other} {path}");
         }
+    }
+    // The routes without an `HttpCall` (the file upload and download): documented, guarded.
+    for route in routes::BINARY {
+        let method = route.method.as_str();
+        assert!(spec["paths"][route.path][method.to_ascii_lowercase()].is_object(), "{method} {} is not documented", route.path);
+        let path = route.path.replace("{file}", "1");
+        let request = Request::builder().method(method).uri(&path).body(Body::empty()).expect("request");
+        assert_eq!(common::call(&router, request).await.0, StatusCode::UNAUTHORIZED, "{method} {path} without a token");
     }
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "net_backend_protocol"
-version = "0.1.1"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 description = "Shared message types for net_backend_server: plain Rust + serde, usable from any Rust client."
@@ -29,9 +29,9 @@ serde_json = { workspace = true }
 # Wipes the secret types (`Password`, `AccessToken`, `RefreshToken`, `Secret`) when they are
 # dropped. No I/O, no unsafe in this crate; rustls already depends on it, so a client build has it.
 zeroize = { version = "1.7", default-features = false, features = ["alloc"] }
-# Optional integration with the published client. A plain version (newest compatible 0.1.x), never
+# Optional integration with the published client. A plain version (newest compatible 0.2.x), never
 # a path. Only the WebSocket + JSON parts are needed for the traits.
-bevy_net_backend = { version = "0.1.0", default-features = false, features = ["ws", "json"], optional = true }
+bevy_net_backend = { version = "0.2.0", default-features = false, features = ["ws", "json"], optional = true }
 
 [[example]]
 name = "print_frames"

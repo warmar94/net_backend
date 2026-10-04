@@ -82,6 +82,9 @@ pub mod codes {
     pub const BANNED: &str = "banned";
     /// The Steam ticket was refused by Steam (or Steam could not be asked). HTTP 401.
     pub const STEAM_AUTH_FAILED: &str = "steam_auth_failed";
+    /// An OpenID Connect ID token was refused (signature, issuer, audience, expiry, nonce, or a
+    /// token used before). HTTP 401.
+    pub const OAUTH_FAILED: &str = "oauth_failed";
     /// The chat room is full. HTTP 409.
     pub const ROOM_FULL: &str = "room_full";
     /// The caller is not a member of the chat room (join it first). HTTP 403.
@@ -99,7 +102,12 @@ pub mod codes {
 pub fn http_status_for(code: &str) -> Option<u16> {
     Some(match code {
         codes::BAD_REQUEST | codes::UNSUPPORTED_PROTOCOL | codes::INVALID_TOKEN => 400,
-        codes::UNAUTHORIZED | codes::TOKEN_EXPIRED | codes::INVALID_CREDENTIALS | codes::REFRESH_TOKEN_REUSED | codes::STEAM_AUTH_FAILED => 401,
+        codes::UNAUTHORIZED
+        | codes::TOKEN_EXPIRED
+        | codes::INVALID_CREDENTIALS
+        | codes::REFRESH_TOKEN_REUSED
+        | codes::STEAM_AUTH_FAILED
+        | codes::OAUTH_FAILED => 401,
         codes::FORBIDDEN | codes::QUOTA_EXCEEDED | codes::EMAIL_NOT_VERIFIED | codes::BANNED | codes::NOT_A_MEMBER | codes::REAUTHENTICATION_REQUIRED => 403,
         codes::NOT_FOUND => 404,
         codes::METHOD_NOT_ALLOWED => 405,
@@ -264,6 +272,7 @@ mod tests {
             codes::BANNED,
             codes::REAUTHENTICATION_REQUIRED,
             codes::STEAM_AUTH_FAILED,
+            codes::OAUTH_FAILED,
             codes::ROOM_FULL,
             codes::NOT_A_MEMBER,
             codes::HOOK_TIMEOUT,

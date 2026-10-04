@@ -882,9 +882,11 @@ async fn openapi_lists_auth_routes() {
         assert!(spec["paths"][path].is_object(), "{path} missing");
     }
     // Every route the protocol defines for accounts is served (method + path); a user's storage
-    // under /v1/admin belongs to the storage module.
+    // under /v1/admin belongs to the storage module, the OpenID Connect login to the oauth module.
     let accounts = |r: &&routes::Route| {
-        (r.path.starts_with("/v1/auth") || r.path.starts_with("/v1/account") || r.path.starts_with("/v1/admin")) && !r.path.contains("/storage")
+        (r.path.starts_with("/v1/auth") || r.path.starts_with("/v1/account") || r.path.starts_with("/v1/admin"))
+            && !r.path.contains("/storage")
+            && r.path != routes::auth::OAUTH
     };
     for route in routes::ALL.iter().filter(accounts) {
         let method = route.method.as_str().to_ascii_lowercase();
@@ -1239,7 +1241,7 @@ async fn last_admin_keeps_the_role() {
     fx.service().set_user_role(fx.state(), boss.account.id, "admin", false).await.expect("two admins: one may go");
 }
 
-/// F6 (0.1.1): `revocation_poll_secs = 0` is refused while the WebSocket hub is on (a ban made by
+/// F6: `revocation_poll_secs = 0` is refused while the WebSocket hub is on (a ban made by
 /// the command line or another instance would never close open sockets); without the hub it is
 /// allowed.
 #[cfg(feature = "sqlite")]
@@ -1263,7 +1265,7 @@ async fn revocation_poll_zero_is_refused_with_the_hub() {
     assert!(build(true, 1).await.is_ok(), "1 is allowed with the hub");
 }
 
-/// F7 (0.1.1): `n` registrations at the same moment all succeed, and each leaves exactly one
+/// F7: `n` registrations at the same moment all succeed, and each leaves exactly one
 /// unused verification token (the token insert no longer follows a ranged DELETE, which took gap
 /// locks on MySQL and deadlocked simultaneous registrations; a lost token would show here).
 async fn concurrent_registrations(url: &str, n: usize) {
@@ -1353,4 +1355,36 @@ async fn postgres_concurrent_registrations() {
     let (url, name) = common::fresh_database(&base).await;
     concurrent_registrations(&url, 60).await;
     common::drop_database(&base, &name).await;
+}
+
+/// B1: one account's live sessions are capped (`max_sessions_per_user`): a login over the cap
+/// revokes the oldest session (broadcast with the reason `session_limit`); the others keep working.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sessions_per_user_are_capped() {
+    let fx = fixture_with(
+        "sqlite::memory:",
+        |auth| {
+            auth.max_sessions_per_user = 2;
+            auth.rate_limits = false;
+        },
+        |s| s,
+    )
+    .await;
+    let first = fx.register("cap@example.com").await;
+    let mut revocations = fx.service().subscribe_revocations();
+    let second = fx.login_ok("cap@example.com", PASSWORD).await;
+    assert!(revocations.try_recv().is_err(), "two sessions are within the cap");
+    let third = fx.login_ok("cap@example.com", PASSWORD).await;
+    let revocation = revocations.try_recv().expect("the oldest session was revoked");
+    assert_eq!((revocation.user_id, revocation.reason, revocation.close_code()), (first.account.id, RevocationReason::SessionLimit, CloseCode::UNAUTHORIZED));
+    assert!(matches!(revocation.sessions, RevokedSessions::One(_)));
+    assert!(revocations.try_recv().is_err(), "only the oldest");
+    assert_eq!(fx.get(routes::account::ME, Some(access(&first))).await.0, StatusCode::UNAUTHORIZED);
+    for session in [&second, &third] {
+        assert_eq!(fx.get(routes::account::ME, Some(access(session))).await.0, StatusCode::OK);
+    }
+    let mut config = AuthConfig::default();
+    config.max_sessions_per_user = 0;
+    assert!(config.validate().is_err());
 }

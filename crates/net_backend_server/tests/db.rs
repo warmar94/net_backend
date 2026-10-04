@@ -292,6 +292,11 @@ async fn publish_suite(url: &str) {
     assert!(report.applied.is_empty());
     assert!(report.warnings.iter().any(|w| w.contains("202610010003_add_note.sql")), "{:?}", report.warnings);
     upgraded.state().db().close().await;
+    // ... and `serve` refuses to start on the old schema, saying what to run.
+    let refused = NetBackendServer::new(config.clone()).module(Items { name: "items", table: "items", extra: true }).build().await.expect("build");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let error = refused.serve_with_shutdown(listener, async {}).await.err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(error.contains("migrations publish items") && error.contains("202610010003_add_note.sql") && error.contains("migrate"), "{error}");
     // Publishing again adds only the new file and keeps the edited one.
     let added = NetBackendServer::new(config.clone())
         .module(Items { name: "items", table: "items", extra: true })

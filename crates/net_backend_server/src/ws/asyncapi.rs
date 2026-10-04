@@ -104,7 +104,7 @@ fn description(config: &Config) -> String {
          `auth` (absent = 1). Supported: {min}..={max}. An unsupported one: upgrade, then close 4010 (or HTTP 403 when the \
          request is not an upgrade). This endpoint never answers HTTP 400.\n\n\
          **Handshake answers.** 101 (upgraded); 401 `unauthorized` / `token_expired` (refresh, then reconnect); 403 `banned` or a server rule; 426 without an upgrade; 429 + `Retry-After` (too many handshakes or sockets from one address); 503 + `Retry-After` (full, too many sockets waiting for `auth`, shutting down, a temporary error). For first-message `auth`, a temporary server error closes with 1013 WITHOUT `auth.failed` (reconnect and retry).\n\n\
-         **Limits.** Messages up to {max_bytes} bytes (bigger: close 1009); {fps} frames per second per connection with a \
+         **Limits.** Messages up to {max_bytes} bytes, {pre_auth} bytes before the connection authenticated (bigger: close 1009); {fps} frames per second per connection with a \
          burst of {burst} (over it: `rate_limited`, close 1008 when flooding); {per_user} connections per user (the oldest \
          is closed with 4009); {rooms} rooms per connection. The server pings every {ping} s and drops a connection that \
          sent nothing for {idle} s; it answers the client's pings.\n\n**Close codes.**\n\n| Code | Meaning | Reconnect |\n|---|---|---|\n",
@@ -116,6 +116,7 @@ fn description(config: &Config) -> String {
         min = MIN_PROTOCOL_VERSION,
         max = PROTOCOL_VERSION,
         max_bytes = ws.max_message_bytes,
+        pre_auth = super::tap::PRE_AUTH_MAX_BYTES.min(ws.max_message_bytes),
         fps = ws.frames_per_second,
         burst = ws.frame_burst,
         per_user = ws.max_connections_per_user,

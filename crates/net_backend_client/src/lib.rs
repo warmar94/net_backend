@@ -12,10 +12,19 @@
 //! - HTTP and the WebSocket go through an HTTP CONNECT proxy from the environment or
 //!   [`ClientBuilder::proxy`]. The protocol's secret types and the client's own copies of secrets
 //!   are overwritten with zeros when dropped (the README lists exactly what is and is not).
-//! - Feature `ws`: the WebSocket (module `ws`): typed requests, pushes, heartbeats, reconnects that obey
-//!   the close codes.
-//! - Features `ssh` / `sftp` / `ssh-rsa`: SSH and SFTP to the server machine's OpenSSH (module `ssh`),
-//!   for admin tools: opt-in reconnects, pipelined transfers with progress.
+//! - Certificates: Mozilla's roots, extra roots ([`ClientBuilder::root_certificates_pem`]), the
+//!   operating system's store (feature `os-certificates`); HTTP/2 through ALPN (feature `http2`).
+//! - [`ClientBuilder::token_file`] / [`TokenFile`]: the session kept in a file between runs.
+//! - Files on the server (module [`files`]): uploads streamed from disk as `multipart/form-data`
+//!   with progress ([`Client::start_upload`]), downloads to memory or to a file with progress, typed
+//!   settings and listings through [`Client::call`].
+//! - OpenID Connect logins: [`Client::login_oauth`] with a provider's ID token; feature `oauth`:
+//!   the desktop sign-in in the system browser (module `oauth`: PKCE, a loopback redirect, Google's
+//!   endpoints as a preset) and `Client::sign_in_oauth`.
+//! - Feature `ws`: the WebSocket (module `ws`): typed requests, pushes, heartbeats, reconnects that
+//!   obey the close codes.
+//! - Features `ssh` / `sftp` / `ssh-rsa`: SSH and SFTP to the server machine's OpenSSH (module
+//!   `ssh`), for admin tools: opt-in reconnects, pipelined transfers with progress.
 //!
 //! ```no_run
 //! use net_backend_client::protocol::auth::{GetAccount, LoginRequest};
@@ -41,7 +50,11 @@
 pub mod blocking;
 mod client;
 mod error;
+pub mod files;
 mod http;
+#[cfg(feature = "oauth")]
+#[cfg_attr(docsrs, doc(cfg(feature = "oauth")))]
+pub mod oauth;
 mod reply;
 mod runtime;
 mod session;
@@ -49,6 +62,7 @@ mod session;
 #[cfg_attr(docsrs, doc(cfg(feature = "ssh")))]
 pub mod ssh;
 mod tls;
+mod token_file;
 #[cfg(feature = "ws")]
 #[cfg_attr(docsrs, doc(cfg(feature = "ws")))]
 pub mod ws;
@@ -59,8 +73,9 @@ pub use error::{Error, HostKeyProblem};
 pub use net_backend_protocol as protocol;
 pub use reply::{CancelHandle, Reply};
 pub use session::TokenUpdates;
+pub use token_file::TokenFile;
 
 /// The README's Rust blocks, compiled as doctests.
-#[cfg(all(doctest, feature = "ws", feature = "sftp"))]
+#[cfg(all(doctest, feature = "ws", feature = "sftp", feature = "oauth"))]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;

@@ -26,7 +26,7 @@ This crate defines **what** is said; a client library decides **how** it is sent
 | Your client is… | Use |
 |---|---|
 | a **Rust** app | this crate + [`net_backend_client`](https://github.com/warmar94/net_backend/tree/main/crates/net_backend_client) for the connection. |
-| a **Bevy** game | this crate + [`bevy_net_backend`](https://github.com/warmar94/bevy_net_backend) for the connection (with the optional `bevy_net_backend` feature, the types plug straight into its WebSocket requests). |
+| a **Bevy** game | this crate + [`bevy_net_backend`](https://github.com/warmar94/bevy_net_backend) for the connection (with the optional `bevy_net_backend` feature, the types plug straight into its WebSocket requests, and every HTTP route is a typed call there too). |
 | **other** Rust code | this crate + any HTTP / WebSocket library (for example reqwest, ureq, tokio-tungstenite). |
 | **not Rust** | the HTTP / WebSocket API directly: [API.md](https://github.com/warmar94/net_backend/blob/main/API.md) (plus the server's OpenAPI and AsyncAPI documents), with the same JSON. |
 
@@ -44,7 +44,14 @@ This crate defines **what** is said; a client library decides **how** it is sent
 - [Errors](#errors)
 - [Accounts and sessions](#accounts-and-sessions)
 - [Storage (saves)](#storage-saves)
+- [Files](#files)
 - [Chat](#chat)
+- [Leaderboards](#leaderboards)
+- [Notifications](#notifications)
+- [Friends](#friends)
+- [Groups](#groups)
+- [Lobbies](#lobbies)
+- [Matchmaking](#matchmaking)
 - [Ids, timestamps, pages](#ids-timestamps-pages)
 - [Versioning and compatibility](#versioning-and-compatibility)
 - [Optional integration with bevy_net_backend](#optional-integration-with-bevy_net_backend)
@@ -60,11 +67,19 @@ This crate defines **what** is said; a client library decides **how** it is sent
 |---|---|
 | `envelope` | The WebSocket frames: `WsRequestFrame`, `WsResponseFrame`, `WsPushFrame`, first-message `WsAuth`, `WsAuthOk`, the decoders `WsServerFrame` / `WsClientFrame`, `CloseCode`, the traits `WsCall` (request kind → answer type) and `ServerPush`, `Ack`. |
 | `error` | `ApiError { code, message, details }`, the HTTP body `ErrorBody`, the stable `codes`, `ValidationDetails`, `http_status_for`. |
-| `ids`, `time`, `page` | `UserId`, `RoomId`, `MessageId` (`i64`), `UnixMillis` (`i64` milliseconds), cursor pagination (`PageRequest`, `Page<T>`, `Cursor`). |
+| `ids`, `time`, `page` | `UserId`, `RoomId`, `MessageId`, `NotificationId`, `GroupId`, `LobbyId`, `TicketId`, `FileId` (`i64`), `UnixMillis` (`i64` milliseconds), cursor pagination (`PageRequest`, `Page<T>`, `Cursor`). |
 | `auth` | Register, login, Steam login, refresh, logout, account, email verification, password reset; `TokenPair`; redacted `Password`, `AccessToken`, `RefreshToken`, `Secret`. |
 | `admin` | Operator routes: list / inspect accounts (`AdminUser`), ban (`BanRequest`, `BanInfo`), revoke sessions, roles, the audit log (`AuditEntry`, `AuditQuery`), a user's storage (`AdminPutObject`). |
-| `storage` | Per-user key-value objects (save slots): put / get / list / delete / batch with optimistic versions. |
-| `chat` | Rooms, direct messages, join / leave / send / history / members, the pushes `chat.message`, `chat.deleted` and `chat.presence`, message deletion. |
+| `storage` | Per-user key-value objects (save slots): put / get / list / delete / batch with optimistic versions; a visibility (`ObjectVisibility`: private / public / friends) and reads of other players' objects (`GetPlayerObject`, `ListPlayerObjects`). |
+| `files` | Players' binary files: `FileInfo`, `FileVisibility` (private / public / friends / shared), `FileMeta` (the upload's JSON part), `UpdateFile`, `FileQuery`, `FileUsage`, the calls `ListFiles`, `GetFileUsage`, `GetFile`, `EditFile`, `DeleteFile`; the part names `UPLOAD_META_PART` / `UPLOAD_FILE_PART`, `name_problem`, `is_valid_content_type`, `is_sha256_hex`. |
+| `chat` | Rooms, direct messages, join / leave / send / history / members, the pushes `chat.message`, `chat.deleted` and `chat.presence`, message deletion; message editing (`EditMessage`, `chat.edited`), read markers and unread counts (`MarkRead`, `ListReceipts`, `UnreadQuery`, `chat.read`), typing (`SetTyping`, `chat.typing`), rooms created by players (`CreateRoom`, `RoomRole`, `RoomVisibility`, the room calls, `chat.room`). |
+| `leaderboards` | Boards (`BoardInfo`: `ScoreMode`, `ScoreOrder`, `Period` with its reset times), `SubmitScore` / `ScoreAck`, the top (`LeaderboardPage`), the caller's rank (`MyRank`) and the ranks around it. |
+| `notifications` | `Notification` (also the `notify.new` push), `NotificationQuery`, `CountNotifications` / `NotificationCount`, `MarkNotifications` / `MarkAck`, `DeleteNotification`: each a WebSocket request and an HTTP call. |
+| `groups` | `GroupInfo`, `GroupRole`, `GroupMember`, `GroupInvite`, `GroupList`, `CreateGroup`, `UpdateGroup`, `GroupQuery`, `Invitee`, `RoleChange` and the calls (`ListGroups`, `MyGroups`, `GetGroup`, `EditGroup`, `DeleteGroup`, `ListGroupMembers`, `JoinGroup`, `LeaveGroup`, `InviteToGroup`, `AcceptGroupInvite`, `DeclineGroupInvite`, `RevokeGroupInvite`, `KickMember`, `SetMemberRole`, `TransferGroup`). |
+| `lobbies` | `LobbyInfo` (`LobbyVisibility`, `LobbyState`, `LobbyMember`), `LobbyCode` (text and number forms), `CreateLobby`, `UpdateLobby`, `LobbySearch` (`LobbyFilter`), `SetReady`, `LobbyPlayer`, `JoinLobbyByCode`, the pushes `LobbyMemberUpdate` / `LobbyUpdate` and the calls (`MyLobbies`, `GetLobby`, `EditLobby`, `JoinLobby`, `LeaveLobby`, `SetLobbyReady`, `NewLobbyCode`, `TransferLobby`, `KickFromLobby`). |
+| `matchmaking` | `QueueInfo` / `Queues`, `CreateTicket`, `MatchTicket` (`TicketStatus`), the pushes `MatchFound` / `TicketExpired` and the calls (`ListQueues`, `GetTicket`, `CancelTicket`). |
+| `friends` | `FriendEntry` (`FriendState`), `AddFriend` (by id, name or code), `AcceptFriend`, `DeclineFriend`, `CancelFriendRequest`, `RemoveFriend`, `BlockUser` / `UnblockUser`, the lists (`ListFriends`, `ListFriendRequests`, `ListBlocks`), `FriendCode`, `FriendsHeartbeat`, the `friends.presence` push (`FriendPresence`), `normalize_friend_code`; the Steam ID lookup `SteamMatch` → `SteamMatchResult` (`SteamPlayer`), `parse_steam_id`, `is_individual_steam_id`, the settings `GetFriendSettings` / `UpdateFriendSettings` → `FriendSettings`. |
+| `oauth` | OpenID Connect logins: `OAuthToken` (an identity provider's ID token + the nonce of the sign-in) and the call `OAuthLogin` (`POST /v1/auth/oauth/{provider}` → `AuthSession`). |
 | `http_call` | `HttpCall` (route + payload + answer type of every HTTP route), `PathParams`, `PayloadKind`, `NoPayload`. |
 | `text` | The character rules behind `validate()`: control, invisible and direction-changing characters. |
 | `kinds`, `routes` | Every WebSocket `type` and every `/v1` HTTP path as constants (plus a route table). |
@@ -75,16 +90,16 @@ This crate defines **what** is said; a client library decides **how** it is sent
 | Feature | Default | What |
 |---|---|---|
 | (none) | yes | serde, serde_json and zeroize only. |
-| `bevy_net_backend` | no | Implements the client crate [`bevy_net_backend`](https://github.com/warmar94/bevy_net_backend)'s `WsRequest` / `WsPushMessage` for this crate's WebSocket messages and its `Credentials` for `AccessToken`. Brings that crate and its dependencies; a server never enables it. |
+| `bevy_net_backend` | no | Implements the client crate [`bevy_net_backend`](https://github.com/warmar94/bevy_net_backend)'s `WsRequest` / `WsPushMessage` for this crate's WebSocket messages and its `Credentials` for `AccessToken`, and adds the `bevy` module: every `HttpCall` as a typed request of that client. Brings that crate and its dependencies; a server never enables it. |
 
 ## Install
 
 ```toml
 [dependencies]
-net_backend_protocol = { version = "0.1.1" }
+net_backend_protocol = { version = "0.2.0" }
 
 # With the optional client integration:
-# net_backend_protocol = { version = "0.1.1", features = ["bevy_net_backend"] }
+# net_backend_protocol = { version = "0.2.0", features = ["bevy_net_backend"] }
 ```
 
 Rust 1.95 or newer.
@@ -164,7 +179,7 @@ assert_eq!(<SendMessage as WsCall>::KIND, "chat.send");
 ## The WebSocket envelope
 
 JSON objects in text frames, compatible with the default envelope (`JsonEnvelope`) of the client
-crate `bevy_net_backend` 0.1.0:
+crate `bevy_net_backend`:
 
 | Direction | Frame | JSON |
 |---|---|---|
@@ -193,7 +208,7 @@ crate `bevy_net_backend` 0.1.0:
 - An open socket survives the expiry of its access token; only a revocation closes it (4001, or
   4003 for a ban). Client recipe: refresh shortly before expiry (`ACCESS_TOKEN_REFRESH_MARGIN_SECS`);
   after a `Disconnected` with a handshake 401 or close 4001, refresh once and connect again (if the
-  refresh fails, log in again).
+  refresh is refused, log in again).
 - Messages are at most 1 MiB (`MAX_MESSAGE_BYTES`) in both directions.
 
 **Close codes** (`CloseCode`). Clients reconnect after every code except 4000–4099:
@@ -211,8 +226,12 @@ crate `bevy_net_backend` 0.1.0:
 | 4009 | `REPLACED` | replaced by a newer connection of the same user or session (e.g. over the server's per-user connection cap) |
 | 4010 | `UNSUPPORTED_PROTOCOL` | the client's protocol version is not supported |
 
-**WebSocket kinds** (`kinds`): `auth`, `auth.ok`, `auth.failed`, `chat.join`, `chat.leave`,
-`chat.send`, `chat.history`, `chat.members`, pushes `chat.message`, `chat.deleted` and `chat.presence`.
+**WebSocket kinds** (`kinds`): `auth`, `auth.ok`, `auth.failed`; chat `chat.join`, `chat.leave`,
+`chat.send`, `chat.history`, `chat.members`, `chat.edit`, `chat.mark_read`, `chat.receipts`,
+`chat.unread`, `chat.set_typing` and the pushes `chat.message`, `chat.deleted`, `chat.presence`,
+`chat.edited`, `chat.read`, `chat.typing`, `chat.room`; notifications `notify.list`, `notify.count`,
+`notify.mark`, `notify.delete` and the push `notify.new`; the pushes `friends.presence`,
+`lobby.member`, `lobby.changed`, `match.found` and `match.expired`.
 
 ## HTTP routes
 
@@ -225,6 +244,7 @@ Everything versioned is under `/v1` (`routes::PREFIX`). "auth" = `Authorization:
 | POST | `/v1/auth/register` | no | `RegisterRequest` → `AuthSession` |
 | POST | `/v1/auth/login` | no | `LoginRequest` → `AuthSession` |
 | POST | `/v1/auth/steam` | no | `SteamLoginRequest` → `AuthSession` |
+| POST | `/v1/auth/oauth/{provider}` | no (a Bearer token of a recent login links) | `OAuthToken` → `AuthSession` |
 | POST | `/v1/auth/refresh` | no | `RefreshRequest` → `TokenPair` |
 | POST | `/v1/auth/logout` | auth or `refresh_token` in the body | `LogoutRequest` → `Ack` |
 | POST | `/v1/auth/email/verify` | no | `VerifyEmailRequest` → `Ack` |
@@ -241,11 +261,80 @@ Everything versioned is under `/v1` (`routes::PREFIX`). "auth" = `Authorization:
 | DELETE | `/v1/storage/{collection}/{key}` | auth | query `DeleteObject` → `Ack` |
 | POST | `/v1/storage/_batch/get` | auth | `BatchGet` → `BatchObjects` |
 | POST | `/v1/storage/_batch/put` | auth | `BatchPut` → `BatchAcks` |
+| GET | `/v1/users/{user}/storage/{collection}` | auth | query `PageRequest` → `Page<StorageObjectInfo>` (another player's objects the caller may read) |
+| GET | `/v1/users/{user}/storage/{collection}/{key}` | auth | → `StorageObject` (public, or `friends` for the owner's friends) |
 | GET | `/v1/chat/rooms` | auth | query `PageRequest` → `Page<RoomInfo>` |
 | GET | `/v1/chat/rooms/{room}/messages` | auth | query `PageRequest` → `Page<ChatMessage>` |
 | DELETE | `/v1/chat/rooms/{room}/messages/{message}` | auth (its sender or a moderator) | → `Ack` (the room gets `chat.deleted`) |
 | POST | `/v1/chat/dm` | auth | `OpenDirect` → `RoomInfo` |
 | GET | `/v1/chat/dms` | auth | query `PageRequest` → `Page<RoomInfo>` (the caller's DMs, with `peer`) |
+| PATCH | `/v1/chat/rooms/{room}/messages/{message}` | auth (its sender in the edit window, or a moderator) | `MessageEdit` → `ChatMessage` (the room gets `chat.edited`) |
+| PUT | `/v1/chat/rooms/{room}/read` | auth | `ReadUpTo` → `Ack` (the read marker) |
+| GET | `/v1/chat/rooms/{room}/receipts` | auth (members) | → `ReadReceipts` |
+| POST | `/v1/chat/unread` | auth | `UnreadQuery` → `UnreadCounts` |
+| POST | `/v1/chat/rooms` | auth | `CreateRoom` → `RoomInfo` (a player room) |
+| GET | `/v1/chat/rooms/mine` | auth | query `PageRequest` → `Page<RoomInfo>` (the caller's player rooms and invitations) |
+| GET | `/v1/chat/rooms/public` | auth | query `PageRequest` → `Page<RoomInfo>` (public player rooms) |
+| GET | `/v1/chat/rooms/{room}` | auth | → `RoomInfo` |
+| PATCH | `/v1/chat/rooms/{room}` | auth (owner, moderators) | `UpdateRoom` → `RoomInfo` |
+| DELETE | `/v1/chat/rooms/{room}` | auth (owner) | → `Ack` |
+| POST | `/v1/chat/rooms/{room}/join` | auth | → `RoomInfo` (become a member, or accept an invitation) |
+| POST | `/v1/chat/rooms/{room}/leave` | auth | → `Ack` |
+| GET | `/v1/chat/rooms/{room}/members` | auth (members) | query `PageRequest` → `Page<RoomMembership>` |
+| POST | `/v1/chat/rooms/{room}/invites` | auth (owner, moderators) | `RoomUser` → `Ack` |
+| DELETE | `/v1/chat/rooms/{room}/members/{user}` | auth (owner, moderators) | → `Ack` (a kick: banned until invited again) |
+| PUT | `/v1/chat/rooms/{room}/members/{user}/role` | auth (owner) | `RoomRoleChange` → `Ack` |
+| POST | `/v1/chat/rooms/{room}/owner` | auth (owner) | `RoomUser` → `Ack` |
+| GET | `/v1/leaderboards` | auth | → `Boards` |
+| GET | `/v1/leaderboards/{board}` | auth | query `TopQuery` (`cursor`, `limit`, `at`) → `LeaderboardPage` (best first) |
+| POST | `/v1/leaderboards/{board}/scores` | auth | `SubmitScore` → `ScoreAck` |
+| GET | `/v1/leaderboards/{board}/me` | auth | query `RankQuery` (`at`) → `MyRank` |
+| GET | `/v1/leaderboards/{board}/around` | auth | query `AroundQuery` (`above`, `below`, `at`) → `LeaderboardPage` |
+| GET | `/v1/notifications` | auth | query `NotificationQuery` (`cursor`, `limit`, `unread_only`) → `Page<Notification>` (newest first) |
+| GET | `/v1/notifications/count` | auth | → `NotificationCount` |
+| POST | `/v1/notifications/mark` | auth | `MarkNotifications` → `MarkAck` |
+| DELETE | `/v1/notifications/{id}` | auth | → `Ack` |
+| GET | `/v1/friends` | auth | query `PageRequest` → `Page<FriendEntry>` (with the online state) |
+| DELETE | `/v1/friends/{user}` | auth | → `Ack` |
+| GET | `/v1/friends/requests` | auth | query `RequestQuery` (`direction`, `cursor`, `limit`) → `Page<FriendEntry>` |
+| POST | `/v1/friends/requests` | auth | `AddFriend` → `FriendEntry` |
+| DELETE | `/v1/friends/requests/{user}` | auth | → `Ack` |
+| POST | `/v1/friends/requests/{user}/accept` | auth | → `FriendEntry` |
+| POST | `/v1/friends/requests/{user}/decline` | auth | → `Ack` |
+| GET | `/v1/friends/blocks` | auth | query `PageRequest` → `Page<FriendEntry>` |
+| PUT / DELETE | `/v1/friends/blocks/{user}` | auth | → `Ack` (block / unblock) |
+| GET / POST | `/v1/friends/code` | auth | → `FriendCode` (the code / a new one) |
+| POST | `/v1/friends/presence` | auth | → `Ack` (online heartbeat) |
+| POST | `/v1/friends/steam` | auth | `SteamMatch` → `SteamMatchResult` (Steam IDs → accounts here) |
+| GET / PUT | `/v1/friends/settings` | auth | → `FriendSettings` / `UpdateFriendSettings` → `FriendSettings` |
+| GET / POST | `/v1/groups` | auth | query `GroupQuery` (`query`, `cursor`, `limit`) → `Page<GroupInfo>`; `CreateGroup` → `GroupInfo` |
+| GET | `/v1/groups/mine` | auth | → `GroupList` |
+| GET | `/v1/groups/invites` | auth | query `PageRequest` → `Page<GroupInvite>` |
+| GET / PATCH / DELETE | `/v1/groups/{group}` | auth | → `GroupInfo`; `UpdateGroup` → `GroupInfo`; → `Ack` |
+| GET | `/v1/groups/{group}/members` | auth | query `PageRequest` → `Page<GroupMember>` |
+| POST | `/v1/groups/{group}/join`, `/leave` | auth | → `GroupInfo`, `Ack` |
+| POST | `/v1/groups/{group}/invites` | auth | `Invitee` → `Ack` |
+| POST | `/v1/groups/{group}/invites/accept`, `/decline` | auth | → `GroupInfo`, `Ack` |
+| DELETE | `/v1/groups/{group}/invites/{user}`, `/v1/groups/{group}/members/{user}` | auth | → `Ack` |
+| PUT | `/v1/groups/{group}/members/{user}/role` | auth | `RoleChange` → `Ack` |
+| POST | `/v1/groups/{group}/transfer` | auth | `Invitee` → `Ack` |
+| POST | `/v1/lobbies` | auth | `CreateLobby` → `LobbyInfo` |
+| GET | `/v1/lobbies/mine` | auth | → `LobbyList` |
+| POST | `/v1/lobbies/search` | auth | `LobbySearch` → `Page<LobbyInfo>` |
+| POST | `/v1/lobbies/join` | auth | `JoinLobbyByCode` → `LobbyInfo` |
+| GET / PATCH | `/v1/lobbies/{lobby}` | auth | → `LobbyInfo`; `UpdateLobby` → `LobbyInfo` (host) |
+| POST | `/v1/lobbies/{lobby}/join`, `/leave` | auth | → `LobbyInfo`, `Ack` |
+| PUT | `/v1/lobbies/{lobby}/ready` | auth | `SetReady` → `Ack` |
+| POST | `/v1/lobbies/{lobby}/code` | auth | → `LobbyInfo` (host: a new join code) |
+| POST | `/v1/lobbies/{lobby}/host` | auth | `LobbyPlayer` → `Ack` (host) |
+| DELETE | `/v1/lobbies/{lobby}/members/{user}` | auth | → `Ack` (host) |
+| GET | `/v1/matchmaking/queues` | auth | → `Queues` |
+| POST / GET / DELETE | `/v1/matchmaking/ticket` | auth | `CreateTicket` → `MatchTicket`; → `MatchTicket`; → `Ack` |
+| POST | `/v1/files` | auth | `multipart/form-data`: `meta` (JSON `FileMeta`, optional, first) + `file` (the bytes) → `FileInfo` (in `routes::BINARY`) |
+| GET | `/v1/files` | auth | query `FileQuery` (`owner`, `cursor`, `limit`) → `Page<FileInfo>` |
+| GET | `/v1/files/usage` | auth | → `FileUsage` |
+| GET / PATCH / DELETE | `/v1/files/{file}` | auth | → `FileInfo`; `UpdateFile` → `FileInfo` (owner); → `Ack` (owner) |
+| GET | `/v1/files/{file}/content` | auth | → the bytes (in `routes::BINARY`) |
 | GET | `/v1/admin/users` | admin | query `UserListQuery` (`q`, `cursor`, `limit`) → `Page<AdminUser>` |
 | GET | `/v1/admin/users/{user}` | admin | → `AdminUser` |
 | POST | `/v1/admin/users/{user}/ban` | admin | `BanRequest` → `Ack` (sessions revoked, sockets close 4003) |
@@ -345,7 +434,7 @@ Codes (`codes`): `bad_request` 400, `validation_failed` 422, `unauthorized` 401,
 `token_expired` 401, `not_found` 404, `method_not_allowed` 405, `unsupported_media_type` 415, `conflict` 409, `version_conflict` 409, `payload_too_large` 413, `rate_limited`
 429, `quota_exceeded` 403, `unknown_type` (WebSocket only), `unsupported_protocol` 400,
 `invalid_credentials` 401, `refresh_token_reused` 401, `email_taken` 409, `email_not_verified`
-403, `invalid_token` 400, `banned` 403, `reauthentication_required` 403, `steam_auth_failed` 401, `room_full` 409, `not_a_member`
+403, `invalid_token` 400, `banned` 403, `reauthentication_required` 403, `steam_auth_failed` 401, `oauth_failed` 401, `room_full` 409, `not_a_member`
 403, `hook_timeout` 503, `unavailable` 503, `internal` 500. Codes never change meaning; server
 modules and games may add their own, so treat an unknown code like its HTTP status.
 `unsupported_protocol` is 400 on plain HTTP routes only (see versioning). `email_taken` tells that
@@ -384,12 +473,29 @@ Rules shared by both sides: passwords 10 characters to 128 bytes, no control cha
 whitespace; emails up to 254 bytes (shape only: the server normalises them and sends a verification
 mail); display names up to 32 characters, trimmed. Emails must be a plain `local@domain`
 (`auth::is_valid_email`): display names, angle brackets, comments, quoted local parts and address
-literals are refused, so a server never re-parses an address with a lenient mail parser. Emails and display names refuse control
-characters and invisible or direction-changing characters (bidi controls, zero-width characters,
-BOM: `net_backend_protocol::text`), which would allow impersonation. Steam tickets up to 8192 hex
-characters (Steam's buffer is 2560 bytes = 5120 hex). Password-reset requests always answer the same way, whether or not the
-address has an account. Steam: the game sends the hex ticket from `GetAuthTicketForWebApi` with
+literals are refused, so a server never re-parses an address with a lenient mail parser. Emails
+and display names refuse control characters and invisible or direction-changing characters (bidi
+controls, zero-width characters, BOM: `net_backend_protocol::text`), which would allow
+impersonation. Steam tickets up to 8192 hex characters (Steam's buffer is 2560 bytes = 5120 hex).
+Password-reset requests always answer the same way, whether or not the address has an account. Steam: the game sends the hex ticket from `GetAuthTicketForWebApi` with
 its identity string; the server checks it with Steam and creates the account on the first login.
+
+OpenID Connect (a server with the `oauth` module): the game signs the player in at the provider
+(Google, or another provider the server is configured for), gets the provider's ID token and sends
+it with the nonce of that sign-in as `OAuthLogin`; the server checks the token and answers an
+`AuthSession`. The provider account becomes a `LinkedIdentity` (`provider` = the server's name for
+the provider). With the Bearer token of a recent login the same call links the provider account
+instead; unlinking is `UnlinkIdentity`.
+
+```rust
+use net_backend_protocol::oauth::{OAuthLogin, OAuthToken};
+use net_backend_protocol::HttpCall;
+
+let login = OAuthLogin::new("google", OAuthToken::new("eyJhbGciOi.eyJpc3Mi.c2lnbmF0dXJl").with_nonce("nonce-of-this-sign-in"));
+assert!(login.token.validate().is_ok());
+assert_eq!(login.path().as_deref(), Some("/v1/auth/oauth/google"));
+assert!(!format!("{login:?}").contains("eyJhbGciOi")); // the token never shows in Debug
+```
 
 ## Storage (saves)
 
@@ -423,8 +529,36 @@ Names: 1–128 bytes of ASCII letters, digits, `_`, `-`, `.`, starting with a le
 distinct objects (`MAX_BATCH`) and 4 MiB of values (`MAX_BATCH_BYTES`), all or nothing; a batch
 read over 4 MiB is refused with 413. Collection listings return `StorageObjectInfo` (version, size,
 time, no value), so a page stays small. `write` is `owner` or `server`: only server-side game code
-sets `server`, and clients then get 403 on writes. Binary data: put it in a string yourself (e.g.
-base64, +33 %, which counts against the size limit).
+sets `server`, and clients then get 403 on writes. `visibility` (`ObjectVisibility`) is `private`
+(the default), `public` or `friends`: `PutObject::with_visibility` sets it, a write without it keeps
+the stored one, and `GetPlayerObject` / `ListPlayerObjects` read another player's objects the caller
+may read (404 / left out otherwise). Binary data: the `files` module (below), or a string you
+encode yourself (e.g. base64, +33 %, which counts against the size limit).
+
+## Files
+
+A server with the `files` module keeps players' binary files. The upload and the download carry
+bytes, not JSON, so they have no `HttpCall` (`routes::BINARY`); everything else is typed.
+
+```rust
+use net_backend_protocol::files::{FileMeta, FileVisibility, ListFiles, FileQuery, UpdateFile, UPLOAD_META_PART};
+use net_backend_protocol::{routes, FileId, HttpCall, UserId};
+
+// The upload's `meta` part (JSON), sent before the `file` part.
+let meta = FileMeta::new().with_name("caves.level").shared_with(vec![UserId(7), UserId(9)]);
+assert!(meta.validate().is_ok());
+assert_eq!(UPLOAD_META_PART, "meta");
+// Another player's readable files; a change of the settings.
+assert_eq!(ListFiles::new().with_query(FileQuery::of(UserId(7))).path().as_deref(), Some("/v1/files"));
+let _public = UpdateFile::new().with_visibility(FileVisibility::Public);
+assert_eq!(routes::file_content_path(FileId(12)), "/v1/files/12/content");
+```
+
+`FileVisibility`: `private` (the owner), `public` (every logged-in player), `friends` (the owner's
+friends), `shared` (the accounts in `shared_with`). `FileInfo.sha256` is the lower-case hex SHA-256
+of the bytes (the download's `ETag`); `FileMeta::with_sha256` makes the server check the upload.
+Names: 1–255 bytes without slashes or control / invisible characters (`files::name_problem`);
+content types: a plain `type/subtype` (`files::is_valid_content_type`).
 
 ## Chat
 
@@ -441,6 +575,15 @@ history pages and opening a direct-message room are also HTTP routes.
 | push `chat.deleted` | `MessageDeleted` (moderation) |
 | `chat.members` | `ListMembers` → `RoomMembers` (who is online: each user once, up to 200 listed, the total `count`; a DM room lists only the caller: a DM never reveals the peer's online state) |
 | push `chat.presence` | `Presence` (`joined` / `left`, with the user's name and the room's online `count`) |
+| `chat.edit` | `EditMessage` → `ChatMessage` (the edited message, with `edited_at`) |
+| push `chat.edited` | `MessageEdited` |
+| `chat.mark_read` | `MarkRead` → `Ack` (the caller's read marker; forward only) |
+| push `chat.read` | `ReadReceipt` (a member's marker moved; DM, group and player rooms; coalesced) |
+| `chat.receipts` | `ListReceipts` → `ReadReceipts` |
+| `chat.unread` | `UnreadQuery` → `UnreadCounts` (up to 100 rooms, counts stop at 1000) |
+| `chat.set_typing` | `SetTyping` → `Ack` (never stored) |
+| push `chat.typing` | `TypingUpdate` (throttled; a client drops it after `expires_in_ms`) |
+| push `chat.room` | `RoomUpdate` (a player room changed: `RoomChange`) |
 
 Public and group rooms: membership lasts as long as the connection; after a reconnect, join
 again. **Direct messages** need no join: their `chat.message` goes to every open connection of
@@ -467,10 +610,247 @@ It is best effort on purpose: rooms with more online users than the server's pre
 **Deleting** a message (`DELETE /v1/chat/rooms/{room}/messages/{message}`, its sender or a
 moderator) pushes `chat.deleted` and removes it from the history.
 
+**Editing** (`EditMessage`, over the WebSocket or HTTP): the sender within the server's edit window
+(`DEFAULT_EDIT_WINDOW_SECS`, 900) or a moderator; the room gets `chat.edited`, and the history shows
+the latest text with `ChatMessage::edited_at`. **Read markers** (`MarkRead`: "read up to message X",
+forward only) feed `UnreadQuery`; in DM, group and player rooms the members get `ReadReceipt` pushes
+and `ListReceipts` answers the current markers. **Typing** (`SetTyping`) is never stored; a
+`TypingUpdate` carries how long to show it.
+
+**Rooms created by players** (`RoomKind::Player`): `CreateRoom` (a name, `RoomVisibility` public or
+private) makes the caller the owner. Public rooms are listed (`PublicRooms`) and open to anyone not
+banned; private rooms take invited players. Membership is stored: `JoinChatRoom` (or a `chat.join`)
+makes the caller a member and accepts an invitation, `LeaveChatRoom` ends it. Roles (`RoomRole`):
+the owner renames, changes the visibility, sets roles (`SetRoomRole`), hands the room on
+(`TransferRoom`) and deletes it (`DeleteRoom`); moderators rename (`EditRoom`), invite
+(`InviteToRoom`), kick (`KickFromRoom`: banned until invited again) and delete messages in the room.
+`MyRooms` lists the caller's rooms and invitations with its role, `ListRoomMembers` the rows of a
+room (`RoomMembership`). Every change is a `RoomUpdate` push (`chat.room`).
+
+```rust
+use net_backend_protocol::chat::{CreateRoom, EditMessage, InviteToRoom, MarkRead, RoomUser, UnreadQuery};
+use net_backend_protocol::{HttpCall, MessageId, RoomId, UserId, WsCall};
+
+let create = CreateRoom::new("Night Owls").public();
+assert_eq!(serde_json::to_string(&create).ok().as_deref(), Some(r#"{"name":"Night Owls","visibility":"public"}"#));
+let invite = InviteToRoom::new(RoomId(40), RoomUser::new(UserId(77)));
+assert_eq!(invite.path().as_deref(), Some("/v1/chat/rooms/40/invites"));
+// The same request over the WebSocket and over HTTP.
+let edit = EditMessage::new(RoomId(12), MessageId(981), "hello again");
+assert_eq!(<EditMessage as WsCall>::KIND, "chat.edit");
+assert_eq!(edit.path().as_deref(), Some("/v1/chat/rooms/12/messages/981"));
+assert_eq!(serde_json::to_string(&MarkRead::new(RoomId(12), MessageId(981))).ok().as_deref(), Some(r#"{"room":12,"message":981}"#));
+assert!(UnreadQuery::new(vec![RoomId(12)]).validate().is_ok());
+```
+
+## Leaderboards
+
+The server configures its boards; players submit scores (`PostScore` with a `SubmitScore`) and read
+them (`ListBoards`, `GetLeaderboard`, `GetMyRank`, `GetAroundMe`). A board (`BoardInfo`) has a key
+(1–64 bytes of `a-z`, `0-9`, `_ - .`; `leaderboards::is_valid_board_key`), a `ScoreMode` (`best`
+keeps the better score, `latest` replaces it, `sum` adds to it), a `ScoreOrder` (`desc`: higher is
+better; `asc`: lower is better) and a `Period` (`all_time`, `daily`, `weekly`: resets at 00:00 UTC,
+weeks on Monday). `Period::start_of` / `end_of` compute a period's bounds; every read takes `at`, a
+time inside the period to show.
+
+```rust
+use net_backend_protocol::leaderboards::{AroundQuery, GetAroundMe, Period, PostScore, SubmitScore};
+use net_backend_protocol::{HttpCall, UnixMillis};
+
+let submit = PostScore::new("weekly-race", SubmitScore::new(61_250).with_metadata(serde_json::json!({"car": "red"})));
+assert_eq!(submit.path().as_deref(), Some("/v1/leaderboards/weekly-race/scores"));
+let around = GetAroundMe::new("weekly-race").with_query(AroundQuery::new().with_counts(2, 2));
+assert_eq!(around.path().as_deref(), Some("/v1/leaderboards/weekly-race/around"));
+// The week of 2026-10-02 started on Monday 2026-09-28 at 00:00 UTC.
+assert_eq!(Period::Weekly.start_of(UnixMillis(1_790_953_200_000)), Some(UnixMillis(1_790_553_600_000)));
+```
+
+Ranks (`LeaderboardEntry::rank`) start at 1 and are unique: equal scores rank by who reached the
+score first (`achieved_at`), then by the lower account id. `ScoreAck` says the stored score, the
+submitted one (after the server's hooks), whether the stored score changed and the rank. A board
+with `client_submit: false` takes scores from the server's own code only (players get 403). A score
+is any `i64` except `i64::MIN`; metadata is a small JSON value (`DEFAULT_MAX_METADATA_BYTES`, 1 KiB,
+unless the server configures another). `AroundQuery` asks for up to `MAX_AROUND` (50) entries above
+and below the caller (default `DEFAULT_AROUND`, 5).
+
+## Notifications
+
+The server stores notifications per player (a reward, an invitation, a system notice) and pushes
+each new one as `notify.new` to the player's open connections. Only the server creates them; a
+player reads, marks and deletes their own, over the WebSocket or HTTP (same answers):
+
+| Kind | Request → answer | HTTP |
+|---|---|---|
+| push `notify.new` | `Notification` | |
+| `notify.list` | `NotificationQuery` → `Page<Notification>` (newest first) | `GET /v1/notifications` |
+| `notify.count` | `CountNotifications` → `NotificationCount` (`unread`, `total`) | `GET /v1/notifications/count` |
+| `notify.mark` | `MarkNotifications` → `MarkAck` (`changed`, `unread`) | `POST /v1/notifications/mark` |
+| `notify.delete` | `DeleteNotification` → `Ack` | `DELETE /v1/notifications/{id}` |
+
+```rust
+use net_backend_protocol::notifications::{MarkNotifications, NotificationQuery};
+use net_backend_protocol::{HttpCall, NotificationId, WsCall};
+
+let unread = NotificationQuery::new().unread_only();
+assert_eq!(<NotificationQuery as WsCall>::KIND, "notify.list");
+assert_eq!(serde_json::to_string(&unread).unwrap(), r#"{"unread_only":true}"#);
+let mark = MarkNotifications::read(vec![NotificationId(31), NotificationId(32)]);
+assert!(mark.validate().is_ok());
+assert_eq!(mark.path().as_deref(), Some("/v1/notifications/mark"));
+assert!(MarkNotifications::all_read().validate().is_ok());
+```
+
+A `Notification` has its `id`, the game's `kind` (1–64 bytes of `a-z`, `0-9`, `_ . : -`, starting
+with a letter; `notifications::is_valid_kind`), an optional `text` (at most `MAX_TEXT_CHARS`, 1000,
+with the chat text rules), optional `data` (JSON; `DEFAULT_MAX_DATA_BYTES`, 4 KiB, unless the server
+configures another), the `sender` account if any, `created_at` and `read`. `MarkNotifications` names
+1 to `MAX_MARK_IDS` (100) distinct ids or `all`; ids of other players are skipped. A client that was
+offline lists what it missed (`unread_only`); while connected it gets `notify.new`.
+
+## Friends
+
+Friends by account. A player sends a request by account id, display name or friend code
+(`AddFriend`); the other accepts (`AcceptFriend`) or declines (`DeclineFriend`); the sender may
+withdraw it (`CancelFriendRequest`); either ends the friendship (`RemoveFriend`). `BlockUser` ends a
+friendship and every open request between the two, and refuses the blocked player's requests. Every
+entry is a `FriendEntry` (`user`, `name`, `state`: `friend` / `sent` / `received` / `blocked`,
+`since`; for friends `online` and `last_seen`). HTTP only, plus one push:
+
+| Push | Data |
+|---|---|
+| `friends.presence` | `FriendPresence` (`user`, `online`, `last_seen`), to the player's friends when it comes online or goes offline |
+
+```rust
+use net_backend_protocol::friends::{normalize_friend_code, AddFriend, ListFriendRequests, RequestQuery};
+use net_backend_protocol::HttpCall;
+
+let add = AddFriend::by_code("k7m2-q9xd");
+assert!(add.validate().is_ok());
+assert_eq!(normalize_friend_code("k7m2-q9xd").as_deref(), Some("K7M2Q9XD"));
+assert_eq!(serde_json::to_string(&add).unwrap(), r#"{"code":"k7m2-q9xd"}"#);
+let sent = ListFriendRequests::sent().with_query(RequestQuery::sent().with_limit(20));
+assert_eq!(sent.path().as_deref(), Some("/v1/friends/requests"));
+```
+
+A friend code is 8 characters of `FRIEND_CODE_ALPHABET` (`2-9`, `A-Z` without `O` and `I`); case,
+spaces and dashes do not matter when it is typed in (`normalize_friend_code`). A name is matched
+exactly against display names, which are not unique: several matches answer 409 `conflict`. A
+friend is online while it has a WebSocket connection, or for the server's online window (90 s by
+default) after its last `FriendsHeartbeat`.
+
+**Steam IDs:** on a server with Steam login, a player who linked a Steam account sends Steam IDs,
+e.g. its Steam friends list (`SteamMatch`), and gets the ones that belong to accounts there
+(`SteamMatchResult`: `SteamPlayer` with `steam_id`, `user`, `name`, and `state` when the caller
+already relates to that player). Steam IDs travel as decimal strings (`parse_steam_id`: an
+individual SteamID64, no sign, spaces or leading zeros); a SteamID64 is larger than the integers a
+JSON number carries exactly. Players who turned `FriendSettings::steam_findable` off
+(`UpdateFriendSettings`) are never found; it is on by default.
+
+```rust
+use net_backend_protocol::friends::{parse_steam_id, SteamMatch, UpdateFriendSettings};
+use net_backend_protocol::HttpCall;
+
+let lookup = SteamMatch::new([76_561_201_960_265_729]);
+assert!(lookup.validate().is_ok());
+assert_eq!(serde_json::to_string(&lookup).unwrap(), r#"{"steam_ids":["76561201960265729"]}"#);
+assert_eq!(lookup.path().as_deref(), Some("/v1/friends/steam"));
+assert_eq!(parse_steam_id("76561201960265729"), Some(76_561_201_960_265_729));
+let hide = UpdateFriendSettings::new().steam_findable(false);
+assert_eq!(serde_json::to_string(&hide).unwrap(), r#"{"steam_findable":false}"#);
+```
+
+## Groups
+
+Groups (guilds, clans). A player creates one (`CreateGroup`) and owns it; others join by invitation
+(`InviteToGroup`, then `AcceptGroupInvite` or `DeclineGroupInvite`) or directly when it is open
+(`JoinGroup`). Roles (`GroupRole`): the owner, admins (change the group, invite, remove members) and
+members; `SetMemberRole` and `TransferGroup` are the owner's. HTTP only.
+
+```rust
+use net_backend_protocol::groups::{CreateGroup, EditGroup, GroupRole, SetMemberRole, UpdateGroup};
+use net_backend_protocol::{GroupId, HttpCall, UserId};
+
+let create = CreateGroup::new("Night Owls").with_description("We play at night").open();
+assert!(create.validate().is_ok());
+assert!(CreateGroup::new("No").validate().is_err(), "3 to 32 characters");
+let clear = EditGroup::new(GroupId(5), UpdateGroup::new().with_description(""));
+assert_eq!(clear.path().as_deref(), Some("/v1/groups/5"));
+let promote = SetMemberRole::new(GroupId(5), UserId(42), GroupRole::Admin);
+assert_eq!(promote.path().as_deref(), Some("/v1/groups/5/members/42/role"));
+```
+
+A `GroupInfo` has the name (3 to `MAX_GROUP_NAME_CHARS`, 32, characters; unique on the server
+without regard to case), an optional description (`MAX_DESCRIPTION_CHARS`, 500), `open`, the game's
+`metadata` (JSON; `DEFAULT_MAX_METADATA_BYTES`, 2 KiB, unless the server configures another), the
+owner, the member count and the server's `max_members`, the group's `chat_room` (when the server
+runs the chat module) and the caller's `role` when it is a member. In an `UpdateGroup`, an empty
+description removes it and a present `"metadata":null` removes the metadata.
+
+## Lobbies
+
+Lobbies (`lobbies`): a player creates one (`CreateLobby`) and hosts it; others join by id
+(`JoinLobby`: public lobbies, or a friends-only one of a friend) or with the join code
+(`JoinLobbyByCode`, any visibility); members set a ready flag (`SetLobbyReady`); the host changes
+the metadata, size, visibility and state (`EditLobby` with an `UpdateLobby`), kicks
+(`KickFromLobby`), hands the lobby over (`TransferLobby`) and replaces the code (`NewLobbyCode`).
+`LobbySearch` lists open lobbies by metadata filters. HTTP, plus two pushes:
+
+| Push | Data |
+|---|---|
+| `lobby.member` | `LobbyMemberUpdate` (`lobby`, `change`: `joined` / `left` / `kicked` / `ready`, `member`), to every member |
+| `lobby.changed` | `LobbyUpdate` (`changes`: `host` / `metadata` / `settings` / `state` / `code`, `lobby` without its member list), to every member |
+
+```rust
+use net_backend_protocol::lobbies::{CreateLobby, EditLobby, JoinLobbyByCode, LobbyCode, LobbySearch, LobbyState, LobbyVisibility, UpdateLobby};
+use net_backend_protocol::{HttpCall, LobbyId};
+
+let create = CreateLobby::new(4).with_visibility(LobbyVisibility::Private).with_meta("mode", "ranked");
+assert!(create.validate().is_ok());
+// A join code is also a number below 2^40, for platforms that carry a number.
+let code = LobbyCode::parse("k7m2-q9xd").unwrap();
+assert_eq!(code.to_u64(), 590_122_524_587);
+assert_eq!(LobbyCode::from_u64(590_122_524_587), Some(code));
+assert_eq!(JoinLobbyByCode::from_number(590_122_524_587).unwrap().code, "K7M2Q9XD");
+let start = EditLobby::new(LobbyId(7), UpdateLobby::new().with_state(LobbyState::InGame).remove_meta("password"));
+assert_eq!(start.path().as_deref(), Some("/v1/lobbies/7"));
+assert_eq!(serde_json::to_string(&start.update).unwrap(), r#"{"state":"in_game","metadata":{"password":null}}"#);
+let search = LobbySearch::new().with_filter("mode", "ranked");
+assert!(search.validate().is_ok());
+```
+
+A `LobbyInfo` has the visibility (`public`, `private`, `friends`), the state (`open`, `in_game`,
+`closed`: the last `lobby.changed` of a lobby that is gone), the host, `max_players`, the member
+count, the metadata (text keys of 1 to `MAX_META_KEY_BYTES`, 64, bytes; values of at most
+`MAX_META_VALUE_CHARS`, 256, characters), and for members the join code in both forms (`code`,
+`code_number`) and the `chat_room` (when the server runs the chat module); answers about one lobby
+list its `players` (`LobbyMember`: `user`, `name`, `ready`, `joined_at`). A join code is 8
+characters of `FRIEND_CODE_ALPHABET`; case, spaces and dashes do not matter when typed
+(`LobbyCode::parse`); `LobbyCode::grouped` shows it as `K7M2-Q9XD`.
+
+## Matchmaking
+
+Matchmaking (`matchmaking`): a player puts a ticket (`CreateTicket`: a queue and `attributes` the
+game's rules read) into one of the server's queues (`ListQueues`), reads it (`GetTicket`: waiting,
+or matched with its `MatchFound`) and cancels it (`CancelTicket`). HTTP, plus two pushes:
+
+| Push | Data |
+|---|---|
+| `match.found` | `MatchFound` (`ticket`, `queue`, `players`, the rules' `data`), to each matched player |
+| `match.expired` | `TicketExpired` (`ticket`, `queue`): the ticket ran out unmatched |
+
+```rust
+use net_backend_protocol::matchmaking::{CreateTicket, GetTicket};
+use net_backend_protocol::HttpCall;
+
+let ticket = CreateTicket::new("duel").with_attributes(serde_json::json!({"rating": 1520}));
+assert!(ticket.validate().is_ok());
+assert_eq!(GetTicket::new().path().as_deref(), Some("/v1/matchmaking/ticket"));
+```
+
 ## Ids, timestamps, pages
 
-- Ids are `i64` newtypes (`UserId`, `RoomId`, `MessageId`) and travel as plain JSON numbers.
-  Ids from outside (a SteamID64) travel as strings.
+- Ids are `i64` newtypes (`UserId`, `RoomId`, `MessageId`, `NotificationId`, `GroupId`, `LobbyId`,
+  `TicketId`, `FileId`) and travel as plain JSON numbers. Ids from outside (a SteamID64) travel as strings.
 - Timestamps are `UnixMillis`: `i64` milliseconds since 1970 UTC, a plain JSON number
   (`UnixMillis::now()`, `from_system_time`, `to_system_time`).
 - Lists use **cursor** pagination: `PageRequest { cursor, limit }` (default 50, at most 100) →
@@ -497,7 +877,11 @@ moderator) pushes `chat.deleted` and removes it from the history.
 
 With the feature `bevy_net_backend`, this crate's WebSocket messages implement that client's
 `WsRequest` / `WsPushMessage` (same kinds, same answer types: `JoinRoom`, `LeaveRoom`, `SendMessage`,
-`ChatHistory`, `ListMembers`; pushes `ChatMessage`, `MessageDeleted`, `Presence`) and `AccessToken` implements its
+`ChatHistory`, `ListMembers`, `EditMessage`, `MarkRead`, `ListReceipts`, `UnreadQuery`, `SetTyping`,
+`NotificationQuery`, `CountNotifications`, `MarkNotifications`, `DeleteNotification`; pushes
+`ChatMessage`, `MessageDeleted`, `Presence`, `MessageEdited`, `ReadReceipt`, `TypingUpdate`,
+`RoomUpdate`, `Notification`, `FriendPresence`, `LobbyMemberUpdate`, `LobbyUpdate`, `MatchFound`,
+`TicketExpired`) and `AccessToken` implements its
 `Credentials` (a `Bearer` header on every request and WebSocket handshake). The client's default
 envelope is the one above, so nothing else is needed:
 
@@ -515,7 +899,36 @@ ws.request("main", &JoinRoom::new("world"));
 // `BackendError::Rejected`, whose payload decodes as `ApiError` (`rejection.json::<ApiError>()`).
 ```
 
-The feature uses `bevy_net_backend` 0.1.0.
+Every HTTP route is a typed call there as well (module `net_backend_protocol::bevy`):
+`request(&call)` builds the client's `OutgoingRequest` exactly as `net_backend_client` sends the
+call (`C::ROUTE.method` on `call.path()`, the payload as the JSON body or the query string,
+`accept: application/json` and the `x-net-backend-protocol` header; the game's credentials only on
+routes that need a token), `HttpClientCalls::call(&call)` sends it with the answer decoded as
+`C::Response`, and `api_error(&error)` reads the protocol's `ApiError` out of a refused answer. A
+path parameter that is missing or would need escaping is answered `InvalidRequest` and never sent.
+
+```rust,ignore
+use net_backend_protocol::bevy::{api_error, request, HttpClientCalls};
+use net_backend_protocol::leaderboards::{GetLeaderboard, LeaderboardPage, TopQuery};
+
+app.add_json_response::<LeaderboardPage>();
+
+// In a system: `http: Res<HttpClient>`.
+http.call(&GetLeaderboard::new("highscore").with_query(TopQuery::new().with_limit(10)));
+// Or adjust the request first (a timeout, a header):
+http.send_json::<LeaderboardPage>(request(&GetLeaderboard::new("highscore")).with_timeout(Duration::from_secs(5)));
+
+// Answers arrive as `JsonResponse<LeaderboardPage>`:
+match &answer.result {
+    Ok(page) => show(page),
+    Err(error) => match api_error(error) {
+        Some(api) => warn!("refused: {} ({})", api.message, api.code),
+        None => warn!("no answer: {error}"),
+    },
+}
+```
+
+Add the Bevy client itself to your game with `cargo add bevy_net_backend`.
 
 ## API design rules
 
@@ -537,14 +950,15 @@ The feature uses `bevy_net_backend` 0.1.0.
 
 ```sh
 cargo test -p net_backend_protocol                              # unit, golden JSON, round trips, redaction, wiped secrets, forward compatibility, HttpCall table
-cargo test -p net_backend_protocol --features bevy_net_backend  # plus the frames through the client's own JsonEnvelope
+cargo test -p net_backend_protocol --features bevy_net_backend  # plus the frames through the client's own JsonEnvelope and every HTTP call as its request
 cargo run -p net_backend_protocol --example print_frames        # prints the JSON of every frame
 ```
 
 The golden tests pin the exact JSON text of every envelope frame. With the feature on, the tests
-run every frame through `bevy_net_backend`'s real encoder and decoder in both directions and
-check that both decoders classify the same frames the same way. CI runs fmt, clippy, tests and
-docs for every feature combination on Rust 1.96.0.
+run every frame through `bevy_net_backend`'s real encoder and decoder in both directions,
+check that both decoders classify the same frames the same way, and build every route's typed
+call as that client's request, compared with what `net_backend_client` sends. CI runs fmt, clippy,
+tests and docs for every feature combination on Rust 1.96.0.
 
 ## FAQ
 

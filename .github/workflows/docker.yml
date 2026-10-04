@@ -89,7 +89,7 @@ jobs:
           pull: true
           labels: |
             org.opencontainers.image.title=net_backend_server
-            org.opencontainers.image.description=The net_backend_server reference server (Auth + Storage + Chat)
+            org.opencontainers.image.description=The net_backend_server reference server (every module)
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.url=https://net-backend.com
             org.opencontainers.image.version=${{ needs.version.outputs.version }}
@@ -154,7 +154,7 @@ jobs:
           for tag in $TAGS; do args+=(-t "$IMAGE:$tag"); done
           docker buildx imagetools create "${args[@]}" \
             --annotation "index:org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
-            --annotation "index:org.opencontainers.image.description=The net_backend_server reference server (Auth + Storage + Chat)" \
+            --annotation "index:org.opencontainers.image.description=The net_backend_server reference server (every module)" \
             --annotation "index:org.opencontainers.image.licenses=MIT OR Apache-2.0" \
             --annotation "index:org.opencontainers.image.version=${{ needs.version.outputs.version }}" \
             $(printf "$IMAGE@sha256:%s " *)

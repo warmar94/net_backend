@@ -4,14 +4,14 @@
 //!
 //! | Event | Kind | When |
 //! |---|---|---|
-//! | [`BeforeRegister`] | before | an account is about to be created (email registration or a first Steam login); change the display name, or refuse (e.g. a reserved name) |
+//! | [`BeforeRegister`] | before | an account is about to be created (email registration, or a first Steam or OpenID Connect login); change the display name, or refuse (e.g. a reserved name) |
 //! | [`AfterRegister`] | after | the account exists (committed) |
 //! | [`BeforeLogin`] | before | credentials are valid, the session is about to be created; refuse to keep a player out (maintenance, a game ban) |
-//! | [`AfterLogin`] | after | a session was created (login, registration, Steam) |
+//! | [`AfterLogin`] | after | a session was created (login, registration, Steam, OpenID Connect) |
 //! | [`BeforeAccountUpdate`] | before | `PATCH /v1/account`: change or refuse the new display name |
 //! | [`AfterEmailVerified`] | after | an email address was confirmed |
 //! | [`AfterPasswordChanged`] | after | a password was changed or reset |
-//! | [`AfterSessionsRevoked`] | after | sessions were revoked in THIS process (logout, password change, ban, admin, refresh-token reuse) |
+//! | [`AfterSessionsRevoked`] | after | sessions were revoked in THIS process (logout, password change, ban, admin, refresh-token reuse, the session cap) |
 //!
 //! ```
 //! use net_backend_server::auth::events::BeforeRegister;
@@ -49,6 +49,8 @@ pub enum LoginMethod {
     Steam,
     /// Created by a registration.
     Register,
+    /// An OpenID Connect ID token (the `oauth` module).
+    OpenId,
 }
 
 impl LoginMethod {
@@ -58,6 +60,7 @@ impl LoginMethod {
             LoginMethod::Password => "password",
             LoginMethod::Steam => "steam",
             LoginMethod::Register => "register",
+            LoginMethod::OpenId => "openid",
         }
     }
 }
@@ -108,6 +111,9 @@ pub struct BeforeLogin {
     pub method: LoginMethod,
     /// What Steam said, for a Steam login (ban flags, the owner of a borrowed copy).
     pub steam: Option<SteamIdentity>,
+    /// The provider account, for an OpenID Connect login (`provider` = the server's provider name,
+    /// `subject` = the token's `sub`).
+    pub identity: Option<LinkedIdentity>,
     /// The client address.
     pub ip: Option<IpAddr>,
 }
@@ -214,6 +220,8 @@ pub enum RevocationReason {
     Admin,
     /// A refresh token was used again after its grace window (possible theft).
     RefreshTokenReused,
+    /// A login went over `max_sessions_per_user`: the account's oldest sessions were revoked.
+    SessionLimit,
 }
 
 impl RevocationReason {
@@ -226,6 +234,7 @@ impl RevocationReason {
             RevocationReason::Banned => "banned",
             RevocationReason::Admin => "admin",
             RevocationReason::RefreshTokenReused => "refresh_reused",
+            RevocationReason::SessionLimit => "session_limit",
         }
     }
 
@@ -237,6 +246,7 @@ impl RevocationReason {
             "password_reset" => RevocationReason::PasswordReset,
             "banned" => RevocationReason::Banned,
             "refresh_reused" => RevocationReason::RefreshTokenReused,
+            "session_limit" => RevocationReason::SessionLimit,
             _ => RevocationReason::Admin,
         }
     }
@@ -311,5 +321,6 @@ mod tests {
             assert_eq!(RevocationReason::from_name(reason.as_str()), reason);
         }
         assert_eq!(LoginMethod::Steam.as_str(), "steam");
+        assert_eq!(LoginMethod::OpenId.as_str(), "openid");
     }
 }

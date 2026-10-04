@@ -70,8 +70,10 @@ pub(crate) async fn connect(client: Client, settings: WsSettings, runtime: Optio
     let (commands, receiver) = mpsc::unbounded_channel();
     let (state_sender, state) = watch::channel(WsState::Connected);
     // Only the task holds the senders: every stream ends (after its buffer) when the task does.
-    let (events, events_template) = broadcast::channel(settings.event_buffer);
-    let (pushes, pushes_template) = broadcast::channel(settings.push_buffer);
+    // The handles keep weak senders: with no stream, nothing is buffered.
+    let (events, _) = broadcast::channel(settings.event_buffer);
+    let (pushes, _) = broadcast::channel(settings.push_buffer);
+    let (events_weak, pushes_weak) = (events.downgrade(), pushes.downgrade());
     let task = Task {
         client,
         settings: settings.clone(),
@@ -83,9 +85,18 @@ pub(crate) async fn connect(client: Client, settings: WsSettings, runtime: Optio
         in_flight: HashMap::new(),
     };
     let handle = crate::runtime::current()?;
+    let on_current_thread = crate::runtime::spawns_on_current_thread_runtime();
     handle.spawn(task.run(link));
-    let (events, pushes) = (std::sync::Mutex::new(events_template), std::sync::Mutex::new(pushes_template));
-    Ok(WsConnection::new(Shared { commands, next_id: AtomicU64::new(1), state, events, pushes, settings, _runtime: runtime }))
+    Ok(WsConnection::new(Shared {
+        commands,
+        next_id: AtomicU64::new(1),
+        state,
+        events: events_weak,
+        pushes: pushes_weak,
+        settings,
+        on_current_thread,
+        _runtime: runtime,
+    }))
 }
 
 /// One connection attempt with a fresh token; a refused token gets ONE refresh and one more try.
@@ -129,24 +140,26 @@ impl Task {
                 }
                 let error = match end {
                     End::App => return self.finish(None),
-                    End::Closed(code, reason) if code == CloseCode::UNAUTHORIZED && !refreshed_after_4001 => {
-                        // 4001: ONE refresh, then one new connection at once.
+                    End::Closed(code, reason) if code == CloseCode::UNAUTHORIZED && !refreshed_after_4001 && self.settings.reconnect.is_some() => {
+                        // 4001 with a reconnect policy: ONE refresh, then one new connection at once.
+                        // (Without a policy, 4001 ends the connection like every 4000–4099 code.)
                         refreshed_after_4001 = true;
-                        let closed = Error::Closed { code, reason };
                         match self.client.refresh_shared(deadline_after(self.settings.connect_timeout)).await {
-                            Ok(_) => {}
+                            Ok(_) => match self.attempt_now().await {
+                                Some(Ok(new)) => {
+                                    link = Some(new);
+                                    reconnected = true;
+                                    continue;
+                                }
+                                Some(Err(error)) if self.is_final(&error) => return self.finish(Some(error)),
+                                Some(Err(error)) => error,
+                                None => return self.finish(None),
+                            },
                             Err(error @ Error::SessionEnded { .. }) => return self.finish(Some(error)),
-                            Err(_) => return self.finish(Some(closed)),
-                        }
-                        match self.attempt_now().await {
-                            Some(Ok(new)) => {
-                                link = Some(new);
-                                reconnected = true;
-                                continue;
-                            }
-                            Some(Err(error)) if self.is_final(&error) => return self.finish(Some(error)),
-                            Some(Err(error)) => error,
-                            None => return self.finish(None),
+                            // Logged out meanwhile: nothing to reconnect with.
+                            Err(Error::NotLoggedIn) => return self.finish(Some(Error::Closed { code, reason })),
+                            // A passing failure (network, 5xx, timeout): the backoff below.
+                            Err(error) => error,
                         }
                     }
                     End::Closed(code, reason) if code.is_permanent() => return self.finish(Some(Error::Closed { code, reason })),

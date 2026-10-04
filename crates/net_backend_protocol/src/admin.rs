@@ -369,7 +369,7 @@ mod calls {
     use crate::http_call::{payload_call, HttpCall, NoPayload, PathParams, PayloadKind, NO_PAYLOAD};
     use crate::page::{Page, PageRequest};
     use crate::routes::{self, HttpMethod, Route};
-    use crate::storage::{is_valid_name, DeleteObject, ObjectAck, ObjectVersion, StorageObject, StorageObjectInfo, WriteAccess};
+    use crate::storage::{is_valid_name, DeleteObject, ObjectAck, ObjectVersion, ObjectVisibility, StorageObject, StorageObjectInfo, WriteAccess};
 
     payload_call!(UserListQuery, Get, routes::admin::USERS, true, Query, Page<AdminUser>);
     payload_call!(AuditQuery, Get, routes::admin::AUDIT, true, Query, Page<AuditEntry>);
@@ -671,12 +671,21 @@ mod calls {
         /// Set who may write it afterwards ([`WriteAccess::Server`] locks it against the owner).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub write: Option<WriteAccess>,
+        /// Set who may read it (absent: unchanged; a new object is private).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub visibility: Option<ObjectVisibility>,
     }
 
     impl AdminPutObject {
         /// An unconditional write of `value`.
         pub fn new(value: Value) -> Self {
-            Self { value, if_version: None, write: None }
+            Self { value, if_version: None, write: None, visibility: None }
+        }
+
+        /// Set who may read it.
+        pub fn with_visibility(mut self, visibility: ObjectVisibility) -> Self {
+            self.visibility = Some(visibility);
+            self
         }
 
         /// Only write if the stored version is `version`.

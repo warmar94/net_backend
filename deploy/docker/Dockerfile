@@ -4,7 +4,9 @@
 # Build context: the repository root, e.g.
 #   docker build -f deploy/docker/Dockerfile -t net-backend-server .
 #
-# Your own server: copy this file into your project and set the three build arguments, e.g.
+# Your own server: a project from `net-backend new` has its own Dockerfile. Otherwise copy this file
+# into your project (it builds with `--locked`: the project's Cargo.lock must be there, committed)
+# and set the three build arguments, e.g.
 #   docker build --build-arg CARGO_ARGS="--bin mygame" --build-arg BINARY=target/release/mygame \
 #       --build-arg CONFIG=config.toml -t mygame .
 # (in Compose: `build: { context: ., args: { CARGO_ARGS: "--bin mygame", ... } }`). Every server built
@@ -18,7 +20,7 @@ FROM ${BUILD_IMAGE} AS build
 WORKDIR /src
 # What to build: the package / binary and its cargo features. The default is the reference server
 # with every database (the URL picks one), the modules, mail and Steam.
-ARG CARGO_ARGS="-p net_backend_server --example server --no-default-features --features sqlite,mysql,postgres,storage,chat,smtp,steam"
+ARG CARGO_ARGS="-p net_backend_server --example server --no-default-features --features sqlite,mysql,postgres,storage,chat,leaderboards,notifications,friends,groups,oauth,lobbies,matchmaking,files,smtp,steam"
 # Where cargo writes that binary.
 ARG BINARY=target/release/examples/server
 # The configuration baked into the image (the Compose files point the server at their own).

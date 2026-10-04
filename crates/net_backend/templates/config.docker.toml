@@ -1,6 +1,7 @@
 # The {{name}} server's configuration inside its Docker image (/etc/net-backend/config.toml), used by
-# compose.yaml: SQLite in /data (the volume `data`), migrations applied on start. The production
-# Compose files of net_backend's deploy/docker mount their own configuration over this file.
+# compose.yaml: SQLite in /data (the volume `data`, also the players' files with the files module),
+# migrations applied on start. The production Compose files of net_backend's deploy/docker mount their
+# own configuration over this file.
 
 [server]
 # Inside the container; compose.yaml publishes it on 127.0.0.1:8080 of this machine only.
@@ -15,13 +16,4 @@ migrations_dir = "/app/migrations"
 [log]
 level = "info"
 format = "json"
-
-[modules.auth]
-app_name = "{{name}}"
-# The log mailer writes only the recipient (masked) and the subject of each mail.
-log_mailer_show_links = false
-
-[modules.chat]
-[[modules.chat.rooms]]
-key = "world"
-name = "World"
+{{module_sections}}

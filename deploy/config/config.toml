@@ -1,4 +1,5 @@
-# net_backend_server: production configuration of the reference server (Auth + Storage + Chat).
+# net_backend_server: production configuration of the reference server (every module: Auth, Storage,
+# Chat, Leaderboards, Notifications, Friends, Groups, OAuth, Lobbies, Matchmaking, Files).
 #
 # The systemd install copies it once to /etc/net-backend/config.toml. (The Docker Compose files carry
 # the same settings inline, as their `x-nbs-config`.) Unknown keys are errors: check a change with
@@ -10,15 +11,22 @@
 [server]
 # Behind Caddy on the same machine: loopback only.
 bind = "127.0.0.1:8080"
-# In-flight requests and closing WebSockets get this long after SIGTERM; then each module gets up to
-# server.module_shutdown_timeout_secs (10 s), one after the other. systemd's TimeoutStopSec and
-# Compose's stop_grace_period (90 s each) cover grace + 3 modules + the pool close.
+# In-flight requests and closing WebSockets get this long after SIGTERM; then the modules shut down
+# at the same time, within server.module_shutdown_timeout_secs (10 s) together. systemd's
+# TimeoutStopSec and Compose's stop_grace_period (60 s each) cover grace + modules + the pool close.
 shutdown_grace_secs = 20
 
 [database]
 # A file holding the URL (mysql://… / postgres://… / sqlite:…), written by the installer.
 url_file = "/etc/net-backend/database_url"
 max_connections = 20
+# How long a request waits for a free database connection, in seconds; on SQLite also how long a
+# write waits for the write lock (SQLite allows one writer at a time).
+acquire_timeout_secs = 5
+# SQLite only (ignored for MySQL / PostgreSQL): when a commit waits for the disk.
+# "normal": a power loss or OS crash can lose the last moments of writes; the file is never corrupted.
+# "full": every commit waits for the disk; far fewer writes per second.
+sqlite_synchronous = "normal"
 # Production runs `migrate` as a deploy step (systemd ExecStartPre, the Compose `migrate` service).
 migrate_on_start = false
 # Published module migrations and the app's own (`migrations publish <module>` writes here).
@@ -49,6 +57,9 @@ query_token = false
 # Below the open-file limit (LimitNOFILE / ulimits nofile: 262144) with room for the database pool.
 max_connections = 10000
 
+# [permissions]               # role -> the permissions it holds (`admin` holds every one), e.g.
+# moderator = ["lobbies.manage"]
+
 [modules.auth]
 app_name = "My Game"
 # The log mailer writes only the recipient (masked) and the subject. For real mail (feature `smtp`):
@@ -71,9 +82,69 @@ app_name = "My Game"
 
 [modules.chat]
 # Defaults: 500 characters per message, a burst of 5 messages then one every 2 s, history kept 30 days.
+# Senders edit their messages for 900 s; players create rooms (10 owned each, 100 members per room,
+# 5 new rooms per hour); typing pushes at most every 3 s and none in rooms over 50 online users.
 history_retention_days = 30
+# edit_window_secs = 900
+# player_rooms = true
+# max_rooms_per_player = 10
+# max_player_room_members = 100
 
 [[modules.chat.rooms]]
 key = "world"
 name = "World"
 max_members = 200
+
+[modules.leaderboards]
+# Defaults: a burst of 30 client submissions per player then one every 2 s, 1 KiB of metadata per
+# score, 8 finished periods kept for daily / weekly boards.
+
+[[modules.leaderboards.boards]]
+key = "highscore"
+name = "High score"
+mode = "best"          # best | latest | sum
+order = "desc"         # desc (higher is better) | asc
+period = "all_time"    # all_time | daily | weekly (00:00 UTC, weeks on Monday)
+
+[modules.notifications]
+# Defaults: kept 30 days, at most 200 per player, 4 KiB of data each.
+retention_days = 30
+
+[modules.friends]
+# Defaults: 200 friends, 50 open requests (sent and received each) and 500 blocks per player; a burst
+# of 10 requests then one every 6 s; a heartbeat keeps a player online for 90 s. With Steam login
+# (modules.auth): up to 500 Steam IDs per lookup (POST /v1/friends/steam), a burst of 3 lookups per
+# player then one every 5 minutes.
+max_friends = 200
+
+[modules.groups]
+# Defaults: 100 members per group, 10 groups per player, 50 open invitations per group, 2 KiB of
+# metadata; a burst of 3 new groups per player then one every 20 minutes; a chat room per group.
+max_members = 100
+
+[modules.oauth]
+# OpenID Connect logins (`POST /v1/auth/oauth/{provider}`): off until a provider is set (every login
+# answers 404). Defaults: 60 s clock skew, tokens at most 10 minutes old, a nonce required, 10 logins
+# per client address and minute. Google, with your OAuth client id(s) from the Google Cloud console:
+# [modules.oauth.providers.google]
+# preset = "google"
+# client_ids = ["1234-abc.apps.googleusercontent.com"]
+
+[modules.lobbies]
+# Defaults: lobbies of at most 64 players, 1 lobby per player at a time, 32 metadata keys (4 KiB);
+# a burst of 5 new lobbies then one every 12 s; 10 join attempts then one every 6 s; 20 join codes
+# that match no lobby per hour; a disconnected player leaves its lobbies after 30 s; a chat room per lobby.
+max_players = 64
+
+[modules.matchmaking]
+# Tickets live in the server's memory; a round every second. A queue per game mode:
+[[modules.matchmaking.queues]]
+key = "duel"
+players = 2            # players per match (the default rule: first come, first matched)
+timeout_secs = 120     # a waiting ticket runs out after this (push match.expired)
+
+[modules.files]
+# Players' files (uploads): the bytes in this folder (the unit's StateDirectory), the rest in the
+# database. Defaults: 16 MiB per file (within http.max_body_bytes), 100 files and 256 MiB per player,
+# a burst of 10 uploads per player then one every 6 s, any content type.
+dir = "/var/lib/net-backend/files"

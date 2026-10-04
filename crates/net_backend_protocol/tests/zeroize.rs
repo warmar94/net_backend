@@ -13,14 +13,20 @@ const MARKER: &str = "zz-wipe-marker-7d41c0";
 static ARMED: AtomicBool = AtomicBool::new(false);
 static SEEN: AtomicUsize = AtomicUsize::new(0);
 
-/// The system allocator, plus a look at every freed block of up to 4 KiB while armed.
+/// The system allocator, plus a look at every freed block of up to 4 KiB while armed. Every block
+/// is handed out zero-filled, so the look never reads bytes that were never written.
 struct Checker;
 
-// SAFETY: every call is forwarded to the system allocator unchanged; `dealloc` only reads the
-// block it is about to free (test code: the block may hold bytes that were never written).
+// SAFETY: every call is forwarded to the system allocator (`alloc` as `alloc_zeroed`: the caller
+// gets a valid block either way, and every byte of it is initialised); `dealloc` only reads the
+// block it is about to free, whose bytes were all written (zeros, then whatever the program wrote).
 unsafe impl GlobalAlloc for Checker {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        unsafe { System.alloc(layout) }
+        unsafe { System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {

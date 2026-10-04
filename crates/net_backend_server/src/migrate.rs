@@ -10,7 +10,8 @@
 //! `<migrations_dir>/<module>/` exists, its files are used and the embedded ones are ignored, so
 //! the app can edit them. Edit before the first `migrate`; an applied migration is checksummed
 //! and a later edit is an error (write a new migration instead). When a module upgrade brings new
-//! migrations, `migrate` warns until they are published too (publishing again adds only new files).
+//! migrations, `migrate` warns until they are published too (publishing again adds only new files),
+//! and `serve` refuses to start: the server would run on the old schema.
 //!
 //! **Order.** Modules in registration order, then `app`; inside a namespace by version. Versions
 //! are positive integers, by convention `YYYYMMDDnnnn` (`202610010001`).
@@ -264,8 +265,7 @@ pub(crate) fn plan(modules: &ModuleSet, dialect: Dialect, dir: &Path) -> Result<
                 )));
             }
             let owned = read_dir_migrations(name, &dialect_dir)?;
-            let known: HashSet<i64> = owned.iter().map(|m| m.version).collect();
-            let newer: Vec<String> = embedded.iter().filter(|m| !known.contains(&m.version)).map(|m| m.file_name()).collect();
+            let newer = missing_from(&embedded, &owned);
             if !newer.is_empty() {
                 plan.warnings
                     .push(format!("module `{name}` has migrations that are not published ({}): run `migrations publish {name}` to add them", newer.join(", ")));
@@ -282,6 +282,57 @@ pub(crate) fn plan(modules: &ModuleSet, dialect: Dialect, dir: &Path) -> Result<
         plan.items.extend(own.into_iter().map(|migration| Planned { module: APP_NAMESPACE.to_string(), migration, source: MigrationSource::App }));
     }
     Ok(plan)
+}
+
+/// The file names of `embedded` migrations that `published` lacks.
+fn missing_from(embedded: &[Migration], published: &[Migration]) -> Vec<String> {
+    let known: HashSet<i64> = published.iter().map(|m| m.version).collect();
+    embedded.iter().filter(|m| !known.contains(&m.version)).map(|m| m.file_name()).collect()
+}
+
+/// The published modules whose copy in `dir` lacks migrations the module brings (a module upgrade:
+/// `migrations publish <module>` adds them), with the missing file names. A copy that cannot be
+/// read is left to [`plan`] (which reports it).
+pub(crate) fn unpublished(modules: &ModuleSet, dialect: Dialect, dir: &Path) -> Vec<(String, Vec<String>)> {
+    let mut out = Vec::new();
+    for module in modules.iter() {
+        let name = module.name();
+        let dialect_dir = dir.join(name).join(dialect.name());
+        if !dialect_dir.is_dir() {
+            continue;
+        }
+        let (mut embedded, Ok(published)) = (module.migrations(dialect), read_dir_migrations(name, &dialect_dir)) else { continue };
+        if validate_set(name, &mut embedded).is_err() {
+            continue;
+        }
+        let missing = missing_from(&embedded, &published);
+        if !missing.is_empty() {
+            out.push((name.to_string(), missing));
+        }
+    }
+    out
+}
+
+/// Why `serve` refuses to start with [`unpublished`] migrations: what is missing and what to run.
+pub(crate) fn unpublished_error(missing: &[(String, Vec<String>)]) -> Error {
+    let commands: Vec<String> = missing.iter().map(|(module, _)| format!("`migrations publish {module}`")).collect();
+    let detail: Vec<String> = missing.iter().map(|(module, files)| format!("`{module}` lacks {}", files.join(", "))).collect();
+    Error::Migration(format!(
+        "published module migrations are missing migrations of this server version ({}): run {} and then `migrate` before serving (the server would run on the old schema)",
+        detail.join("; "),
+        commands.join(", ")
+    ))
+}
+
+/// Why `serve` refuses to start with pending migrations (without `database.migrate_on_start`):
+/// which ones, and what to run.
+pub(crate) fn pending_error(pending: &[&MigrationStatus]) -> Error {
+    let names: Vec<String> = pending.iter().map(|s| format!("{} {:04}_{}", s.module, s.version, s.name)).collect();
+    Error::Migration(format!(
+        "{} migration(s) are not applied yet ({}): run `migrate` (or set database.migrate_on_start = true) before serving (the server would run on the old schema)",
+        names.len(),
+        names.join(", ")
+    ))
 }
 
 #[derive(sqlx::FromRow)]

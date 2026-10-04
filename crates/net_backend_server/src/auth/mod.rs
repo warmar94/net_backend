@@ -55,6 +55,11 @@ pub use events::{Revocation, RevocationReason, RevokedSessions};
 pub use module::Auth;
 pub use service::normalize_email;
 pub use service::AuthService;
+// For other modules that log players in through the accounts (the `oauth` module).
+#[allow(unused_imports)]
+pub(crate) use openapi::AuthSession as AuthSessionSchema;
+#[allow(unused_imports)]
+pub(crate) use service::ReqInfo;
 
 /// Who is calling: attached to a request by an [`Authenticator`].
 #[derive(Clone, Debug, PartialEq, Eq)]

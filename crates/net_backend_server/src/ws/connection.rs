@@ -34,11 +34,11 @@ use tungstenite::{Message, Utf8Bytes as WireText};
 use super::events::{AfterWsConnect, AfterWsDisconnect, BeforeWsConnect, BeforeWsFrame};
 use super::handlers::WsCtx;
 use super::hub::{ConnHandle, ConnectionId, Hub, Refusal, Registered, HANDLING};
-use super::tap::{AuthTap, Diverted, MARKER};
+use super::tap::{AuthTap, Diverted, TapLimit, MARKER, PRE_AUTH_MAX_BYTES};
 use crate::auth::{AuthContext, AuthFailure};
 use crate::error::AppError;
 use crate::hooks::{guarded, HookCtx, Outcome};
-use crate::http::middleware::{rate_limited_response, AuthCheckedAt, MIN_PROTOCOL_VERSION};
+use crate::http::middleware::{rate_limited_response, AuthCheckedAt, HandshakeCounted, MIN_PROTOCOL_VERSION};
 use crate::http::{ClientIp, RequestId};
 use crate::rate_limit::RateDecision;
 use crate::state::AppState;
@@ -73,10 +73,16 @@ fn upgrade_key(parts: &Parts) -> Option<HeaderValue> {
         && header(SEC_WEBSOCKET_VERSION).is_some_and(|v| v == b"13")
         && parts.extensions.get::<OnUpgrade>().is_some();
     if ok {
-        parts.headers.get(SEC_WEBSOCKET_KEY).cloned()
+        parts.headers.get(SEC_WEBSOCKET_KEY).filter(|key| valid_key(key.as_bytes())).cloned()
     } else {
         None
     }
+}
+
+/// Whether `Sec-WebSocket-Key` is what RFC 6455 section 4.1 asks for: 16 bytes in base64 (22
+/// base64 characters and `==`).
+fn valid_key(key: &[u8]) -> bool {
+    key.len() == 24 && key.ends_with(b"==") && key[..22].iter().all(|b| b.is_ascii_alphanumeric() || *b == b'+' || *b == b'/')
 }
 
 /// The plain-GET answer: 426 with `Upgrade: websocket`.
@@ -246,7 +252,10 @@ pub(crate) async fn endpoint(State(state): State<AppState>, request: Request) ->
         return busy("the server is shutting down");
     }
     let ip = parts.extensions.get::<ClientIp>().and_then(|c| c.0);
-    if let RateDecision::Deny { retry_after_ms } = hub.handshake_allowed(ip) {
+    // Normally counted before the authenticators ran (`rate_limit_before_auth`).
+    let counted = parts.extensions.get::<HandshakeCounted>().is_some();
+    let decision = if counted { RateDecision::Allow } else { hub.handshake_allowed(ip) };
+    if let RateDecision::Deny { retry_after_ms } = decision {
         count(&hub, "nbs_ws_handshakes_refused_total", "reason", "rate_limited");
         return rate_limited_response(retry_after_ms);
     }
@@ -315,10 +324,12 @@ pub(crate) async fn endpoint(State(state): State<AppState>, request: Request) ->
             }
         };
         let diverted = Diverted::default();
-        let tap = AuthTap::new(TokioIo::new(upgraded), max, diverted.clone());
+        // Small until the socket authenticated (`become_user` raises it).
+        let limit = TapLimit::new(PRE_AUTH_MAX_BYTES.min(max));
+        let tap = AuthTap::new(TokioIo::new(upgraded), limit.clone(), max, diverted.clone());
         let socket = WebSocketStream::from_raw_socket(tap, Role::Server, Some(ws_config)).await;
         let (registered, handle) = hub.register(slot, ip, state.now());
-        let connection = Connection::new(state, hub, socket, diverted, registered, handle, ip, origin, request_id);
+        let connection = Connection::new(state, hub, socket, Tap { diverted, limit }, registered, handle, ip, origin, request_id);
         connection.run(start).await;
     });
     let mut response = Response::new(Body::empty());
@@ -395,12 +406,170 @@ fn client_error(error: AppError, kind: &str) -> ApiError {
     error.api_error().clone()
 }
 
-/// Whether `text` is an `auth` frame (no `id`), however broken its data.
+/// Whether `text` is an `auth` frame (no `id`), however broken its data: the rule of
+/// `WsClientFrame::parse` (a JSON object without an `id` key whose `type` - the last one, as in a
+/// parsed document - is the string `auth`), read without building the document.
 pub(super) fn is_auth_frame(text: &str) -> bool {
-    serde_json::from_str::<Value>(text)
-        .ok()
-        .and_then(|v| v.as_object().map(|o| !o.contains_key("id") && o.get("type").and_then(Value::as_str) == Some(net_backend_protocol::kinds::AUTH)))
-        .unwrap_or(false)
+    serde_json::from_str::<probe::Probe>(text).is_ok_and(|probe| probe.is_auth())
+}
+
+/// A JSON reader that only looks at the top-level `id` and `type` keys (see [`is_auth_frame`]).
+mod probe {
+    use std::fmt;
+
+    use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
+
+    pub(super) struct Probe {
+        id: bool,
+        auth: bool,
+    }
+
+    impl Probe {
+        pub(super) fn is_auth(&self) -> bool {
+            !self.id && self.auth
+        }
+    }
+
+    /// Any JSON value, read and dropped (validated like a parsed document).
+    struct Skip;
+
+    impl<'de> Deserialize<'de> for Skip {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            deserializer.deserialize_any(SkipVisitor)
+        }
+    }
+
+    struct SkipVisitor;
+
+    impl<'de> Visitor<'de> for SkipVisitor {
+        type Value = Skip;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("any JSON value")
+        }
+        fn visit_bool<E>(self, _: bool) -> Result<Skip, E> {
+            Ok(Skip)
+        }
+        fn visit_i64<E>(self, _: i64) -> Result<Skip, E> {
+            Ok(Skip)
+        }
+        fn visit_u64<E>(self, _: u64) -> Result<Skip, E> {
+            Ok(Skip)
+        }
+        fn visit_f64<E>(self, _: f64) -> Result<Skip, E> {
+            Ok(Skip)
+        }
+        fn visit_str<E>(self, _: &str) -> Result<Skip, E> {
+            Ok(Skip)
+        }
+        fn visit_unit<E>(self) -> Result<Skip, E> {
+            Ok(Skip)
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Skip, A::Error> {
+            while seq.next_element::<Skip>()?.is_some() {}
+            Ok(Skip)
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Skip, A::Error> {
+            while map.next_entry::<Skip, Skip>()?.is_some() {}
+            Ok(Skip)
+        }
+    }
+
+    /// A key: `id`, `type` or another (compared without allocating when it has no escapes).
+    enum Key {
+        Id,
+        Type,
+        Other,
+    }
+
+    impl<'de> Deserialize<'de> for Key {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct KeyVisitor;
+            impl Visitor<'_> for KeyVisitor {
+                type Value = Key;
+                fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str("a key")
+                }
+                fn visit_str<E>(self, key: &str) -> Result<Key, E> {
+                    Ok(match key {
+                        "id" => Key::Id,
+                        "type" => Key::Type,
+                        _ => Key::Other,
+                    })
+                }
+            }
+            deserializer.deserialize_str(KeyVisitor)
+        }
+    }
+
+    /// The value of `type`: whether it is the string `auth`.
+    struct IsAuth(bool);
+
+    impl<'de> Deserialize<'de> for IsAuth {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct IsAuthVisitor;
+            impl<'de> Visitor<'de> for IsAuthVisitor {
+                type Value = IsAuth;
+                fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str("any JSON value")
+                }
+                fn visit_str<E>(self, value: &str) -> Result<IsAuth, E> {
+                    Ok(IsAuth(value == net_backend_protocol::kinds::AUTH))
+                }
+                fn visit_bool<E>(self, _: bool) -> Result<IsAuth, E> {
+                    Ok(IsAuth(false))
+                }
+                fn visit_i64<E>(self, _: i64) -> Result<IsAuth, E> {
+                    Ok(IsAuth(false))
+                }
+                fn visit_u64<E>(self, _: u64) -> Result<IsAuth, E> {
+                    Ok(IsAuth(false))
+                }
+                fn visit_f64<E>(self, _: f64) -> Result<IsAuth, E> {
+                    Ok(IsAuth(false))
+                }
+                fn visit_unit<E>(self) -> Result<IsAuth, E> {
+                    Ok(IsAuth(false))
+                }
+                fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<IsAuth, A::Error> {
+                    SkipVisitor.visit_seq(seq).map(|_| IsAuth(false))
+                }
+                fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<IsAuth, A::Error> {
+                    SkipVisitor.visit_map(map).map(|_| IsAuth(false))
+                }
+            }
+            deserializer.deserialize_any(IsAuthVisitor)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for Probe {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct ProbeVisitor;
+            impl<'de> Visitor<'de> for ProbeVisitor {
+                type Value = Probe;
+                fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str("a JSON object")
+                }
+                fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Probe, A::Error> {
+                    let mut probe = Probe { id: false, auth: false };
+                    while let Some(key) = map.next_key::<Key>()? {
+                        match key {
+                            Key::Id => {
+                                probe.id = true;
+                                map.next_value::<Skip>()?;
+                            }
+                            Key::Type => probe.auth = map.next_value::<IsAuth>()?.0,
+                            Key::Other => {
+                                map.next_value::<Skip>()?;
+                            }
+                        }
+                    }
+                    Ok(probe)
+                }
+            }
+            deserializer.deserialize_any(ProbeVisitor)
+        }
+    }
 }
 
 /// Whether a read error is a message over the size limit.
@@ -425,13 +594,20 @@ fn close_reason(reason: Cow<'static, str>) -> WireText {
     }
 }
 
+/// The connection's side of its [`AuthTap`].
+struct Tap {
+    /// The `auth` messages the tap took out of the socket's stream ([`MARKER`] stands for each).
+    diverted: Diverted,
+    /// The tap's size limit: [`PRE_AUTH_MAX_BYTES`] until the socket authenticated.
+    limit: TapLimit,
+}
+
 struct Connection {
     state: AppState,
     hub: Hub,
     id: ConnectionId,
     socket: Socket,
-    /// The `auth` messages the tap took out of the socket's stream ([`MARKER`] stands for each).
-    diverted: Diverted,
+    tap: Tap,
     handle: ConnHandle,
     registered: Option<Registered>,
     auth: Option<AuthContext>,
@@ -456,7 +632,7 @@ impl Connection {
         state: AppState,
         hub: Hub,
         socket: Socket,
-        diverted: Diverted,
+        tap: Tap,
         registered: Registered,
         handle: ConnHandle,
         ip: Option<IpAddr>,
@@ -471,7 +647,7 @@ impl Connection {
             state,
             hub,
             socket,
-            diverted,
+            tap,
             handle,
             registered: Some(registered),
             auth: None,
@@ -516,6 +692,7 @@ impl Connection {
         if let Some(registered) = &self.registered {
             registered.slot.authenticated();
         }
+        self.tap.limit.set(self.hub.config().max_message_bytes);
         if !self.connected {
             self.connected = true;
             let event = AfterWsConnect { connection: self.id, user_id: context.user_id, session_id: context.session_id, ip: self.ip };
@@ -725,13 +902,13 @@ impl Connection {
                     Err(None) => Flow::Stop,
                 }
             }
-            // tungstenite answers pings itself (they count against the rate limit, so a ping flood
-            // is closed like any other); a pong only proves the peer is alive.
-            Message::Ping(_) => match self.charge().await {
+            // tungstenite answers pings itself; a pong only proves the peer is alive. Both count
+            // against the rate limit, so a ping or pong flood is closed like any other (a real
+            // heartbeat sends a few per minute).
+            Message::Ping(_) | Message::Pong(_) => match self.charge().await {
                 Ok(()) | Err(Some(_)) => Flow::Go,
                 Err(None) => Flow::Stop,
             },
-            Message::Pong(_) => Flow::Go,
             // tungstenite answers the close; the next read ends the stream. (A raw frame is never
             // read.)
             Message::Close(_) | Message::Frame(_) => Flow::Go,
@@ -763,7 +940,7 @@ impl Connection {
         // An `auth` message never passed through tungstenite: the tap took it out (`tap.rs`).
         let diverted;
         let text = if wire.as_str() == MARKER {
-            diverted = self.diverted.pop().unwrap_or_default();
+            diverted = self.tap.diverted.pop().unwrap_or_default();
             diverted.as_str()
         } else {
             wire.as_str()
@@ -968,5 +1145,48 @@ mod tests {
         assert!(bucket.take().is_err_and(|ms| (1..=1000).contains(&ms)));
         assert!(is_transient(&AppError::unavailable("x")) && is_transient(&AppError::rate_limited(5)));
         assert!(!is_transient(&AppError::unauthorized()) && !is_transient(&AppError::new(codes::BANNED, "b")));
+    }
+
+    /// The probe classifies `auth` frames exactly like a parsed document (the rule of
+    /// `WsClientFrame::parse`), including duplicate keys, escapes and broken JSON.
+    #[test]
+    fn the_auth_probe_matches_the_document_rule() {
+        fn by_document(text: &str) -> bool {
+            serde_json::from_str::<Value>(text)
+                .ok()
+                .and_then(|v| v.as_object().map(|o| !o.contains_key("id") && o.get("type").and_then(Value::as_str) == Some(net_backend_protocol::kinds::AUTH)))
+                .unwrap_or(false)
+        }
+        for text in [
+            r#"{"type":"auth","data":{"token":"nbsa_x"}}"#,
+            r#"{"type":"auth"}"#,
+            r#"{"type":"auth","data":1}"#,
+            r#"{"type":"x","type":"auth"}"#,
+            r#"{"type":"auth","type":"x"}"#,
+            r#"{"type":"auth","id":null}"#,
+            r#"{"id":1,"type":"auth"}"#,
+            r#"{"type":["auth"]}"#,
+            r#"{"type":{"auth":1}}"#,
+            r#"{"type":"auth","data":[1,{"a":[true,null,-1.5e3]}]}"#,
+            r#"{"type":"auth","x":1e400}"#,
+            r#"{"type":"auth"} trailing"#,
+            r#"{"type":"auth""#,
+            r#"["auth"]"#,
+            r#""auth""#,
+            "",
+            "x",
+            r#"{"id":1,"type":"auth"}"#,
+            r#"{"data":{"id":1,"type":"x"},"type":"auth"}"#,
+        ] {
+            assert_eq!(is_auth_frame(text), by_document(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn websocket_keys_are_checked() {
+        assert!(valid_key(b"dGhlIHNhbXBsZSBub25jZQ=="));
+        for bad in [&b""[..], b"x", b"dGhlIHNhbXBsZSBub25jZQ=", b"dGhlIHNhbXBsZSBub25jZ===", b"dGhlIHNhbXBsZSBub25j!Q==", b"dGhlIHNhbXBsZSBub25jZQ==x"] {
+            assert!(!valid_key(bad), "{bad:?}");
+        }
     }
 }

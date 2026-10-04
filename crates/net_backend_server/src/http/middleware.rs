@@ -12,6 +12,7 @@ use http::header::{ALLOW, CONTENT_TYPE, RETRY_AFTER, WWW_AUTHENTICATE};
 use http::{HeaderValue, StatusCode};
 use net_backend_protocol::{codes, routes, ErrorBody, PROTOCOL_HEADER, PROTOCOL_VERSION};
 
+use super::deadline::{Deadline, Limit};
 use super::{ClientIp, RequestId, REQUEST_ID_HEADER};
 use crate::auth::{AuthContext, AuthFailure, Authenticator};
 use crate::error::{default_error_for, AppError, ErrorMarker};
@@ -97,14 +98,35 @@ pub(crate) async fn protocol(req: Request, next: Next) -> Response {
     response
 }
 
-/// The per-request time limit (503 `unavailable` after it).
-pub(crate) async fn timeout(State(state): State<AppState>, req: Request, next: Next) -> Response {
-    let limit = Duration::from_secs(state.config().http.request_timeout_secs.max(1));
-    match tokio::time::timeout(limit, next.run(req)).await {
-        Ok(response) => response,
-        Err(_) => {
-            tracing::warn!(limit_secs = limit.as_secs(), "request timed out");
-            AppError::unavailable("the request took too long").into_response()
+/// The per-request time limit (503 `unavailable` after it): `http.request_timeout_secs`, or the
+/// upload limits while a route with [`upload_timeout`](crate::http::upload_timeout) receives its body.
+pub(crate) async fn timeout(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
+    let http = &state.config().http;
+    let deadline = Deadline::new(
+        Duration::from_secs(http.request_timeout_secs.max(1)),
+        Duration::from_secs(http.upload_idle_timeout_secs.max(1)),
+        (http.upload_timeout_secs > 0).then(|| Duration::from_secs(http.upload_timeout_secs)),
+    );
+    req.extensions_mut().insert(deadline.clone());
+    let mut run = std::pin::pin!(next.run(req));
+    loop {
+        let (at, _) = deadline.current();
+        tokio::select! {
+            response = &mut run => return response,
+            () = tokio::time::sleep_until(at) => {
+                let (at, limit) = deadline.current();
+                if at <= tokio::time::Instant::now() {
+                    let secs = deadline.length(limit).as_secs();
+                    let message = match limit {
+                        Limit::Request => "the request took too long",
+                        Limit::UploadIdle => "the upload stalled: no data arrived in time",
+                        Limit::Upload => "the upload took too long",
+                    };
+                    tracing::warn!(limit_secs = secs, ?limit, "request timed out");
+                    return AppError::unavailable(message).into_response();
+                }
+            }
+            () = deadline.changed() => {}
         }
     }
 }
@@ -175,8 +197,25 @@ pub(crate) fn rate_limited_response(retry_after_ms: u64) -> Response {
     response
 }
 
-/// Ask the rate limiter before authentication (address + route).
-pub(crate) async fn rate_limit_before_auth(State(mw): State<Mw>, req: Request, next: Next) -> Response {
+/// The WebSocket handshake of this request was counted against `ws.handshakes_per_ip_per_minute`
+/// already (before the authenticators ran).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HandshakeCounted;
+
+/// Ask the rate limiter before authentication (address + route). A `/v1/ws` handshake is counted
+/// against `ws.handshakes_per_ip_per_minute` here too, so a handshake flood is refused before the
+/// authenticators look up its token.
+pub(crate) async fn rate_limit_before_auth(State(mw): State<Mw>, mut req: Request, next: Next) -> Response {
+    if mw.state.config().ws.enabled && req.uri().path() == routes::WS {
+        let ip = req.extensions().get::<ClientIp>().and_then(|c| c.0);
+        if let RateDecision::Deny { retry_after_ms } = mw.state.ws().handshake_allowed(ip) {
+            if mw.state.ws().metrics() {
+                metrics::counter!("nbs_ws_handshakes_refused_total", "reason" => "rate_limited").increment(1);
+            }
+            return rate_limited_response(retry_after_ms);
+        }
+        req.extensions_mut().insert(HandshakeCounted);
+    }
     match limit(&mw, &req, RateLimitStage::BeforeAuth) {
         Some(refused) => refused,
         None => next.run(req).await,

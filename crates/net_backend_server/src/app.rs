@@ -33,6 +33,7 @@ use crate::http::middleware::{self, Mw};
 use crate::http::{routes as core, RequestId, REQUEST_ID_HEADER};
 use crate::migrate::{self, MigrateReport, MigrationStatus, PublishReport};
 use crate::module::{Module, ModuleSet, Setup};
+use crate::permissions::{Permission, Permissions};
 use crate::rate_limit::RateLimiter;
 use crate::serve::serve_connections;
 use crate::shutdown::{os_signal, Shutdown};
@@ -76,6 +77,8 @@ pub struct NetBackendServer {
     commands: Vec<Arc<dyn AppCommand>>,
     ws_handlers: WsHandlers,
     broadcaster: Option<Arc<dyn Broadcaster>>,
+    /// The game's own declared permissions.
+    permissions: Vec<Permission>,
     /// Registration mistakes found before build (reported by it).
     problems: Vec<String>,
 }
@@ -96,6 +99,7 @@ impl NetBackendServer {
             commands: Vec::new(),
             ws_handlers: WsHandlers::new(),
             broadcaster: None,
+            permissions: Vec::new(),
             problems: Vec::new(),
         }
     }
@@ -162,6 +166,13 @@ impl NetBackendServer {
     /// Merge an OpenAPI router (documented and plain routes together).
     pub fn merge(mut self, router: OpenApiRouter<AppState>) -> Self {
         self.route_ops.push(Box::new(move |api| api.merge(router)));
+        self
+    }
+
+    /// Declare a permission the game's own code checks (see [`crate::permissions`]); the operator
+    /// grants it to roles in `[permissions]`.
+    pub fn permission(mut self, permission: Permission) -> Self {
+        self.permissions.push(permission);
         self
     }
 
@@ -333,6 +344,7 @@ impl NetBackendServer {
             commands: _,
             mut ws_handlers,
             broadcaster,
+            permissions,
             problems: _,
         } = self;
         let db = match db {
@@ -348,6 +360,15 @@ impl NetBackendServer {
                     Error::Config(problems) => Error::Config(problems),
                     other => Error::Module(format!("module `{}`: setup failed: {other}", module.name())),
                 });
+            }
+        }
+        let declared =
+            modules.iter().flat_map(|m| m.permissions().into_iter().map(move |p| (Some(m.name()), p))).chain(permissions.into_iter().map(|p| (None, p)));
+        match Permissions::build(declared.collect(), &config.permissions) {
+            Ok(permissions) => extensions.insert(permissions),
+            Err(error) => {
+                db.close().await;
+                return Err(error);
             }
         }
         hooks.set_timeout(Duration::from_millis(config.server.hook_timeout_ms.max(1)));
@@ -495,6 +516,26 @@ fn cors_layer(config: &Config) -> Option<CorsLayer> {
             .expose_headers([protocol, request_id, ETAG, RETRY_AFTER])
             .max_age(Duration::from_secs(config.cors.max_age_secs)),
     )
+}
+
+/// Apply `plan`. With `database.statement_timeout_secs` set (MySQL / MariaDB / PostgreSQL) on a
+/// short-lived pool of its own without the limit: a long schema change is normal in a migration.
+async fn run_migrations(state: &AppState, plan: &migrate::Plan) -> Result<MigrateReport, Error> {
+    let clock = state.clock().clone();
+    let database = &state.config().database;
+    let wait = Duration::from_secs(database.migrate_lock_timeout_secs);
+    if database.statement_timeout_secs == 0 || state.db().dialect() == Dialect::Sqlite {
+        return migrate::run(state.db(), plan, move || clock.now(), wait).await;
+    }
+    let mut unlimited = database.clone();
+    unlimited.statement_timeout_secs = 0;
+    unlimited.max_connections = 2;
+    unlimited.min_connections = 0;
+    unlimited.connect_lazy = false;
+    let db = Db::connect(&unlimited).await?;
+    let result = migrate::run(&db, plan, move || clock.now(), wait).await;
+    db.close().await;
+    result
 }
 
 fn panic_text(panic: &(dyn std::any::Any + Send)) -> String {
@@ -666,9 +707,7 @@ impl PreparedServer {
     /// Apply every pending migration (modules in registration order, then the app's).
     pub async fn migrate(&self) -> Result<MigrateReport, Error> {
         let plan = self.plan()?;
-        let clock = self.state.clock().clone();
-        let wait = Duration::from_secs(self.state.config().database.migrate_lock_timeout_secs);
-        migrate::run(self.state.db(), &plan, move || clock.now(), wait).await
+        run_migrations(&self.state, &plan).await
     }
 
     /// The state of every migration (applied, pending, modified, missing), in plan order.
@@ -684,8 +723,8 @@ impl PreparedServer {
 
     /// Serve until `signal` resolves (or SIGTERM / Ctrl-C), then shut down gracefully: stop
     /// accepting, let in-flight requests finish within `server.shutdown_grace_secs` (then drop the
-    /// remaining connections, aborting their handlers), shut the modules down (reverse order, each
-    /// bounded), run the shutdown hooks, close the database.
+    /// remaining connections, aborting their handlers), shut the modules down (all at once, within
+    /// `server.module_shutdown_timeout_secs` together), run the shutdown hooks, close the database.
     pub async fn serve_with_shutdown<F>(self, listener: TcpListener, signal: F) -> Result<(), Error>
     where
         F: Future<Output = ()> + Send + 'static,
@@ -699,11 +738,29 @@ impl PreparedServer {
             }
             None => None,
         };
+        // A published module copy without this version's migrations: the server would answer 500
+        // on the old schema (an upgrade that skipped `migrations publish <module>`).
+        let missing = migrate::unpublished(&modules, state.db().dialect(), &config.database.migrations_dir);
+        if !missing.is_empty() {
+            state.db().close().await;
+            return Err(migrate::unpublished_error(&missing));
+        }
+        let plan = migrate::plan(&modules, state.db().dialect(), &config.database.migrations_dir)?;
         if config.database.migrate_on_start {
-            let plan = migrate::plan(&modules, state.db().dialect(), &config.database.migrations_dir)?;
-            let clock = state.clock().clone();
-            let wait = Duration::from_secs(config.database.migrate_lock_timeout_secs);
-            migrate::run(state.db(), &plan, move || clock.now(), wait).await?;
+            run_migrations(&state, &plan).await?;
+        } else {
+            // Pending migrations (embedded or published): the server would answer 500 on the old
+            // schema. A database that cannot be read now (`connect_lazy`, down) is not judged here.
+            match migrate::status(state.db(), &plan).await {
+                Ok(status) => {
+                    let pending: Vec<&MigrationStatus> = status.iter().filter(|s| s.state == migrate::MigrationState::Pending).collect();
+                    if !pending.is_empty() {
+                        state.db().close().await;
+                        return Err(migrate::pending_error(&pending));
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "could not read the migration status at start; serving anyway"),
+            }
         }
         let ctx = HookCtx::new(state.clone(), None);
         let start_limit = Duration::from_secs(config.server.module_start_timeout_secs);
@@ -796,14 +853,16 @@ impl PreparedServer {
     }
 }
 
-/// Each module's `shutdown`, bounded and with panics contained; a failure is logged and the next
-/// module still shuts down.
+/// Every module's `shutdown` at the same time (started in the order given), within one overall
+/// `limit`; panics are contained. A module that fails or runs out of time is logged and abandoned;
+/// the others still finish.
 async fn shutdown_modules<'a>(modules: impl Iterator<Item = &'a dyn Module>, state: &AppState, limit: Duration) {
-    for module in modules {
-        match guarded(limit, module.shutdown(state)).await {
+    let stops = modules.map(|module| async move { (module.name(), guarded(limit, module.shutdown(state)).await) });
+    for (name, outcome) in futures_util::future::join_all(stops).await {
+        match outcome {
             Outcome::Done(()) => {}
-            Outcome::TimedOut => tracing::warn!(module = module.name(), limit_secs = limit.as_secs(), "module shutdown timed out"),
-            Outcome::Panicked => tracing::error!(module = module.name(), "module shutdown panicked"),
+            Outcome::TimedOut => tracing::warn!(module = name, limit_secs = limit.as_secs(), "module shutdown timed out"),
+            Outcome::Panicked => tracing::error!(module = name, "module shutdown panicked"),
         }
     }
 }

@@ -1,11 +1,10 @@
-//! The {{name}} server: net_backend_server with the `Auth` (accounts), `Storage` (saves) and `Chat`
-//! modules, configured from `config.toml` in the current folder plus `NBS__*` environment variables.
+//! The {{name}} server, built with net_backend_server. Its modules: {{modules_doc}}.
+//! It reads `config.toml` in the current folder plus `NBS__*` environment variables.
 //!
 //! ```text
 //! cargo run                                  # serve on http://127.0.0.1:8080 until Ctrl-C
 //! cargo run -- --help                        # every command
-//! cargo run -- user:create you@example.com --admin
-//! cargo run -- config check --connect
+{{user_create}}//! cargo run -- config check --connect
 //! cargo run -- healthcheck                   # exit 0 when the running server's /readyz answers 200
 //! ```
 //!
@@ -18,18 +17,9 @@
 
 use std::process::ExitCode;
 
-use net_backend_server::chat::Chat;
-use net_backend_server::storage::Storage;
-use net_backend_server::{Auth, NetBackendServer};
-
+{{imports}}
 #[tokio::main]
 async fn main() -> ExitCode {
     // `--help` and `--version` work without a configuration; everything else loads it.
-    NetBackendServer::run_main(|config| {
-        NetBackendServer::new(config)
-            .module(Auth::new())
-            .module(Storage::new())
-            .module(Chat::new())
-    })
-    .await
+{{main_body}}
 }

@@ -2,8 +2,9 @@
 //! name, like a service provider.
 //!
 //! **Order is deterministic: registration order.** Modules' migrations run in that order (then
-//! the app's own), their routes are merged in that order, `start` runs in that order and
-//! `shutdown` in the reverse order. A name may be registered once.
+//! the app's own), their routes are merged in that order and `start` runs in that order;
+//! `shutdown` runs for every module at the same time (started in the reverse order), within one
+//! `server.module_shutdown_timeout_secs`. A name may be registered once.
 //!
 //! **Build order:** for each module in registration order, [`setup`](Module::setup) (state values,
 //! authenticators, rate limiters), then [`register_hooks`](Module::register_hooks), then the routes
@@ -25,6 +26,7 @@ use crate::db::{Db, Dialect};
 use crate::error::Error;
 use crate::hooks::Hooks;
 use crate::migrate::Migration;
+use crate::permissions::Permission;
 use crate::rate_limit::RateLimiter;
 use crate::state::{AppState, Extensions};
 use crate::ws::WsHandlers;
@@ -114,6 +116,13 @@ pub trait Module: Send + Sync + 'static {
         Vec::new()
     }
 
+    /// The permissions the module checks (see [`crate::permissions`]): names starting with the
+    /// module's name and a dot, each with the roles that hold it by default (`admin` holds every
+    /// one). The operator grants them to other roles in `[permissions]`.
+    fn permissions(&self) -> Vec<Permission> {
+        Vec::new()
+    }
+
     /// Start background work (called once before the server accepts requests, in registration
     /// order). Wait on `state.shutdown()` to stop. An error, a panic or running longer than
     /// `server.module_start_timeout_secs` aborts the start (modules already started shut down).
@@ -122,8 +131,9 @@ pub trait Module: Send + Sync + 'static {
         Box::pin(async { Ok(()) })
     }
 
-    /// Clean up after the in-flight requests drained (reverse registration order). Bounded by
-    /// `server.module_shutdown_timeout_secs`; a panic is caught and logged.
+    /// Clean up after the in-flight requests drained. Every module shuts down at the same time
+    /// (started in reverse registration order), all within one `server.module_shutdown_timeout_secs`;
+    /// a panic is caught and logged.
     fn shutdown<'a>(&'a self, state: &'a AppState) -> BoxFuture<'a, ()> {
         let _ = state;
         Box::pin(async {})

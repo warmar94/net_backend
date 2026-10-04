@@ -531,6 +531,24 @@ impl Link {
     pub(crate) fn reason(&self) -> String {
         self.lost.get().unwrap_or_else(|| "the connection was lost".to_string())
     }
+
+    /// Resolves once this connection is gone (lost, or closed): at once when the transport reports
+    /// it, else within [`WATCH_EVERY`] (a closed handle sends no wake-up).
+    #[cfg(feature = "sftp")]
+    pub(crate) async fn gone(&self) {
+        loop {
+            let notified = self.lost.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_gone() {
+                return;
+            }
+            tokio::select! {
+                () = notified => {}
+                () = tokio::time::sleep(WATCH_EVERY) => {}
+            }
+        }
+    }
 }
 
 /// Where the session is: on a connection, waiting to reconnect, connecting again, or closed.

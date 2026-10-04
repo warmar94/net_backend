@@ -5,11 +5,114 @@ All notable changes to this crate are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) (before 1.0: a minor bump for any API
 change or a key dependency bump).
 
-## [0.1.1] - Unreleased
+## [0.2.0] - 2026-10-04
+
+### Added
+
+- `leaderboards`: boards (`BoardInfo` with `ScoreMode` best / latest / sum, `ScoreOrder` desc /
+  asc, `Period` all-time / daily / weekly with `Period::start_of` / `end_of`, resets at 00:00 UTC,
+  weeks on Monday), `SubmitScore` / `ScoreAck`, `LeaderboardEntry`, `LeaderboardPage`, `MyRank`,
+  the queries `TopQuery`, `RankQuery`, `AroundQuery`, `is_valid_board_key`; the `HttpCall` types
+  `ListBoards`, `GetLeaderboard`, `PostScore`, `GetMyRank`, `GetAroundMe`; the routes
+  `routes::leaderboards` (`/v1/leaderboards`, `/{board}`, `/{board}/scores`, `/{board}/me`,
+  `/{board}/around`) in `routes::ALL`.
+- `notifications`: `Notification` (also the `notify.new` push), `NotificationQuery`
+  (`notify.list`, `GET /v1/notifications`), `CountNotifications` / `NotificationCount`
+  (`notify.count`, `GET /v1/notifications/count`), `MarkNotifications` / `MarkAck` (`notify.mark`,
+  `POST /v1/notifications/mark`), `DeleteNotification` (`notify.delete`,
+  `DELETE /v1/notifications/{id}`), `is_valid_kind`, `text_problem`; the id type `NotificationId`;
+  the kinds `kinds::NOTIFY_*` in `kinds::ALL`; the routes `routes::notifications` in `routes::ALL`.
+  With the feature `bevy_net_backend` the four requests implement `WsRequest` and `Notification`
+  implements `WsPushMessage`.
+- `friends`: `FriendEntry` / `FriendState` (friend, sent, received, blocked), `AddFriend` (by
+  account id, display name or friend code), `RequestQuery` / `RequestDirection`, `FriendCode`,
+  `FriendPresence` (the `friends.presence` push, `kinds::FRIENDS_PRESENCE` in `kinds::ALL`),
+  `normalize_friend_code`, `FRIEND_CODE_ALPHABET`; the `HttpCall` types `ListFriends`,
+  `RemoveFriend`, `ListFriendRequests`, `AddFriend`, `CancelFriendRequest`, `AcceptFriend`,
+  `DeclineFriend`, `ListBlocks`, `BlockUser`, `UnblockUser`, `GetFriendCode`, `ResetFriendCode`,
+  `FriendsHeartbeat`; the routes `routes::friends` in `routes::ALL`. With the feature
+  `bevy_net_backend` `FriendPresence` implements `WsPushMessage`.
+- `friends`, Steam IDs: `SteamMatch` (`POST /v1/friends/steam`: SteamID64s as decimal strings,
+  `validate`, `ids`) → `SteamMatchResult` (`SteamPlayer`: `steam_id`, `user`, `name`, `state`),
+  `parse_steam_id`, `is_individual_steam_id`, `MAX_STEAM_IDS` (2000); the settings `FriendSettings`
+  (`steam_findable`, true by default), `GetFriendSettings` and `UpdateFriendSettings`
+  (`GET` / `PUT /v1/friends/settings`); `routes::friends::STEAM` and `SETTINGS` in `routes::ALL`.
+- `groups`: `GroupInfo`, `GroupRole` (owner, admin, member), `GroupMember`, `GroupInvite`,
+  `GroupList`, `CreateGroup`, `UpdateGroup` (a present `"metadata":null` clears the metadata),
+  `GroupQuery`, `Invitee`, `RoleChange`, `group_name_problem`, `description_problem`; the
+  `HttpCall` types `ListGroups`, `CreateGroup`, `MyGroups`, `ListGroupInvites`, `GetGroup`,
+  `EditGroup`, `DeleteGroup`, `ListGroupMembers`, `JoinGroup`, `LeaveGroup`, `InviteToGroup`,
+  `AcceptGroupInvite`, `DeclineGroupInvite`, `RevokeGroupInvite`, `KickMember`, `SetMemberRole`,
+  `TransferGroup`; the routes `routes::groups` in `routes::ALL`; the id type `GroupId`.
+- `oauth`: OpenID Connect logins: `OAuthToken` (an identity provider's ID token and the nonce of
+  the sign-in; `validate`, `ID_TOKEN_MAX_BYTES`, `NONCE_MAX_BYTES`) and the `HttpCall` `OAuthLogin`
+  (`POST /v1/auth/oauth/{provider}` → `AuthSession`); the route `routes::auth::OAUTH` in
+  `routes::ALL`, `routes::oauth_login_path`; the error code `codes::OAUTH_FAILED`
+  (`oauth_failed`, 401).
+- `files`: players' binary files: `FileInfo`, `FileVisibility` (private, public, friends, shared),
+  `FileMeta` (the upload's JSON part), `UpdateFile` (a present `"metadata":null` clears),
+  `FileQuery`, `FileUsage`, `name_problem`, `is_valid_content_type`, `is_sha256_hex`, the part names
+  `UPLOAD_META_PART` / `UPLOAD_FILE_PART`; the `HttpCall` types `ListFiles`, `GetFileUsage`,
+  `GetFile`, `EditFile`, `DeleteFile`; the routes `routes::files` (in `routes::ALL`) and
+  `routes::BINARY` (the upload and the download: no JSON body or answer), `routes::file_path`,
+  `routes::file_content_path`; the id type `FileId`.
+- `storage`: `ObjectVisibility` (private, public, friends); `PutObject::visibility` /
+  `with_visibility`, `StorageObject::visibility`, `StorageObjectInfo::visibility`,
+  `AdminPutObject::visibility`; the `HttpCall` types `GetPlayerObject`
+  (`GET /v1/users/{user}/storage/{collection}/{key}`) and `ListPlayerObjects`
+  (`GET /v1/users/{user}/storage/{collection}`), in `routes::ALL`.
+- `lobbies`: `LobbyInfo`, `LobbyVisibility` (public, private, friends), `LobbyState` (open,
+  in_game, closed), `LobbyMember`, `LobbyList`, `LobbyCode` (the join code: `parse`, `grouped`, and
+  its number below 2^40: `to_u64` / `from_u64`; `LobbyInfo` carries `code` and `code_number`),
+  `CreateLobby`, `UpdateLobby` (metadata keys set or removed with `null`), `SetReady`, `LobbyPlayer`,
+  `JoinLobbyByCode` (`from_number`), `LobbySearch` / `LobbyFilter`, `is_valid_meta_key`,
+  `meta_value_problem`; the pushes `LobbyMemberUpdate` (`lobby.member`, `MemberChange`) and
+  `LobbyUpdate` (`lobby.changed`, `LobbyChange`); the `HttpCall` types `CreateLobby`, `MyLobbies`,
+  `LobbySearch`, `JoinLobbyByCode`, `GetLobby`, `EditLobby`, `JoinLobby`, `LeaveLobby`,
+  `SetLobbyReady`, `NewLobbyCode`, `TransferLobby`, `KickFromLobby`; the routes `routes::lobbies` in
+  `routes::ALL`; the id type `LobbyId`.
+- `matchmaking`: `QueueInfo`, `Queues`, `CreateTicket`, `MatchTicket` (`TicketStatus`),
+  `is_valid_queue_key`; the pushes `MatchFound` (`match.found`) and `TicketExpired`
+  (`match.expired`); the `HttpCall` types `ListQueues`, `CreateTicket`, `GetTicket`,
+  `CancelTicket`; the routes `routes::matchmaking` in `routes::ALL`; the id type `TicketId`.
+- The kinds `lobby.member`, `lobby.changed`, `match.found` and `match.expired` in `kinds::ALL`. With
+  the feature `bevy_net_backend`, `LobbyMemberUpdate`, `LobbyUpdate`, `MatchFound` and
+  `TicketExpired` implement `WsPushMessage`.
+- Chat extras in `chat`: `EditMessage` (`chat.edit`, and `PATCH` on the message path with a
+  `MessageEdit` body) and the push `MessageEdited` (`chat.edited`); `ChatMessage::edited_at`;
+  `MarkRead` (`chat.mark_read`, and `PUT /v1/chat/rooms/{room}/read` with a `ReadUpTo` body), the push
+  `ReadReceipt` (`chat.read`), `ListReceipts` / `ReadReceipts` (`chat.receipts` and its `GET`),
+  `UnreadQuery` / `UnreadCounts` / `UnreadCount` (`chat.unread` and `POST /v1/chat/unread`);
+  `SetTyping` (`chat.set_typing`) and the push `TypingUpdate` (`chat.typing`); rooms created by
+  players: `RoomKind::Player`, `RoomVisibility`, `RoomRole`, `RoomInfo::visibility` / `owner` /
+  `role`, `CreateRoom`, `UpdateRoom`, `RoomUser`, `RoomRoleChange`, `RoomMembership`, the push
+  `RoomUpdate` (`chat.room`, `RoomChange`) and the `HttpCall` types `MyRooms`, `PublicRooms`,
+  `GetRoom`, `EditRoom`, `DeleteRoom`, `JoinChatRoom`, `LeaveChatRoom`, `ListRoomMembers`,
+  `InviteToRoom`, `KickFromRoom`, `SetRoomRole`, `TransferRoom`; `room_name_problem` and the
+  constants `DEFAULT_EDIT_WINDOW_SECS`, `MAX_LISTED_RECEIPTS`, `MAX_UNREAD_ROOMS`,
+  `MAX_UNREAD_COUNT`, `DEFAULT_TYPING_TTL_MS`, `DEFAULT_TYPING_INTERVAL_MS`, `MAX_ROOM_NAME_CHARS`.
+  New routes in `routes::chat` (`ROOMS_MINE`, `ROOMS_PUBLIC`, `ROOM`, `ROOM_JOIN`, `ROOM_LEAVE`,
+  `ROOM_MEMBERS`, `ROOM_INVITES`, `ROOM_MEMBER`, `ROOM_ROLE`, `ROOM_OWNER`, `READ`, `RECEIPTS`,
+  `UNREAD`; `ROOMS` also takes POST, `MESSAGE` also PATCH) and in `routes::ALL`; the kinds
+  `chat.edit`, `chat.edited`, `chat.mark_read`, `chat.read`, `chat.receipts`, `chat.unread`,
+  `chat.set_typing`, `chat.typing`, `chat.room` in `kinds::ALL`. With the feature
+  `bevy_net_backend`, `EditMessage`, `MarkRead`, `ListReceipts`, `UnreadQuery` and `SetTyping`
+  implement `WsRequest`; `MessageEdited`, `ReadReceipt`, `TypingUpdate` and `RoomUpdate` implement
+  `WsPushMessage`.
+- Feature `bevy_net_backend`: the module `bevy` with typed HTTP calls through that client.
+  `bevy::request(&call)` turns any `HttpCall` (every route of `routes::ALL`, or a game's own) into
+  its `OutgoingRequest` as `net_backend_client` sends it (method, path, JSON body or query string,
+  `accept: application/json`, the protocol header; without the game's credentials on routes that
+  need no token, logout excepted: it takes a Bearer token instead of the refresh token; a path
+  parameter that would need escaping answered `InvalidRequest`, never sent);
+  `bevy::HttpClientCalls::call(&call)` sends it with the answer decoded as `C::Response`;
+  `bevy::api_error(&error)` reads the protocol's `ApiError` out of a refused answer.
 
 ### Changed
 
-- The README and the API documentation describe what the crate has and does. No API change.
+- **Breaking:** the feature `bevy_net_backend` uses `bevy_net_backend` 0.2.0 (the `WsRequest`,
+  `WsPushMessage` and `Credentials` implementations are for that version).
+- The README and the API documentation describe what the crate has and does.
 
 ### Security
 
