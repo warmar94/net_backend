@@ -24,20 +24,17 @@ use crate::state::AppState;
 /// The groups module: groups (guilds, clans) with an owner, admins and members, invitations,
 /// open groups, metadata, a list with a name search, and a chat group room per group when the chat
 /// module is registered (see [`crate::groups`]). Name `groups`; settings in `[modules.groups]`
-/// ([`GroupsConfig`]); needs the `auth` module registered first.
+/// ([`GroupsConfig`]); needs the `auth` module registered first. With the `chat` module registered,
+/// each group gets a chat room; with the `notifications` module, invitations arrive as notifications.
 ///
 /// ```no_run
 /// use net_backend_server::auth::Auth;
-/// use net_backend_server::chat::Chat;
 /// use net_backend_server::groups::Groups;
-/// use net_backend_server::notifications::Notifications;
 /// use net_backend_server::{Config, NetBackendServer};
 ///
 /// # async fn demo() -> Result<(), net_backend_server::Error> {
 /// NetBackendServer::new(Config::load()?)
 ///     .module(Auth::new())
-///     .module(Chat::new()) // a chat room per group
-///     .module(Notifications::new()) // invitations as notifications
 ///     .module(Groups::new())
 ///     .run()
 ///     .await
