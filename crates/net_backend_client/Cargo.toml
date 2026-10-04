@@ -44,7 +44,7 @@ net_backend_protocol = { path = "../net_backend_protocol", version = "0.2.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # Ubiquitous crates: caret minimums (PLUGINS §8), the same ones the server uses (one tokio, one hyper).
-tokio = { version = "1.47", default-features = false, features = ["rt", "net", "time", "sync", "fs", "io-util"] }
+tokio = { version = "1.47", default-features = false, features = ["rt", "net", "time", "sync", "fs", "io-util", "macros"] }
 hyper = { version = "1.6", default-features = false, features = ["client", "http1"] }
 # `client-proxy`: the proxy settings from the environment (`HTTPS_PROXY`, `NO_PROXY`, ...) and the
 # HTTP CONNECT tunnel (adds only `ipnet`; base64 and percent-encoding are in every TLS build already).
