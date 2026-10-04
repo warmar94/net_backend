@@ -30,18 +30,17 @@ use crate::ws::WsHandlers;
 /// module is registered (see [`crate::lobbies`]). Name `lobbies`; settings in `[modules.lobbies]`
 /// ([`LobbiesConfig`]); needs the `auth` module registered first. Pushes need the WebSocket hub
 /// (`ws.enabled`); the HTTP routes work without it. With the friends module registered, lobbies may
-/// be friends-only and a host's blocks keep blocked players out.
+/// be friends-only and a host's blocks keep blocked players out. With the chat module registered,
+/// each lobby gets a chat room.
 ///
 /// ```no_run
 /// use net_backend_server::auth::Auth;
-/// use net_backend_server::chat::Chat;
 /// use net_backend_server::lobbies::Lobbies;
 /// use net_backend_server::{Config, NetBackendServer};
 ///
 /// # async fn demo() -> Result<(), net_backend_server::Error> {
 /// NetBackendServer::new(Config::load()?)
 ///     .module(Auth::new())
-///     .module(Chat::new()) // a chat room per lobby
 ///     .module(Lobbies::new())
 ///     .run()
 ///     .await

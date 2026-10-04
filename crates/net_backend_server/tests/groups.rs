@@ -201,6 +201,12 @@ async fn room_exists(server: &Server, room: i64) -> bool {
     server.state.db().fetch_one::<N, _>(&query).await.expect("count").n == 1
 }
 
+/// A list sorted by byte order (for checks that must not depend on the database's collation).
+fn sorted(mut list: Vec<String>) -> Vec<String> {
+    list.sort();
+    list
+}
+
 fn names(page: &Value) -> Vec<String> {
     page["items"].as_array().map(|items| items.iter().filter_map(|g| g["name"].as_str().map(str::to_string)).collect()).unwrap_or_default()
 }
@@ -243,16 +249,21 @@ async fn create_search_and_update(url: &str) {
     for name in ["Nightingales", "Dawn Patrol", "Nimbus"] {
         server.create(&b, json!({"name": name, "open": true})).await;
     }
-    assert_eq!(names(&server.ok(Method::GET, routes::groups::LIST, None, &a).await), ["Dawn Patrol", "Night Owls", "Nightingales", "Nimbus"]);
+    // Sorted by name in the database's collation: PostgreSQL's locale collations ignore the space ("Nightingales"
+    // before "Night Owls"), byte order does not, so only the order that every collation agrees on is checked.
+    let all = names(&server.ok(Method::GET, routes::groups::LIST, None, &a).await);
+    assert_eq!((all.first().map(String::as_str), all.last().map(String::as_str)), (Some("Dawn Patrol"), Some("Nimbus")));
+    assert_eq!(sorted(all), ["Dawn Patrol", "Night Owls", "Nightingales", "Nimbus"]);
     let found = server.ok(Method::GET, "/v1/groups?query=NIGHT", None, &a).await;
-    assert_eq!(names(&found), ["Night Owls", "Nightingales"]);
-    assert_eq!(found["items"][0]["role"], "owner", "the caller's role in the list");
-    assert!(found["items"][1].get("role").is_none());
+    assert_eq!(sorted(names(&found)), ["Night Owls", "Nightingales"]);
+    let item = |name: &str| found["items"].as_array().unwrap().iter().find(|i| i["name"] == name).cloned().unwrap();
+    assert_eq!(item("Night Owls")["role"], "owner", "the caller's role in the list");
+    assert!(item("Nightingales").get("role").is_none());
     let first = server.ok(Method::GET, "/v1/groups?query=n&limit=2", None, &a).await;
     let cursor = first["next_cursor"].as_str().expect("more").to_string();
     let rest = server.ok(Method::GET, &format!("/v1/groups?query=n&limit=2&cursor={}", cursor.replace(' ', "%20")), None, &a).await;
     assert_eq!(
-        (names(&first), names(&rest), rest.get("next_cursor")),
+        (sorted(names(&first)), names(&rest), rest.get("next_cursor")),
         (vec!["Night Owls".to_string(), "Nightingales".to_string()], vec!["Nimbus".to_string()], None)
     );
     assert!(names(&server.ok(Method::GET, "/v1/groups?query=50%25_", None, &a).await).is_empty(), "% and _ are plain characters");

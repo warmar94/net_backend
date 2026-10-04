@@ -132,7 +132,7 @@ impl ClientBuilder {
     /// Also trust the root certificates in this PEM text (every `CERTIFICATE` block; other blocks
     /// are skipped), e.g. the certificate of a self-signed development server or a company CA. They
     /// apply to HTTPS and the WebSocket, on top of webpki-roots (or of the operating system's store
-    /// with [`os_certificates`](Self::os_certificates)). Can be called more than once. Checked at
+    /// with `os_certificates`, feature `os-certificates`). Can be called more than once. Checked at
     /// [`build`](Self::build): PEM without a certificate, or a certificate that cannot be a root,
     /// is `InvalidRequest`.
     pub fn root_certificates_pem(mut self, pem: impl AsRef<[u8]>) -> Self {

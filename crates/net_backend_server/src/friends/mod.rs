@@ -17,7 +17,7 @@
 //!   `friends.presence` when the player's first connection opens and when its last one closes
 //!   (with several instances: counted over every instance, `friend_presence`), and when a heartbeat
 //!   brings an offline player online.
-//! - **Notifications:** with the [`Notifications`](crate::notifications) module registered (and
+//! - **Notifications:** with the `Notifications` module registered (and
 //!   `notify = true`), a request sends the other player a `friends.request` notification and an
 //!   acceptance sends `friends.accepted` (its `sender` is the acting player); without it nothing is
 //!   sent and players see requests in their list.

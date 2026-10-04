@@ -6,7 +6,7 @@
 //! - **Join:** by invitation (owner and admins invite: `POST /v1/groups/{group}/invites`; the player
 //!   accepts or declines) or directly when the group is open (`POST /v1/groups/{group}/join`).
 //!   Invitations reach the invited player as a `groups.invite` notification when the
-//!   [`Notifications`](crate::notifications) module is registered (`notify = true`), and are listed by
+//!   `Notifications` module is registered (`notify = true`), and are listed by
 //!   `GET /v1/groups/invites`.
 //! - **Roles:** one owner (every right; `POST /v1/groups/{group}/transfer` hands the group to a member,
 //!   the old owner becomes an admin), admins (edit the group, invite, revoke invitations, kick
@@ -17,7 +17,7 @@
 //!   no member left ([`GroupService::upkeep`]).
 //! - **Lists:** every group by name with a name prefix search, the caller's groups (with its role),
 //!   a group's members.
-//! - **Group chat:** with the [`Chat`](crate::chat) module registered (and `chat_room = true`), every
+//! - **Group chat:** with the `Chat` module registered (and `chat_room = true`), every
 //!   group gets a chat group room on creation; joining adds the player to it, leaving and kicks
 //!   remove them (at once on every instance), deleting the group deletes the room. `GroupInfo`
 //!   carries the room id.

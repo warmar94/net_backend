@@ -7,7 +7,7 @@
 //!   alphabet, also a number below 2^40), unique among the lobbies, valid while the lobby exists;
 //!   the host replaces it (`POST /v1/lobbies/{lobby}/code`).
 //! - **Join:** by id (`public` lobbies; `friends` lobbies by a friend of the host, with the
-//!   [`Friends`](crate::friends) module) or with the join code (`POST /v1/lobbies/join`, every
+//!   `Friends` module) or with the join code (`POST /v1/lobbies/join`, every
 //!   visibility). Only `open` lobbies with room take players; with the friends module, a player the
 //!   host blocked is refused. Join attempts are rate-limited per player (`join_rate`), and join
 //!   codes that match no lobby have their own, stricter limit (`bad_code_rate`).
@@ -22,7 +22,7 @@
 //!   those the caller's friends host; full ones left out unless asked.
 //! - **Pushes** to the members: `lobby.member` (joined, left, kicked, ready) and `lobby.changed`
 //!   (host, metadata, settings, state, code).
-//! - **Lobby chat:** with the [`Chat`](crate::chat) module registered (and `chat_room = true`),
+//! - **Lobby chat:** with the `Chat` module registered (and `chat_room = true`),
 //!   every lobby gets a chat group room; members join and leave it with the lobby.
 //! - **Limits:** `max_players` (64), `max_lobbies_per_user` (1), `max_metadata_keys` (32),
 //!   `max_metadata_bytes` (4 KiB), a per-player create rate.
